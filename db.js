@@ -5,12 +5,13 @@ const dbConfig = {
     password: process.env.DB_PASSWORD || 'sa#7744',
     server: process.env.DB_SERVER || 'localhost',
     database: process.env.DB_NAME || 'NBT Hub',
+    port: 1433,
     options: {
         encrypt: false,
         trustServerCertificate: true,
         enableArithAbort: true,
-        requestTimeout: 300000, // Query execution timeout increased to 5m (ETIMEOUT prevention)
-        connectionTimeout: 300000 // Connection establishment timeout increased to 5m
+        requestTimeout: 300000, 
+        connectionTimeout: 300000 
     },
     pool: {
         max: 50, // Expanded pool for higher concurrent resilience

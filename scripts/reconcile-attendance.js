@@ -33,7 +33,7 @@ async function reconcileAttendance(userId = null, lookbackDays = null) {
              await pool.request()
                 .input('id', sql.Int, user.id)
                 .input('balance', sql.Decimal(5, 2), stats.available_leave_balance)
-                .query('UPDATE users SET leave_balance = @balance WHERE id = @id');
+                .query('UPDATE leave_stats SET leaves_available = @balance, updated_at = GETDATE() WHERE employee_id = @id AND month = MONTH(DATEADD(MINUTE, 330, GETUTCDATE())) AND year = YEAR(DATEADD(MINUTE, 330, GETUTCDATE()))');
 
             console.log(`   [AUDIT] User ${user.id}: REAL BALANCE UPDATED TO ${stats.available_leave_balance}`);
             totalSynchronized++;
@@ -150,7 +150,7 @@ async function calculateUserMonthlyStats(userId, month, year) {
             total_present: monthlyPresent,
             total_leaves: monthlyLeaves,
             total_absent: monthlyAbsents,
-            available_leave_balance: totalAccrued - totalUsedLeaves - totalUnaccountedGaps
+            available_leave_balance: Math.max(0, totalAccrued - totalUsedLeaves - totalUnaccountedGaps)
         };
 
     } catch (err) {

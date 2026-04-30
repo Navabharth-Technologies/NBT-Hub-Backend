@@ -257,7 +257,7 @@ const emojiMap = {
 app.use(cors({
   origin: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'employee_id', 'employee-id', 'x-user-id'],
   credentials: true,
   maxAge: 86400 // Cache preflight results for 24 hours (86400 seconds)
 }));
@@ -985,18 +985,28 @@ app.get('/api/profile/manager', async (req, res) => {
 });
 
 // 3B. Get Subordinates (Team Synergy View)
-app.get('/api/subordinates/:userId', async (req, res) => {
-  const userId = sanitizeNumericId(req.params.userId);
+// Support both /api/subordinates (uses authenticated user) and /api/subordinates/:userId
+app.get('/api/subordinates', verifyToken, async (req, res) => {
+  const userId = req.user.id;
   try {
     let pool = await getPool();
-    if (!pool || typeof pool.request !== 'function') {
-      return res.status(503).json({ error: 'Database is currently offline' });
-    }
-
     const result = await pool.request()
       .input('userId', sql.Int, userId)
       .query('SELECT id, name, role, profile_picture, team FROM users WHERE reporting_manager_id = @userId');
+    res.json(result.recordset);
+  } catch (err) {
+    console.error('Failed to fetch subordinates:', err);
+    res.status(500).json({ error: 'Failed to extract team synergy matrix' });
+  }
+});
 
+app.get('/api/subordinates/:userId', verifyToken, async (req, res) => {
+  const userId = sanitizeNumericId(req.params.userId);
+  try {
+    let pool = await getPool();
+    const result = await pool.request()
+      .input('userId', sql.Int, userId)
+      .query('SELECT id, name, role, profile_picture, team FROM users WHERE reporting_manager_id = @userId');
     res.json(result.recordset);
   } catch (err) {
     console.error('Failed to fetch subordinates:', err);
@@ -1294,11 +1304,11 @@ const handleProfileGet = async (req, res) => {
         const internResult = await pool.request()
           .input('identifier', sql.NVarChar, identifier)
           .query('SELECT id, name, email, role FROM interns WHERE email = @identifier OR CAST(id AS NVARCHAR) = @identifier');
-        
+
         if (internResult.recordset.length === 0) {
           return res.status(404).json({ error: 'User not found in any directory' });
         }
-        
+
         const intern = internResult.recordset[0];
         return res.json({ ...intern, employee_id: intern.id, userType: 'intern' });
       }
@@ -1573,12 +1583,12 @@ app.get('/api/users/:id/photo', async (req, res) => {
       const mime = parts[0].split(':')[1].split(';')[0];
       const buffer = Buffer.from(parts[1], 'base64');
       res.setHeader('Content-Type', mime);
-      res.setHeader('Cache-Control', 'public, max-age=86400');
+      res.setHeader('Cache-Control', 'no-cache, must-revalidate');
       return res.send(buffer);
     } else {
       const buffer = Buffer.from(picData, 'base64');
       res.setHeader('Content-Type', 'image/png');
-      res.setHeader('Cache-Control', 'public, max-age=86400');
+      res.setHeader('Cache-Control', 'no-cache, must-revalidate');
       return res.send(buffer);
     }
   } catch (err) {
@@ -1711,7 +1721,7 @@ app.post('/api/profile/upload-direct', verifyToken, async (req, res) => {
 /**
  * 4E. Dedicated Document Upload (Handles Onboarding Docs)
  */
-app.post('/api/profile/upload-doc', verifyToken, memoryUpload.single('file'), async (req, res) => {
+app.post(['/api/profile/upload-doc', '/api/profile/upload-document'], verifyToken, memoryUpload.single('file'), async (req, res) => {
   const { userId, docType } = req.body;
   let fileData = req.body.fileData || req.body.base64;
 
@@ -1929,13 +1939,19 @@ const handleAboutUpdate = async (req, res) => {
 
 // 1. Post a new leave request
 app.post('/api/leaves', verifyToken, async (req, res) => {
-  const { leave_type, start_date, end_date, reason } = req.body;
+  const leave_type = req.body.leave_type || req.body.leaveType;
+  const start_date = req.body.start_date || req.body.startDate;
+  const end_date = req.body.end_date || req.body.endDate;
+  const reason = req.body.reason;
+  const is_half_day = req.body.is_half_day ?? req.body.isHalfDay;
+  const half_day_slot = req.body.half_day_slot || req.body.halfDaySlot;
+
   const userId = req.user.id;
 
   console.log(`[LEAVE POST] Attempt by User ID: ${userId} for ${leave_type}`);
 
   if (!leave_type || !start_date || !end_date) {
-    return res.status(400).json({ error: 'Leave type, start date, and end date are required' });
+    return res.status(400).json({ error: 'Leave type, start date, and end date are required', received: { leave_type, start_date, end_date } });
   }
 
   try {
@@ -1945,10 +1961,13 @@ app.post('/api/leaves', verifyToken, async (req, res) => {
     const userResult = await pool.request()
       .input('userId', sql.Int, userId)
       .query(`
-        SELECT u.name, u.role, u.leave_balance, u.reporting_manager_id, u.joining_date,
+        SELECT u.name, u.role, ISNULL(ls.leaves_available, 0) as leave_balance, u.reporting_manager_id, u.joining_date,
                m.reporting_manager_id as hierarchy_pm_id
         FROM users u
         LEFT JOIN users m ON u.reporting_manager_id = m.id
+        LEFT JOIN leave_stats ls ON u.id = ls.employee_id 
+             AND ls.month = MONTH(DATEADD(MINUTE, 330, GETUTCDATE())) 
+             AND ls.year = YEAR(DATEADD(MINUTE, 330, GETUTCDATE()))
         WHERE u.id = @userId
       `);
 
@@ -1957,14 +1976,38 @@ app.post('/api/leaves', verifyToken, async (req, res) => {
     }
 
     const { name, role, leave_balance, reporting_manager_id, joining_date, hierarchy_pm_id } = userResult.recordset[0];
-    const isTL = (role || '').toLowerCase().includes('lead') || (role || '').toLowerCase().includes('tl');
-    const project_manager_id = isTL ? reporting_manager_id : (hierarchy_pm_id || 20251);
-    const requestedDays = Math.ceil((new Date(end_date) - new Date(start_date)) / (1000 * 60 * 60 * 24)) + 1;
+
+    // DUPLICATE CHECK: Prevent multiple active requests for the same user on the same date
+    const duplicateCheck = await pool.request()
+      .input('uId', sql.Int, userId)
+      .input('sDate', sql.Date, start_date)
+      .query("SELECT id FROM leaves WITH (NOLOCK) WHERE user_id = @uId AND start_date = @sDate AND (rm_status <> 'Rejected' AND pm_status <> 'Rejected' AND hr_status <> 'Rejected')");
+    
+    if (duplicateCheck.recordset.length > 0) {
+      return res.status(409).json({ 
+        error: 'Duplicate Request', 
+        message: `You already have an active leave request starting on ${start_date}. Please check your history.` 
+      });
+    }
+
+    const normalizedRole = (role || '').toLowerCase();
+    const isTL = normalizedRole.includes('lead') || normalizedRole.includes('tl');
+    const isManager = normalizedRole.includes('manager');
+
+    // HIERARCHY LOGIC: 
+    // If Manager: Reports directly to CEO (20251)
+    // If Lead: PM is their direct RM
+    // If Member: PM is their RM's RM
+    let project_manager_id = isTL ? reporting_manager_id : (hierarchy_pm_id || 20251);
+    if (isManager) project_manager_id = 20251;
+
+    let requestedDays = Math.ceil((new Date(end_date) - new Date(start_date)) / (1000 * 60 * 60 * 24)) + 1;
+    if (is_half_day) requestedDays = 0.5;
     let rmStatus = 'Pending';
     let pmStatus = 'Pending';
 
-    // SPECIAL CASE: If TL: RM stage is skipped (N/A) because they report directly to PM
-    if (isTL) {
+    // SPECIAL CASE: If TL or Manager: RM stage is skipped (N/A) because they report directly to PM/CEO
+    if (isTL || isManager || reporting_manager_id == project_manager_id) {
       rmStatus = 'N/A';
       pmStatus = 'Pending';
     }
@@ -1977,20 +2020,37 @@ app.post('/api/leaves', verifyToken, async (req, res) => {
       const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
 
       if (diffDays < 90 && leave_type !== 'Unpaid Leave' && leave_type !== 'LOP') {
-        return res.status(403).json({
-          error: 'Probation Period Restriction',
-          message: `During your 3-month probation, only Unpaid/LOP leaves are permitted. Other leave types are available after 90 days. Service days: ${diffDays}/90`
-        });
+        // NEW: Allow Casual Leave during probation if they have a pre-existing balance
+        if (leave_type === 'Casual Leave' && leave_balance >= requestedDays) {
+           console.log(`[LEAVE] Allowing Casual Leave during probation for User ${userId} due to existing balance.`);
+        } else {
+          return res.status(403).json({
+            error: 'Probation Period Restriction',
+            message: `During your 3-month probation, only Unpaid/LOP leaves are permitted. Other leave types are available after 90 days or if you have an existing balance. Service days: ${diffDays}/90`
+          });
+        }
       }
     }
 
-    // --- LEAVE BALANCE CHECK ---
-    // If user applies for Casual Leave but has no/insufficient balance, they must choose LOP
-    if (leave_type === 'Casual Leave' && leave_balance < requestedDays) {
-      return res.status(400).json({
-        error: 'Insufficient Leave Balance',
-        message: `Your current leave balance is ${leave_balance} days, but you requested ${requestedDays} days of Casual Leave. Please apply for LOP (Loss of Pay) instead.`
-      });
+    // --- LEAVE BALANCE CHECK: Include PENDING casual leaves ---
+    if (leave_type === 'Casual Leave') {
+      const pendingRes = await pool.request()
+        .input('uId', sql.Int, userId)
+        .query(`
+          SELECT SUM(CASE WHEN is_half_day = 1 THEN 0.5 ELSE DATEDIFF(day, start_date, end_date) + 1 END) as pending_days
+          FROM leaves 
+          WHERE user_id = @uId AND leave_type = 'Casual Leave' AND hr_status = 'Pending' AND (rm_status <> 'Rejected' AND pm_status <> 'Rejected')
+        `);
+      
+      const pendingDays = pendingRes.recordset[0]?.pending_days || 0;
+      const effectiveBalance = leave_balance - pendingDays;
+
+      if (effectiveBalance < requestedDays) {
+        return res.status(400).json({
+          error: 'Insufficient Leave Balance',
+          message: `Your available balance is ${leave_balance} days, but you have ${pendingDays} days already pending approval. Remaining: ${effectiveBalance} days. You requested ${requestedDays} days.`
+        });
+      }
     }
 
     // 4. Secure Insertion into relational [leaves] table
@@ -2005,10 +2065,12 @@ app.post('/api/leaves', verifyToken, async (req, res) => {
       .input('reason', sql.NVarChar(sql.MAX), reason || '')
       .input('rmStatus', sql.NVarChar, rmStatus)
       .input('pmStatus', sql.NVarChar, pmStatus)
+      .input('isHalfDay', sql.Bit, is_half_day ? 1 : 0)
+      .input('halfDaySlot', sql.NVarChar, half_day_slot || null)
       .query(`
-                INSERT INTO leaves (user_id, employee_name, manager_id, pm_id, leave_type, start_date, end_date, reason, rm_status, pm_status, hr_status, status, created_at, updated_at)
+                INSERT INTO leaves (user_id, employee_name, manager_id, pm_id, leave_type, start_date, end_date, reason, rm_status, pm_status, hr_status, status, is_half_day, half_day_slot, created_at, updated_at)
                 OUTPUT INSERTED.id
-                VALUES (@userId, @employeeName, @managerId, @pmId, @leaveType, @startDate, @endDate, @reason, @rmStatus, @pmStatus, 'Pending', 'Pending', DATEADD(MINUTE, 330, GETUTCDATE()), DATEADD(MINUTE, 330, GETUTCDATE()))
+                VALUES (@userId, @employeeName, @managerId, @pmId, @leaveType, @startDate, @endDate, @reason, @rmStatus, @pmStatus, 'Pending', 'Pending', @isHalfDay, @halfDaySlot, DATEADD(MINUTE, 330, GETUTCDATE()), DATEADD(MINUTE, 330, GETUTCDATE()))
             `);
 
     console.log(`[LEAVE POST SUCCESS] Leave ID ${insertResult.recordset[0].id} generated for User ${userId}`);
@@ -2297,7 +2359,7 @@ app.get('/api/admin/etime-logs', verifyToken, async (req, res) => {
     const finalEmpCode = empCode || 'ALL';
 
     const url = `${baseUrl}/DownloadInOutPunchData?Empcode=${finalEmpCode}&FromDate=${fromDate}&ToDate=${toDate}`;
-    
+
     console.log(`[ETIME FETCH] Fetching from: ${url}`);
 
     const response = await fetch(url, {
@@ -2308,10 +2370,10 @@ app.get('/api/admin/etime-logs', verifyToken, async (req, res) => {
 
     const data = await response.json();
     res.json({
-        success: true,
-        source: 'Etime Office',
-        url: url,
-        data: data.InOutPunchData || []
+      success: true,
+      source: 'Etime Office',
+      url: url,
+      data: data.InOutPunchData || []
     });
   } catch (err) {
     console.error('[ETIME LOG FETCH ERROR]:', err);
@@ -2858,7 +2920,17 @@ app.get('/api/task-updates/:id', async (req, res) => {
 
 
 // 7. Corporate Holidays API
+// Simple in-memory cache for holidays (1 hour TTL)
+let holidaysCache = null;
+let lastHolidaysFetch = 0;
+const HOLIDAYS_CACHE_DURATION = 3600000;
+
 app.get('/api/holidays', async (req, res) => {
+  const now = Date.now();
+  if (holidaysCache && (now - lastHolidaysFetch < HOLIDAYS_CACHE_DURATION)) {
+    return res.json(holidaysCache);
+  }
+
   try {
     let pool = await getPool();
     if (!pool || typeof pool.request !== 'function') {
@@ -2867,11 +2939,11 @@ app.get('/api/holidays', async (req, res) => {
 
     const result = await pool.request().query(`
       SELECT id, name, CONVERT(VARCHAR, holiday_date, 23) AS holiday_date_str, classification, description 
-      FROM holidays 
+      FROM holidays WITH (NOLOCK)
       ORDER BY holiday_date ASC
     `);
 
-    const holidays = result.recordset.map(h => ({
+    holidaysCache = result.recordset.map(h => ({
       id: h.id,
       name: h.name,
       title: h.name,
@@ -2881,7 +2953,8 @@ app.get('/api/holidays', async (req, res) => {
       description: h.description || 'Public Holiday'
     }));
 
-    res.json(holidays);
+    lastHolidaysFetch = now;
+    res.json(holidaysCache);
   } catch (err) {
     console.error('Holidays API failed:', err);
     res.status(500).json({ error: 'Failed to fetch corporate holidays' });
@@ -3017,7 +3090,7 @@ app.get('/api/users', async (req, res) => {
     if (!pool || typeof pool.request !== 'function') {
       return res.status(503).json({ error: 'Database is currently offline' });
     }
-    const result = await pool.request().query('SELECT id, name, email, role, team, joining_date FROM users');
+    const result = await pool.request().query('SELECT id, name, email, role, team, joining_date FROM users WITH (NOLOCK)');
     res.json(result.recordset);
   } catch (err) {
     console.error('All users fetch error:', err);
@@ -3128,7 +3201,7 @@ app.get('/api/teams', async (req, res) => {
 app.put('/api/admin/teams/rename', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
   const isAuthorized = role.includes('manager') || role.includes('ceo') || role.includes('hr') || role.includes('admin');
-  
+
   if (!isAuthorized) {
     return res.status(403).json({ error: 'Unauthorized: Only Managers/HR/Admin can rename teams.' });
   }
@@ -3168,8 +3241,8 @@ app.put('/api/admin/teams/rename', verifyToken, async (req, res) => {
       await syncSpecificTeamTable(pool, null, newName);
 
       Log.success('Team Management', `Team "${oldName}" successfully renamed to "${newName}" by ${req.user.name}`);
-      res.json({ 
-        success: true, 
+      res.json({
+        success: true,
         message: `Team successfully renamed from "${oldName}" to "${newName}".`,
         details: 'Changes applied to Users, Leaves, and Task records.'
       });
@@ -3247,7 +3320,7 @@ app.get('/api/tasks/all-assigned', async (req, res) => {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   res.setHeader('Pragma', 'no-cache');
   res.setHeader('Expires', '0');
-  
+
   try {
     let pool = await getPool();
     if (!pool || typeof pool.request !== 'function') {
@@ -3348,7 +3421,7 @@ app.get('/api/master-task/:id', async (req, res) => {
 // 14. Get Assigned Tasks for a specific user (Targeted Stream)
 app.get('/api/tasks/assigned/:userId', async (req, res) => {
   const userId = sanitizeNumericId(req.params.userId);
-  
+
   // Disable caching for stability
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   res.setHeader('Pragma', 'no-cache');
@@ -3695,9 +3768,9 @@ app.get('/api/threads', async (req, res) => {
       const pfp = `/api/users/${row.user_id}/photo`;
       const userTypes = row.userReactionTypes ? row.userReactionTypes.split(',') : [];
 
-      const totalReactions = (row.heartCount || 0) + (row.thumbsupCount || 0) + (row.shockedCount || 0) + 
-                             (row.laughCount || 0) + (row.fireCount || 0) + (row.clapCount || 0) + 
-                             (row.cakeCount || 0) + (row.likes || 0);
+      const totalReactions = (row.heartCount || 0) + (row.thumbsupCount || 0) + (row.shockedCount || 0) +
+        (row.laughCount || 0) + (row.fireCount || 0) + (row.clapCount || 0) +
+        (row.cakeCount || 0) + (row.likes || 0);
 
       const reactions = {
         total: totalReactions,
@@ -3882,7 +3955,7 @@ const handleReaction = async (req, res) => {
       const threadRes = await pool.request()
         .input('tid', sql.Int, id)
         .query('SELECT likes_count, heart_count, thumbsup_count, shocked_count, laugh_count, fire_count, clap_count, cake_count FROM threads WHERE id = @tid');
-      
+
       const t = threadRes.recordset[0];
       const newTotal = (t.likes_count || 0) + (t.heart_count || 0) + (t.thumbsup_count || 0) + (t.shocked_count || 0) + (t.laugh_count || 0) + (t.fire_count || 0) + (t.clap_count || 0) + (t.cake_count || 0);
 
@@ -3919,7 +3992,7 @@ const handleReaction = async (req, res) => {
       const threadRes = await pool.request()
         .input('tid', sql.Int, id)
         .query('SELECT likes_count, heart_count, thumbsup_count, shocked_count, laugh_count, fire_count, clap_count, cake_count FROM threads WHERE id = @tid');
-      
+
       const t = threadRes.recordset[0];
       const newTotal = (t.likes_count || 0) + (t.heart_count || 0) + (t.thumbsup_count || 0) + (t.shocked_count || 0) + (t.laugh_count || 0) + (t.fire_count || 0) + (t.clap_count || 0) + (t.cake_count || 0);
 
@@ -4104,7 +4177,7 @@ app.delete('/api/threads/:threadId/comments/:commentId', async (req, res) => {
 // 6. Fetch a Single Thread (Deep-link view)
 app.get('/api/threads/:id', async (req, res) => {
   const { id } = req.params;
-  
+
   // Enhanced viewer detection: Try query params first, then fallback to JWT token
   const authHeader = req.headers['authorization'];
   let tokenViewerId = null;
@@ -4169,9 +4242,9 @@ app.get('/api/threads/:id', async (req, res) => {
     const pfp = `/api/users/${thread.user_id}/photo`;
     const userTypes = thread.userReactionTypes ? thread.userReactionTypes.split(',') : [];
 
-    const totalReactions = (thread.heartCount || 0) + (thread.thumbsupCount || 0) + (thread.shockedCount || 0) + 
-                           (thread.laughCount || 0) + (thread.fireCount || 0) + (thread.clapCount || 0) + 
-                           (thread.cakeCount || 0) + (thread.likes || 0);
+    const totalReactions = (thread.heartCount || 0) + (thread.thumbsupCount || 0) + (thread.shockedCount || 0) +
+      (thread.laughCount || 0) + (thread.fireCount || 0) + (thread.clapCount || 0) +
+      (thread.cakeCount || 0) + (thread.likes || 0);
 
     const baseReactions = {
       total: totalReactions,
@@ -4779,12 +4852,12 @@ app.post('/api/admin/new-joinees/unblock-all', verifyToken, async (req, res) => 
         SET is_blocked = 0, block_reason = NULL 
         WHERE is_blocked = 1 AND (block_reason LIKE '%onboarding window%' OR block_reason LIKE '%course%')
       `);
-    
+
     Log.success('Compliance', `Bulk unblock executed by ${req.user.name}. ${result.rowsAffected[0]} joinees restored.`);
-    res.json({ 
-      success: true, 
-      count: result.rowsAffected[0], 
-      message: `${result.rowsAffected[0]} compliance-related blocks have been lifted.` 
+    res.json({
+      success: true,
+      count: result.rowsAffected[0],
+      message: `${result.rowsAffected[0]} compliance-related blocks have been lifted.`
     });
   } catch (err) {
     console.error('[BULK UNBLOCK ERROR]', err);
@@ -4819,7 +4892,7 @@ app.post('/api/admin/new-joinees/unblock', verifyToken, async (req, res) => {
     }
 
     const result = await request.query(query);
-    
+
     if (result.rowsAffected[0] === 0) {
       return res.status(404).json({ error: 'No matching joinee found to unblock.' });
     }
@@ -5736,15 +5809,46 @@ app.delete('/api/newjoinee-courses/:id', async (req, res) => {
 // --- LEAVE MANAGEMENT SYSTEM --- //
 
 /**
- * 30. Request Leave
+ * 30.5 Get Leave Request (GET Alias)
+ * Some frontend versions might call this to fetch leave status for a user
+ */
+app.get('/api/leaves/request', verifyToken, async (req, res) => {
+  const { userId, user_id, employee_id } = req.query;
+  const targetId = userId || user_id || employee_id || req.user.id;
+
+  try {
+    const pool = await getPool();
+    const result = await pool.request()
+      .input('uid', sql.Int, targetId)
+      .query(`
+        SELECT l.*, u.name as employee_name, u.team as employee_team
+        FROM leaves l
+        JOIN users u ON l.user_id = u.id
+        WHERE l.user_id = @uid
+        ORDER BY l.created_at DESC
+      `);
+    res.json(result.recordset);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch leave request data' });
+  }
+});
+
+/**
+ * 30. Request Leave (POST)
  * Logic: Auto-detects manager and notifies Manager + HR + CEO
  */
 app.post('/api/leaves/request', verifyToken, async (req, res) => {
-  const { leaveType, startDate, endDate, reason } = req.body;
+  const leaveType = req.body.leaveType || req.body.leave_type;
+  const startDate = req.body.startDate || req.body.start_date;
+  const endDate = req.body.endDate || req.body.end_date;
+  const reason = req.body.reason;
+  const isHalfDay = req.body.isHalfDay ?? req.body.is_half_day;
+  const halfDaySlot = req.body.halfDaySlot || req.body.half_day_slot;
+
   const userId = req.user.id;
 
   if (!startDate || !endDate || !leaveType) {
-    return res.status(400).json({ error: 'Incomplete leave request parameters' });
+    return res.status(400).json({ error: 'Incomplete leave request parameters', received: { leaveType, startDate, endDate } });
   }
 
   try {
@@ -5754,28 +5858,81 @@ app.post('/api/leaves/request', verifyToken, async (req, res) => {
     const userResult = await pool.request()
       .input('id', sql.Int, userId)
       .query(`
-        SELECT u.name, u.role, u.reporting_manager_id, u.leave_balance, u.joining_date, u.team,
+        SELECT u.name, u.role, u.reporting_manager_id, ISNULL(ls.leaves_available, 0) as leave_balance, u.joining_date, u.team,
                m.reporting_manager_id as hierarchy_pm_id
         FROM users u
         LEFT JOIN users m ON u.reporting_manager_id = m.id
+        LEFT JOIN leave_stats ls ON u.id = ls.employee_id 
+             AND ls.month = MONTH(DATEADD(MINUTE, 330, GETUTCDATE())) 
+             AND ls.year = YEAR(DATEADD(MINUTE, 330, GETUTCDATE()))
         WHERE u.id = @id
       `);
 
     if (userResult.recordset.length === 0) return res.status(404).json({ error: 'Employee not found' });
 
     const employee = userResult.recordset[0];
-    const role = (employee.role || '').toLowerCase();
-    const isTL = role.includes('lead') || role.includes('tl');
+
+    // 1.5 Calculate requested days (handling half-day logic)
+    const requestedDays = isHalfDay ? 0.5 : (Math.ceil(Math.abs(new Date(endDate) - new Date(startDate)) / (1000 * 60 * 60 * 24)) + 1);
+
+    // 1.6 LEAVE BALANCE CHECK: Include PENDING casual leaves in the calculation
+    if (leaveType === 'Casual Leave') {
+      // Calculate total days already "locked" in pending casual leave requests
+      const pendingRes = await pool.request()
+        .input('uId', sql.Int, userId)
+        .query(`
+          SELECT 
+            SUM(CASE WHEN is_half_day = 1 THEN 0.5 ELSE DATEDIFF(day, start_date, end_date) + 1 END) as pending_days
+          FROM leaves 
+          WHERE user_id = @uId 
+          AND leave_type = 'Casual Leave' 
+          AND hr_status = 'Pending' 
+          AND (rm_status <> 'Rejected' AND pm_status <> 'Rejected')
+        `);
+      
+      const pendingDays = pendingRes.recordset[0]?.pending_days || 0;
+      const effectiveBalance = employee.leave_balance - pendingDays;
+
+      if (effectiveBalance < requestedDays) {
+        return res.status(400).json({
+          error: 'Insufficient Leave Balance',
+          message: `Your available balance is ${employee.leave_balance} days, but you have ${pendingDays} days already pending approval. Remaining: ${effectiveBalance} days. You requested ${requestedDays} days.`
+        });
+      }
+    }
+
+    // DUPLICATE CHECK: Prevent multiple active requests for the same user on the same date
+    const duplicateCheck = await pool.request()
+      .input('uId', sql.Int, userId)
+      .input('sDate', sql.Date, startDate)
+      .query("SELECT id FROM leaves WITH (NOLOCK) WHERE user_id = @uId AND start_date = @sDate AND (rm_status <> 'Rejected' AND pm_status <> 'Rejected' AND hr_status <> 'Rejected')");
+    
+    if (duplicateCheck.recordset.length > 0) {
+      return res.status(409).json({ 
+        error: 'Duplicate Request', 
+        message: `You already have an active leave request starting on ${startDate}. Please check your history.` 
+      });
+    }
+
+    const normalizedRole = (employee.role || '').toLowerCase();
+    const isTL = normalizedRole.includes('lead') || normalizedRole.includes('tl');
+    const isManager = normalizedRole.includes('manager');
+    const isHR = normalizedRole.includes('hr');
 
     // HIERARCHY LOGIC:
+    // If Manager or HR: Reports directly to CEO (20250)
     // If Lead: PM is their direct RM
     // If Member: PM is their RM's RM
     const managerId = employee.reporting_manager_id;
     let projectManagerId = isTL ? managerId : (employee.hierarchy_pm_id || 20251);
+    
+    if (isManager || isHR) {
+      projectManagerId = 20250; // Set CEO as their direct PM/Approver
+    }
 
     // Initial Statuses
-    // If TL OR if RM and PM are the same person: RM stage is not required
-    const initialRMStatus = (isTL || managerId == projectManagerId) ? 'N/A' : 'Pending';
+    // If TL, Manager, or HR: RM stage is skipped (N/A) because they report directly to PM/CEO
+    const initialRMStatus = (isTL || isManager || isHR || managerId == projectManagerId) ? 'N/A' : 'Pending';
 
     // --- PROBATION CHECK (3 Months / 90 Days) ---
     if (employee.joining_date) {
@@ -5785,11 +5942,16 @@ app.post('/api/leaves/request', verifyToken, async (req, res) => {
       const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
 
       if (diffDays < 90 && leaveType.toUpperCase() !== 'LOP') {
-        return res.status(403).json({
-          error: 'Probation Period Restriction',
-          message: `During your 3-month probation, only LOP (Loss of Pay) leaves are permitted. Other leave types are available after 90 days. Service days: ${diffDays}/90`,
-          joiningDate: employee.joining_date
-        });
+        // NEW: Allow Casual Leave during probation if they have a pre-existing balance (e.g. manually credited)
+        if (leaveType === 'Casual Leave' && employee.leave_balance >= requestedDays) {
+          console.log(`[LEAVE] Allowing Casual Leave during probation for ${employee.name} due to existing balance.`);
+        } else {
+          return res.status(403).json({
+            error: 'Probation Period Restriction',
+            message: `During your 3-month probation, only LOP (Loss of Pay) leaves are permitted. Other leave types are available after 90 days or if you have an existing balance. Service days: ${diffDays}/90`,
+            joiningDate: employee.joining_date
+          });
+        }
       }
     }
 
@@ -5805,19 +5967,22 @@ app.post('/api/leaves/request', verifyToken, async (req, res) => {
       .input('endDate', sql.Date, endDate)
       .input('reason', sql.NVarChar, reason)
       .input('rmStatus', sql.NVarChar, initialRMStatus)
+      .input('isHalfDay', sql.Bit, isHalfDay ? 1 : 0)
+      .input('halfDaySlot', sql.NVarChar, halfDaySlot || null)
       .query(`
         INSERT INTO leaves (
           user_id, manager_id, pm_id, employee_name, team, leave_type, 
-          start_date, end_date, reason, rm_status, pm_status, hr_status
+          start_date, end_date, reason, rm_status, pm_status, hr_status, status, is_half_day, half_day_slot
         )
         VALUES (
           @userId, @managerId, @pmId, @employeeName, @team, @leaveType, 
-          @startDate, @endDate, @reason, @rmStatus, 'Pending', 'Pending'
+          @startDate, @endDate, @reason, @rmStatus, 'Pending', 'Pending', 'Pending', @isHalfDay, @halfDaySlot
         );
         SELECT SCOPE_IDENTITY() AS id;
       `);
 
     const leaveId = leaveResult.recordset[0].id;
+    console.log(`[LEAVE SUCCESS] User ${userId} successfully requested ${leaveType} (ID: ${leaveId})`);
 
     // 3. Automated Notifications (Manager + HR + CEO)
     // Find HR and CEO IDs
@@ -5852,6 +6017,7 @@ app.get('/api/leaves/my', verifyToken, async (req, res) => {
       .query(`
         SELECT l.id, l.user_id, l.leave_type, l.start_date, l.end_date, l.reason, l.created_at,
                l.rm_status, l.pm_status, l.hr_status, l.rm_remarks, l.pm_remarks, l.hr_remarks,
+               l.is_half_day, l.half_day_slot,
         CASE 
           WHEN l.rm_status = 'Rejected' OR l.pm_status = 'Rejected' OR l.hr_status = 'Rejected' THEN 'Rejected'
           WHEN l.hr_status = 'Approved' THEN 'Approved'
@@ -5884,8 +6050,8 @@ app.get('/api/leaves/pending', verifyToken, async (req, res) => {
         WHEN l.hr_status = 'Approved' THEN 'Approved'
         ELSE 'Pending'
       END as status
-      FROM leaves l
-      JOIN users u ON l.user_id = u.id
+      FROM leaves l WITH (NOLOCK)
+      JOIN users u WITH (NOLOCK) ON l.user_id = u.id
       WHERE (l.rm_status <> 'Rejected' AND l.pm_status <> 'Rejected' AND l.hr_status <> 'Rejected' AND l.hr_status <> 'Approved')
     `;
 
@@ -5915,14 +6081,39 @@ app.get('/api/leaves/pending', verifyToken, async (req, res) => {
 });
 
 /**
- * 32b. Master Leave List (Approved + Rejected + Pending)
+ * 32c. CEO Exclusive: Leave Requests from Managers & HR
+ * Fetches all leave applications submitted by high-level staff for CEO review.
  */
-/**
- * 32b. Master Leave List (Approved + Rejected + Pending)
- * Optimized for Managers & HR with Advanced Filtering
- */
-app.get('/api/leaves/all', verifyToken, async (req, res) => {
-  const currentUserId = req.user.id;
+app.get('/api/ceo/leaves', verifyToken, async (req, res) => {
+  const userRole = (req.user.role || '').toLowerCase();
+  if (!userRole.includes('ceo')) {
+    return res.status(403).json({ error: 'Unauthorized: CEO access only.' });
+  }
+
+  try {
+    const pool = await getPool();
+    const result = await pool.request()
+      .query(`
+        SELECT l.*, u.name as employeeName, u.role as employeeRole, u.team as employeeTeam
+        FROM leaves l
+        JOIN users u ON l.user_id = u.id
+        WHERE (u.role LIKE '%Manager%' OR u.role LIKE '%HR%')
+        ORDER BY l.created_at DESC
+      `);
+    res.json(result.recordset);
+  } catch (err) {
+    console.error('[CEO LEAVES FETCH ERROR]', err);
+    res.status(500).json({ error: 'Failed to fetch manager/HR leave requests' });
+  }
+});
+
+// 32b. Master Leave List (Approved + Rejected + Pending)
+// Optimized for Managers & HR with Advanced Filtering
+const masterLeaveListHandler = async (req, res) => {
+  // Support userId override from query or headers for impersonation/debugging
+  const overrideId = sanitizeNumericId(req.query.userId || req.query.employeeId || req.headers['x-user-id']);
+  const currentUserId = overrideId || req.user.id;
+
   const userRole = (req.user.role || '').toLowerCase();
   const isHR = userRole.includes('hr') || userRole.includes('ceo') || userRole.includes('admin');
 
@@ -5960,8 +6151,8 @@ app.get('/api/leaves/all', verifyToken, async (req, res) => {
         ELSE 'Pending'
       END as status,
       COUNT(*) OVER() as totalCount
-      FROM leaves l
-      JOIN users u ON l.user_id = u.id
+      FROM leaves l WITH (NOLOCK)
+      JOIN users u WITH (NOLOCK) ON l.user_id = u.id
       WHERE 1=1
     `;
 
@@ -6034,7 +6225,12 @@ app.get('/api/leaves/all', verifyToken, async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: 'Failed to extract complete leave history.' });
   }
-});
+};
+
+app.get('/api/leaves/all', verifyToken, masterLeaveListHandler);
+app.get('/api/admin/leaves', verifyToken, masterLeaveListHandler);
+app.get('/api/admin/leaves/all', verifyToken, masterLeaveListHandler);
+app.get('/api/leaves/team', verifyToken, masterLeaveListHandler);
 
 /**
  * 32.5 Get Monthly Leave Stats
@@ -6042,9 +6238,12 @@ app.get('/api/leaves/all', verifyToken, async (req, res) => {
  */
 app.get('/api/admin/leaves/stats', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  const isAdmin = role.includes('hr') || role.includes('admin') || role.includes('ceo') || role.includes('manager');
-  
+  const isAdmin = role.includes('hr') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead') || role.includes('tl');
+
+  console.log(`[GET /api/admin/leaves/stats] Accessed by user ${req.user.id} (Role: ${req.user.role}, isAdmin: ${isAdmin})`);
+
   if (!isAdmin) {
+    console.log(`[GET /api/admin/leaves/stats] 403 Forbidden for user ${req.user.id}`);
     return res.status(403).json({ error: 'Unauthorized: Management access required.' });
   }
 
@@ -6091,6 +6290,7 @@ app.get('/api/admin/leaves/stats', verifyToken, async (req, res) => {
       takenLeaves: row.leaves_taken,
       availableLeaves: row.leaves_available,
       leaveBalance: row.leaves_available,
+      halfDays: row.half_days || 0,
       monthName: monthNames[row.month - 1] || 'Unknown',
       month_name: monthNames[row.month - 1] || 'Unknown'
     }));
@@ -6098,6 +6298,138 @@ app.get('/api/admin/leaves/stats', verifyToken, async (req, res) => {
     res.json(enrichedData);
   } catch (err) {
     console.error('[LEAVE STATS ERROR]:', err);
+    res.status(500).json({ error: 'Failed to fetch leave statistics' });
+  }
+});
+
+/**
+ * 32.5a Update Leave Stats
+ * Allows HR/Admin to manually adjust leave balances.
+ */
+app.put('/api/admin/leaves/stats', verifyToken, async (req, res) => {
+  const role = (req.user.role || '').toLowerCase();
+  const isAdmin = role.includes('hr') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead') || role.includes('tl');
+
+  if (!isAdmin) {
+    return res.status(403).json({ error: 'Unauthorized: Admin/HR access required to modify stats.' });
+  }
+
+  const { employeeId, month, year, leaves_available, leaves_taken, LOP, half_days } = req.body;
+
+  if (!employeeId || !month || !year) {
+    return res.status(400).json({ error: 'employeeId, month, and year are required.' });
+  }
+
+  try {
+    const pool = await getPool();
+    
+    // Check if record exists
+    const checkRes = await pool.request()
+      .input('eid', sql.Int, employeeId)
+      .input('m', sql.Int, month)
+      .input('y', sql.Int, year)
+      .query('SELECT id FROM leave_stats WHERE employee_id = @eid AND month = @m AND year = @y');
+
+    if (checkRes.recordset.length === 0) {
+      await pool.request()
+        .input('eid', sql.Int, employeeId)
+        .input('m', sql.Int, month)
+        .input('y', sql.Int, year)
+        .input('av', sql.Decimal(5, 2), leaves_available || 0)
+        .input('tk', sql.Decimal(5, 2), leaves_taken || 0)
+        .input('lop', sql.Decimal(5, 2), LOP || 0)
+        .input('hd', sql.Int, half_days || 0)
+        .query(`
+          INSERT INTO leave_stats (employee_id, month, year, leaves_available, leaves_taken, LOP, half_days, updated_at)
+          VALUES (@eid, @m, @y, @av, @tk, @lop, @hd, DATEADD(MINUTE, 330, GETUTCDATE()))
+        `);
+      return res.json({ success: true, message: 'Leave stats record created.' });
+    } else {
+      await pool.request()
+        .input('eid', sql.Int, employeeId)
+        .input('m', sql.Int, month)
+        .input('y', sql.Int, year)
+        .input('av', sql.Decimal(5, 2), leaves_available)
+        .input('tk', sql.Decimal(5, 2), leaves_taken)
+        .input('lop', sql.Decimal(5, 2), LOP)
+        .input('hd', sql.Int, half_days)
+        .query(`
+          UPDATE leave_stats 
+          SET 
+            leaves_available = COALESCE(@av, leaves_available),
+            leaves_taken = COALESCE(@tk, leaves_taken),
+            LOP = COALESCE(@lop, LOP),
+            half_days = COALESCE(@hd, half_days),
+            updated_at = DATEADD(MINUTE, 330, GETUTCDATE())
+          WHERE employee_id = @eid AND month = @m AND year = @y
+        `);
+      return res.json({ success: true, message: 'Leave stats updated successfully.' });
+    }
+  } catch (err) {
+    console.error('[STATS UPDATE ERROR]', err);
+    res.status(500).json({ error: 'Failed to update leave stats.' });
+  }
+});
+
+/**
+ * 32.5b Get Leave Stats (Universal Endpoint)
+ * Supports: /api/leave-stats?userId=...
+ */
+app.get('/api/leave-stats', verifyToken, async (req, res) => {
+  const role = (req.user.role || '').toLowerCase();
+  const isAdmin = role.includes('hr') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead') || role.includes('tl');
+
+  let { userId, employeeId, month, year } = req.query;
+  const targetId = userId || employeeId;
+
+  console.log(`[GET /api/leave-stats] Accessed by user ${req.user.id} (Role: ${req.user.role}, isAdmin: ${isAdmin}), targetId: ${targetId}`);
+
+  // Authorization: Admins can see any, users can only see their own
+  if (!isAdmin && targetId && targetId != req.user.id) {
+    console.log(`[GET /api/leave-stats] 403 Forbidden for user ${req.user.id}`);
+    return res.status(403).json({ error: 'Unauthorized: Access denied.' });
+  }
+
+  try {
+    const pool = await getPool();
+    const request = pool.request();
+    let query = `
+      SELECT ls.*, u.name as employee_name, u.team, u.email as employee_email
+      FROM leave_stats ls
+      JOIN users u ON ls.employee_id = u.id
+      WHERE 1=1
+    `;
+
+    if (targetId) {
+      request.input('empId', sql.Int, targetId);
+      query += ' AND ls.employee_id = @empId';
+    }
+    if (month && !isNaN(parseInt(month))) {
+      request.input('month', sql.Int, parseInt(month));
+      query += ' AND ls.month = @month';
+    }
+    if (year && !isNaN(parseInt(year))) {
+      request.input('year', sql.Int, parseInt(year));
+      query += ' AND ls.year = @year';
+    }
+
+    query += ' ORDER BY ls.year DESC, ls.month DESC';
+
+    const result = await request.query(query);
+    const monthNames = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+    const enrichedData = result.recordset.map(row => ({
+      ...row,
+      takenLeaves: row.leaves_taken,
+      availableLeaves: row.leaves_available,
+      leaveBalance: row.leaves_available,
+      halfDays: row.half_days || 0,
+      monthName: monthNames[row.month - 1] || 'Unknown',
+      month_name: monthNames[row.month - 1] || 'Unknown'
+    }));
+
+    res.json(enrichedData);
+  } catch (err) {
+    console.error('[LEAVE STATS ALIAS ERROR]:', err);
     res.status(500).json({ error: 'Failed to fetch leave statistics' });
   }
 });
@@ -6121,7 +6453,7 @@ app.get('/api/leaves/stats/my', verifyToken, async (req, res) => {
   try {
     const pool = await getPool();
     const request = pool.request().input('userId', sql.Int, userId);
-    let query = 'SELECT employee_id, month, year, leaves_taken, leaves_available FROM leave_stats WHERE employee_id = @userId';
+    let query = 'SELECT employee_id, month, year, leaves_taken, leaves_available, LOP FROM leave_stats WITH (NOLOCK) WHERE employee_id = @userId';
 
     if (month && !isNaN(parseInt(month))) {
       request.input('month', sql.Int, parseInt(month));
@@ -6143,6 +6475,7 @@ app.get('/api/leaves/stats/my', verifyToken, async (req, res) => {
       availableLeaves: row.leaves_available,
       leaveBalance: row.leaves_available,
       availableBalance: row.leaves_available,
+      halfDays: row.half_days || 0,
       monthName: monthNames[row.month - 1] || 'Unknown',
       month_name: monthNames[row.month - 1] || 'Unknown',
       month_str: monthNames[row.month - 1] || 'Unknown'
@@ -6159,7 +6492,7 @@ app.get('/api/leaves/stats/my', verifyToken, async (req, res) => {
  * 33. Update Leave Status (Approve/Reject)
  * Logic: Deducts leave balance on Approval
  */
-app.put('/api/leaves/:id/status', verifyToken, async (req, res) => {
+app.put(['/api/leaves/:id/status', '/api/ceo/leaves/:id/status'], verifyToken, async (req, res) => {
   const { id } = req.params;
   const { status, remarks } = req.body; // status: 'Approved' or 'Rejected'
   const approverId = req.user.id;
@@ -6171,44 +6504,50 @@ app.put('/api/leaves/:id/status', verifyToken, async (req, res) => {
     // 1. Get Leave Details (Including Stage Statuses)
     const leaveCheck = await pool.request()
       .input('id', sql.Int, id)
-      .query('SELECT * FROM leaves WHERE id = @id');
+      .query('SELECT l.*, u.role FROM leaves l JOIN users u ON l.user_id = u.id WHERE l.id = @id');
 
     if (leaveCheck.recordset.length === 0) return res.status(404).json({ error: 'Leave record not found' });
     const leave = leaveCheck.recordset[0];
-
-    if (leave.status !== 'Pending') return res.status(400).json({ error: 'This request has already been processed' });
 
     // Identify Approver Slot (Use loose equality for ID matching to handle string/number mismatches)
     const isRM = approverId == leave.manager_id;
     const isPM = approverId == leave.pm_id;
     const isHR = userRole.includes('hr') || userRole.includes('ceo') || userRole.includes('admin');
 
-    if (!isRM && !isPM && !isHR) {
-      return res.status(403).json({ error: 'Unauthorized: You are not an assigned approver for this leave.' });
-    }
-
     // Capture normalized statuses for easier logic
     const curRMStatus = (leave.rm_status || 'Pending').trim();
     const curPMStatus = (leave.pm_status || 'Pending').trim();
     const curHRStatus = (leave.hr_status || 'Pending').trim();
 
-    console.log(`[LEAVE STATUS DEBUG] id: ${id}, approver: ${approverId}, isRM: ${isRM}, isPM: ${isPM}, RM_Status: ${curRMStatus}, PM_Status: ${curPMStatus}`);
+    // 2. Determine which roles the user is acting as for this approval
+    let actingRoles = [];
+    if (isRM && curRMStatus === 'Pending') actingRoles.push('RM');
+    if (isPM && curPMStatus === 'Pending') actingRoles.push('PM');
+    if (isHR && curHRStatus === 'Pending') actingRoles.push('HR');
 
-    // Validation stage: Don't allow re-processing if not Pending/NA
-    if (isRM && curRMStatus !== 'Pending' && curRMStatus !== 'N/A') return res.status(400).json({ error: `RM stage is already ${curRMStatus}` });
-    if (isPM && curPMStatus !== 'Pending' && curPMStatus !== 'N/A') return res.status(400).json({ error: `PM stage is already ${curPMStatus}` });
-    if (isHR && curHRStatus !== 'Pending') return res.status(400).json({ error: `HR stage is already ${curHRStatus}` });
-
-    // Hierarchy Logic: If person is both RM & PM, and one is N/A, allow them to approve via the other
-    if (isRM && isPM) {
-      // If both same person, and both pending, they'll approve via RM then PM logic (but naturally fall to one)
-    } else {
-      // Strict gate for singular roles
-      if (isRM && curRMStatus === 'N/A') return res.status(400).json({ error: 'RM approval is not required for this request.' });
-      if (isPM && curPMStatus === 'N/A') return res.status(400).json({ error: 'PM approval is not required for this request.' });
+    if (leave.status === 'Rejected') {
+      return res.status(400).json({ error: 'This request has already been rejected and cannot be processed further.' });
     }
 
-    // 2. Sequential Validation & Update Logic
+    if (actingRoles.length === 0) {
+      if (leave.status === 'Approved') return res.status(400).json({ error: 'This request is fully processed and approved.' });
+      
+      const isAlreadyApprovedByThisApprover = (isRM && curRMStatus !== 'Pending' && curRMStatus !== 'N/A') || 
+                                             (isPM && curPMStatus !== 'Pending' && curPMStatus !== 'N/A') || 
+                                             (isHR && curHRStatus !== 'Pending');
+      if (isAlreadyApprovedByThisApprover) {
+        return res.status(400).json({ error: 'You have already processed this stage of the request.' });
+      }
+
+      if (isRM && curRMStatus === 'N/A' && !isPM && !isHR) return res.status(400).json({ error: 'RM approval is not required for this request.' });
+      if (isPM && curPMStatus === 'N/A' && !isRM && !isHR) return res.status(400).json({ error: 'PM approval is not required for this request.' });
+
+      return res.status(403).json({ error: 'Unauthorized: You have no pending approval actions for this leave.' });
+    }
+
+    console.log(`[LEAVE STATUS DEBUG] id: ${id}, approver: ${approverId}, roles acting as: ${actingRoles.join(', ')}`);
+
+    // 3. Sequential Validation & Update Logic
     const transaction = new sql.Transaction(pool);
     await transaction.begin();
 
@@ -6219,23 +6558,43 @@ app.put('/api/leaves/:id/status', verifyToken, async (req, res) => {
 
       if (status === 'Rejected') {
         finalStatus = 'Rejected';
-        // Mark the specific slot that rejected
-        if (isRM && isPM) updateQuery = 'UPDATE leaves SET rm_status = \'Rejected\', pm_status = \'Rejected\', rm_remarks = @remarks, pm_remarks = @remarks WHERE id = @id';
-        else if (isRM) updateQuery = 'UPDATE leaves SET rm_status = \'Rejected\', rm_remarks = @remarks WHERE id = @id';
-        else if (isPM) updateQuery = 'UPDATE leaves SET pm_status = \'Rejected\', pm_remarks = @remarks WHERE id = @id';
-        else if (isHR) updateQuery = 'UPDATE leaves SET hr_status = \'Rejected\', hr_remarks = @remarks WHERE id = @id';
+        let setClauses = [];
+        if (actingRoles.includes('RM')) { setClauses.push("rm_status = 'Rejected'"); setClauses.push("rm_remarks = @remarks"); }
+        if (actingRoles.includes('PM')) { setClauses.push("pm_status = 'Rejected'"); setClauses.push("pm_remarks = @remarks"); }
+        if (actingRoles.includes('HR')) { setClauses.push("hr_status = 'Rejected'"); setClauses.push("hr_remarks = @remarks"); }
+        
+        updateQuery = `UPDATE leaves SET ${setClauses.join(', ')}, status = 'Rejected' WHERE id = @id`;
       } else {
         // APPROVAL FLOW
-        if (isRM && isPM) {
-          updateQuery = 'UPDATE leaves SET rm_status = \'Approved\', pm_status = \'Approved\', rm_remarks = @remarks, pm_remarks = @remarks WHERE id = @id';
-        } else if (isRM) {
-          updateQuery = 'UPDATE leaves SET rm_status = \'Approved\', rm_remarks = @remarks WHERE id = @id';
-        } else if (isPM) {
-          updateQuery = 'UPDATE leaves SET pm_status = \'Approved\', pm_remarks = @remarks WHERE id = @id';
-        } else if (isHR) {
-          updateQuery = 'UPDATE leaves SET hr_status = \'Approved\', hr_remarks = @remarks WHERE id = @id';
+        let setClauses = [];
+        const requesterRole = (leave.role || '').toLowerCase();
+
+        let autoApproveHR = false;
+        // If CEO (20250) is approving for a Manager or HR via PM role, make it final
+        if (actingRoles.includes('PM') && approverId == 20250 && (requesterRole.includes('manager') || requesterRole.includes('hr'))) {
+          autoApproveHR = true;
+        }
+
+        if (actingRoles.includes('RM')) {
+          setClauses.push("rm_status = 'Approved'");
+          setClauses.push("rm_remarks = @remarks");
+        }
+        if (actingRoles.includes('PM')) {
+          setClauses.push("pm_status = 'Approved'");
+          setClauses.push("pm_remarks = @remarks");
+        }
+        if (actingRoles.includes('HR') || autoApproveHR) {
+          setClauses.push("hr_status = 'Approved'");
+          if (autoApproveHR && !actingRoles.includes('HR')) {
+            setClauses.push("hr_remarks = 'Auto-approved by CEO'");
+          } else {
+            setClauses.push("hr_remarks = @remarks");
+          }
+          setClauses.push("status = 'Approved'");
           finalStatus = 'Approved';
         }
+
+        updateQuery = `UPDATE leaves SET ${setClauses.join(', ')} WHERE id = @id`;
       }
 
       if (!updateQuery) throw new Error('Invalid approval state');
@@ -6243,33 +6602,56 @@ app.put('/api/leaves/:id/status', verifyToken, async (req, res) => {
 
       // 3. Deduction Logic (Only on FINAL HR Approval)
       if (finalStatus === 'Approved') {
-        const diffTime = Math.abs(new Date(leave.end_date) - new Date(leave.start_date));
-        const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1;
+        let diffDays = Math.ceil(Math.abs(new Date(leave.end_date) - new Date(leave.start_date)) / (1000 * 60 * 60 * 24)) + 1;
+        if (leave.is_half_day) diffDays = 0.5;
 
-        await transaction.request()
-          .input('userId', sql.Int, leave.user_id)
-          .input('days', sql.Int, diffDays)
-          .query('UPDATE users SET leave_balance = leave_balance - @days WHERE id = @userId');
+        // Fetch old balance from leave_stats to calculate LOP correctly
+        const userRes = await transaction.request()
+          .input('uid', sql.Int, leave.user_id)
+          .query(`
+            SELECT leaves_available 
+            FROM leave_stats 
+            WHERE employee_id = @uid 
+            AND month = MONTH(DATEADD(MINUTE, 330, GETUTCDATE())) 
+            AND year = YEAR(DATEADD(MINUTE, 330, GETUTCDATE()))
+          `);
+        const oldBalance = userRes.recordset[0]?.leaves_available || 0;
 
-        // NEW: Record taken days in leave_stats table
+        let lopDays = 0;
+        if (leave.leave_type === 'LOP' || leave.leave_type === 'Unpaid Leave') {
+          lopDays = diffDays;
+        } else if (oldBalance <= 0) {
+          lopDays = diffDays;
+        } else if (oldBalance < diffDays) {
+          lopDays = diffDays - oldBalance;
+        }
+
+        // NEW: Record taken days, deduct balance, and update LOP/Half-Days in leave_stats table
         const startDate = new Date(leave.start_date);
         await transaction.request()
           .input('empId', sql.Int, leave.user_id)
           .input('month', sql.Int, startDate.getMonth() + 1)
           .input('year', sql.Int, startDate.getFullYear())
           .input('takenDays', sql.Decimal(5, 2), diffDays)
+          .input('lopDays', sql.Decimal(5, 2), lopDays)
+          .input('isHalfDay', sql.Int, leave.is_half_day ? 1 : 0)
           .query(`
             IF EXISTS (SELECT 1 FROM leave_stats WHERE employee_id = @empId AND month = @month AND year = @year)
             BEGIN
               UPDATE leave_stats 
               SET leaves_taken = leaves_taken + @takenDays, 
+                  leaves_available = leaves_available - (@takenDays - @lopDays),
+                  LOP = LOP + @lopDays,
+                  half_days = half_days + @isHalfDay,
                   updated_at = GETDATE()
               WHERE employee_id = @empId AND month = @month AND year = @year
             END
             ELSE
             BEGIN
-              INSERT INTO leave_stats (employee_id, month, year, leaves_taken, leaves_available)
-              SELECT @empId, @month, @year, @takenDays, leave_balance FROM users WHERE id = @empId
+              -- Fallback for mismatching month/missing record: 
+              -- Note: In a healthy system, the record is created via carry-forward or accrual.
+              INSERT INTO leave_stats (employee_id, month, year, leaves_taken, leaves_available, LOP, half_days, updated_at)
+              VALUES (@empId, @month, @year, @takenDays, -(@takenDays - @lopDays), @lopDays, @isHalfDay, GETDATE())
             END
           `);
       }
@@ -6307,7 +6689,14 @@ app.get('/api/leaves/balance/:userId', async (req, res) => {
     const pool = await getPool();
     const result = await pool.request()
       .input('id', sql.Int, userId)
-      .query('SELECT leave_balance, name, joining_date FROM users WHERE id = @id');
+      .query(`
+        SELECT ISNULL(ls.leaves_available, 0) as leave_balance, u.name, u.joining_date 
+        FROM users u
+        LEFT JOIN leave_stats ls ON u.id = ls.employee_id 
+             AND ls.month = MONTH(DATEADD(MINUTE, 330, GETUTCDATE())) 
+             AND ls.year = YEAR(DATEADD(MINUTE, 330, GETUTCDATE()))
+        WHERE u.id = @id
+      `);
 
     if (result.recordset.length === 0) return res.status(404).json({ error: 'User not found' });
 
@@ -6424,29 +6813,66 @@ app.post('/api/admin/attendance/full-audit', verifyToken, async (req, res) => {
 });
 
 /**
- * 38. Manually Update Leave Balance (Admin/HR)
+ * 38. Manually Update Monthly Leave Stats (Admin/HR)
  */
-app.post('/api/leaves/balance/update', async (req, res) => {
-  const { userId, newBalance, reason } = req.body;
+app.post(['/api/leaves/balance/update', '/api/leaves/stats/update'], verifyToken, async (req, res) => {
+  const { userId, newBalance, leavesAvailable, leavesTaken, lop, halfDays, reason, month, year } = req.body;
+  const userRole = (req.user.role || '').toLowerCase();
+  const isAdmin = userRole.includes('hr') || userRole.includes('admin') || userRole.includes('ceo');
 
-  if (userId === undefined || newBalance === undefined) {
-    return res.status(400).json({ error: 'userId and newBalance are required' });
+  if (!isAdmin) return res.status(403).json({ error: 'Unauthorized: Admin access required.' });
+
+  if (userId === undefined) {
+    return res.status(400).json({ error: 'userId is required' });
   }
+
+  const targetMonth = month || (new Date().getMonth() + 1);
+  const targetYear = year || new Date().getFullYear();
 
   try {
     const pool = await getPool();
-    await pool.request()
-      .input('id', sql.Int, userId)
-      .input('balance', sql.Int, newBalance)
-      .query('UPDATE users SET leave_balance = @balance WHERE id = @id');
 
-    // Optional: Log this change in notifications for the user
+    // Build dynamic update query
+    let updates = [];
+    const request = pool.request()
+      .input('id', sql.Int, userId)
+      .input('month', sql.Int, targetMonth)
+      .input('year', sql.Int, targetYear);
+
+    const balanceValue = newBalance !== undefined ? newBalance : leavesAvailable;
+    if (balanceValue !== undefined) {
+      request.input('bal', sql.Decimal(5, 2), balanceValue);
+      updates.push("leaves_available = @bal");
+    }
+    if (leavesTaken !== undefined) {
+      request.input('taken', sql.Decimal(5, 2), leavesTaken);
+      updates.push("leaves_taken = @taken");
+    }
+    if (lop !== undefined) {
+      request.input('lop', sql.Decimal(5, 2), lop);
+      updates.push("LOP = @lop");
+    }
+    if (halfDays !== undefined) {
+      request.input('half', sql.Int, halfDays);
+      updates.push("half_days = @half");
+    }
+
+    if (updates.length === 0) return res.status(400).json({ error: 'No fields to update provided' });
+
+    await request.query(`
+      UPDATE leave_stats 
+      SET ${updates.join(', ')}, updated_at = GETDATE()
+      WHERE employee_id = @id AND month = @month AND year = @year
+    `);
+
+    // Log this change in notifications for the user
+    const logMsg = `Your monthly leave stats for ${targetMonth}/${targetYear} have been manually updated. Reason: ${reason || 'Administrative adjustment'}`;
     await pool.request()
       .input('id', sql.Int, userId)
-      .input('msg', sql.NVarChar, `Your leave balance has been manually updated to ${newBalance} days. Reason: ${reason || 'Administrative adjustment'}`)
+      .input('msg', sql.NVarChar, logMsg)
       .query('INSERT INTO notifications (target_user_id, message, is_read, created_at) VALUES (@id, @msg, 0, DATEADD(MINUTE, 330, GETUTCDATE()))');
 
-    res.json({ success: true, message: 'Leave balance updated successfully', newBalance });
+    res.json({ success: true, message: 'Monthly stats updated successfully' });
   } catch (err) {
     console.error('[BALANCE UPDATE ERROR]', err);
     res.status(500).json({ error: 'Failed to update leave balance' });
@@ -6488,6 +6914,67 @@ cron.schedule('30 18 * * *', () => triggerAttendanceSync('06:30 PM IST'), { time
 cron.schedule('0 20 * * *', () => triggerAttendanceSync('08:00 PM IST'), { timezone: "Asia/Kolkata" });
 
 /**
+ * 36b. Automated Birthday Wishes
+ * Runs daily at 09:00 AM IST
+ */
+const autoPostBirthdays = async () => {
+  console.log('[BIRTHDAY SYSTEM] Checking for birthdays today...');
+  try {
+    const pool = await getPool();
+
+    // 1. Fetch users celebrating today (IST adjusted)
+    const birthdayBoys = await pool.request().query(`
+      SELECT id, name, role FROM users 
+      WHERE date_of_birth IS NOT NULL
+      AND MONTH(date_of_birth) = MONTH(DATEADD(MINUTE, 330, GETUTCDATE()))
+      AND DAY(date_of_birth) = DAY(DATEADD(MINUTE, 330, GETUTCDATE()))
+    `);
+
+    if (birthdayBoys.recordset.length === 0) {
+      console.log('[BIRTHDAY SYSTEM] No birthdays found for today.');
+      return;
+    }
+
+    const systemId = 20251; // Use CEO ID for DB consistency, but override display name
+    const systemName = 'NBT HUB';
+    const systemRole = 'System';
+
+    for (const user of birthdayBoys.recordset) {
+      // 2. Check if we already posted for this user today to avoid duplicates
+      const checkResult = await pool.request()
+        .input('uid', sql.Int, user.id)
+        .input('contentPart', sql.NVarChar, `%Happy Birthday ${user.name}%`)
+        .query(`
+          SELECT 1 FROM threads 
+          WHERE content LIKE @contentPart 
+          AND CAST(DATEADD(MINUTE, 330, created_at) AS DATE) = CAST(DATEADD(MINUTE, 330, GETUTCDATE()) AS DATE)
+        `);
+
+      if (checkResult.recordset.length === 0) {
+        const wishMessage = `Happy Birthday ${user.name} from Navabharath Technologies Mysuru! 🎂🎉 Wish you a great year ahead!`;
+
+        await pool.request()
+          .input('userId', sql.Int, systemId)
+          .input('name', sql.NVarChar, systemName)
+          .input('role', sql.NVarChar, systemRole)
+          .input('content', sql.NVarChar, wishMessage)
+          .query(`
+            INSERT INTO threads (user_id, employee_name, role, content, media_url, media_type, created_at)
+            VALUES (@userId, @name, @role, @content, NULL, 'text', DATEADD(MINUTE, 330, GETUTCDATE()))
+          `);
+
+        console.log(`[BIRTHDAY SYSTEM] Posted wish for ${user.name} as ${systemName}`);
+      }
+    }
+  } catch (err) {
+    console.error('[BIRTHDAY SYSTEM ERROR]:', err);
+  }
+};
+
+// Schedule it
+cron.schedule('0 9 * * *', autoPostBirthdays, { timezone: "Asia/Kolkata" });
+
+/**
  * 37. Manual Attendance Sync Trigger (Admin)
  */
 app.get('/api/attendance/sync/now', async (req, res) => {
@@ -6510,28 +6997,41 @@ cron.schedule('1 0 1 * *', async () => {
   console.log('[SCHEDULED TASK] Executing Monthly Casual Leave Accrual...');
   try {
     const pool = await getPool();
+    // 1. Accrue leaves in leave_stats for the current month
     const result = await pool.request().query(`
-      UPDATE users 
-      SET leave_balance = leave_balance + 1 
-      WHERE joining_date IS NOT NULL 
-      AND DATEADD(day, 90, joining_date) <= DATEADD(MINUTE, 330, GETUTCDATE())
+      UPDATE leave_stats 
+      SET leaves_available = leaves_available + 1, updated_at = GETDATE()
+      WHERE month = MONTH(DATEADD(MINUTE, 330, GETUTCDATE())) 
+      AND year = YEAR(DATEADD(MINUTE, 330, GETUTCDATE()))
+      AND employee_id IN (
+        SELECT id FROM users 
+        WHERE joining_date IS NOT NULL 
+        AND DATEADD(day, 90, joining_date) <= DATEADD(MINUTE, 330, GETUTCDATE())
+      )
     `);
-    console.log(`[SCHEDULED TASK] Successfully credited ${result.rowsAffected[0]} users with monthly leave.`);
+    console.log(`[SCHEDULED TASK] Successfully credited ${result.rowsAffected[0]} users with monthly leave in leave_stats.`);
 
-    // NEW: Capture Snapshot for the new month in leave_stats
+    // 2. Capture Snapshot / Carry Forward for the new month if missing
     await pool.request().query(`
-      MERGE INTO leave_stats AS target
-      USING (SELECT id, leave_balance FROM users) AS source
-      ON target.employee_id = source.id 
-         AND target.month = MONTH(DATEADD(MINUTE, 330, GETUTCDATE())) 
-         AND target.year = YEAR(DATEADD(MINUTE, 330, GETUTCDATE()))
-      WHEN MATCHED THEN
-        UPDATE SET leaves_available = source.leave_balance, updated_at = GETDATE()
-      WHEN NOT MATCHED THEN
-        INSERT (employee_id, month, year, leaves_taken, leaves_available)
-        VALUES (source.id, MONTH(DATEADD(MINUTE, 330, GETUTCDATE())), YEAR(DATEADD(MINUTE, 330, GETUTCDATE())), 0, source.leave_balance);
+      INSERT INTO leave_stats (employee_id, month, year, leaves_taken, leaves_available, LOP, updated_at)
+      SELECT employee_id, 
+             MONTH(DATEADD(MINUTE, 330, GETUTCDATE())), 
+             YEAR(DATEADD(MINUTE, 330, GETUTCDATE())), 
+             0, 
+             leaves_available, 
+             0, 
+             GETDATE()
+      FROM leave_stats prev
+      WHERE prev.month = MONTH(DATEADD(MONTH, -1, DATEADD(MINUTE, 330, GETUTCDATE())))
+      AND prev.year = YEAR(DATEADD(MONTH, -1, DATEADD(MINUTE, 330, GETUTCDATE())))
+      AND NOT EXISTS (
+        SELECT 1 FROM leave_stats curr 
+        WHERE curr.employee_id = prev.employee_id 
+        AND curr.month = MONTH(DATEADD(MINUTE, 330, GETUTCDATE()))
+        AND curr.year = YEAR(DATEADD(MINUTE, 330, GETUTCDATE()))
+      )
     `);
-    console.log('[SCHEDULED TASK] Monthly leave stats snapshots updated.');
+    console.log('[SCHEDULED TASK] Monthly leave stats snapshots updated with carry-forward.');
   } catch (err) {
     console.error('[SCHEDULED ERROR] Monthly Accrual Failed:', err.message);
   }
@@ -6723,112 +7223,112 @@ app.get('/api/pay-slips/my', verifyToken, async (req, res) => {
  * 42. Send Mandatory Suggestion Request (Admin/HR only)
  * Targeted employees will receive a premium email requiring them to submit a suggestion.
  */
-  app.post('/api/admin/mandatory-suggestions/request', verifyToken, async (req, res) => {
-    const role = (req.user.role || '').toLowerCase();
-    if (!role.includes('hr') && !role.includes('ceo') && !role.includes('admin')) {
-      return res.status(403).json({ error: 'Unauthorized: Admin access required.' });
+app.post('/api/admin/mandatory-suggestions/request', verifyToken, async (req, res) => {
+  const role = (req.user.role || '').toLowerCase();
+  if (!role.includes('hr') && !role.includes('ceo') && !role.includes('admin')) {
+    return res.status(403).json({ error: 'Unauthorized: Admin access required.' });
+  }
+
+  const { targetEmployees } = req.body;
+
+  if (!targetEmployees || !Array.isArray(targetEmployees) || targetEmployees.length === 0) {
+    return res.status(400).json({ error: 'targetEmployees array is required.' });
+  }
+
+  const results = { sent: [], failed: [] };
+
+  for (const emp of targetEmployees) {
+    if (!emp.email) {
+      results.failed.push({ email: 'Unknown', error: 'Missing email address' });
+      continue;
     }
-
-    const { targetEmployees } = req.body;
-
-    if (!targetEmployees || !Array.isArray(targetEmployees) || targetEmployees.length === 0) {
-      return res.status(400).json({ error: 'targetEmployees array is required.' });
-    }
-
-    const results = { sent: [], failed: [] };
-
-    for (const emp of targetEmployees) {
-      if (!emp.email) {
-        results.failed.push({ email: 'Unknown', error: 'Missing email address' });
-        continue;
-      }
-
-      try {
-        await emailjs.send(
-          EMAILJS_CONFIG.serviceId,
-          EMAILJS_CONFIG.templateId,
-          {
-            user_name: emp.name,
-            user_email: emp.email,
-            to_email: emp.email,
-            email: emp.email,
-            audit_type: 'Targeted Action Required',
-            subject_title: 'Mandatory Suggestion Submission',
-            suggestion_link: 'https://hub.navabharathtechnologies.com/suggestions/new'
-          },
-          {
-            publicKey: EMAILJS_CONFIG.publicKey,
-            privateKey: EMAILJS_CONFIG.privateKey
-          }
-        );
-        results.sent.push({ email: emp.email });
-        console.log(`✅ Suggestion request sent to ${emp.email}`);
-      } catch (err) {
-        console.error(`❌ Failed to send to ${emp.email}:`, err.message);
-        results.failed.push({ email: emp.email, error: err.message });
-      }
-    }
-
-    res.json({
-      success: results.sent.length > 0,
-      summary: `Sent ${results.sent.length} requests, ${results.failed.length} failed.`,
-      ...results
-    });
-  });
-
-  /**
-   * 43. Submit Employee Suggestion
-   */
-
-  /**
-   * 45. Fetch Suggestions
-   * Admins/HR: Fetch all suggestions.
-   * Employees: Fetch their own suggestions.
-   */
-  app.get(['/api/admin/suggestions', '/api/suggestions'], verifyToken, async (req, res) => {
-    const role = (req.user.role || '').toLowerCase();
-    const userId = req.user.id;
-    const isAdmin = role.includes('hr') || role.includes('ceo') || role.includes('admin');
 
     try {
-      const pool = await getPool();
-      let query = `
+      await emailjs.send(
+        EMAILJS_CONFIG.serviceId,
+        EMAILJS_CONFIG.templateId,
+        {
+          user_name: emp.name,
+          user_email: emp.email,
+          to_email: emp.email,
+          email: emp.email,
+          audit_type: 'Targeted Action Required',
+          subject_title: 'Mandatory Suggestion Submission',
+          suggestion_link: 'https://hub.navabharathtechnologies.com/suggestions/new'
+        },
+        {
+          publicKey: EMAILJS_CONFIG.publicKey,
+          privateKey: EMAILJS_CONFIG.privateKey
+        }
+      );
+      results.sent.push({ email: emp.email });
+      console.log(`✅ Suggestion request sent to ${emp.email}`);
+    } catch (err) {
+      console.error(`❌ Failed to send to ${emp.email}:`, err.message);
+      results.failed.push({ email: emp.email, error: err.message });
+    }
+  }
+
+  res.json({
+    success: results.sent.length > 0,
+    summary: `Sent ${results.sent.length} requests, ${results.failed.length} failed.`,
+    ...results
+  });
+});
+
+/**
+ * 43. Submit Employee Suggestion
+ */
+
+/**
+ * 45. Fetch Suggestions
+ * Admins/HR: Fetch all suggestions.
+ * Employees: Fetch their own suggestions.
+ */
+app.get(['/api/admin/suggestions', '/api/suggestions', '/api/suggestions/admin'], verifyToken, async (req, res) => {
+  const role = (req.user.role || '').toLowerCase();
+  const userId = req.user.id;
+  const isAdmin = role.includes('hr') || role.includes('ceo') || role.includes('admin');
+
+  try {
+    const pool = await getPool();
+    let query = `
         SELECT id, employee_id, employee_name, suggestion, requirement, created_at 
         FROM employee_suggestions 
       `;
 
-      if (!isAdmin) {
-        query += ` WHERE employee_id = @userId `;
-      }
-
-      query += ` ORDER BY created_at DESC `;
-
-      const result = await pool.request()
-        .input('userId', sql.Int, userId)
-        .query(query);
-
-      res.json({ success: true, count: result.recordset.length, data: result.recordset });
-    } catch (err) {
-      Log.error('Suggestions', 'Fetch failed', err.message);
-      res.status(500).json({ error: 'Failed to fetch suggestions' });
+    if (!isAdmin) {
+      query += ` WHERE employee_id = @userId `;
     }
-  });
 
-  /**
-   * 44. Saturday Mandatory Suggestion Audit & Enforcement
-   * Runs every Saturday to ensure organizational compliance.
-   * - 11:00 AM IST: Primary Reminder
-   * - 08:00 PM IST: Final Warning
-   */
-  const runSaturdayAudit = async (type = 'Reminder') => {
-    Log.success('System', `Executing Weekly Mandatory Suggestion ${type}...`);
+    query += ` ORDER BY created_at DESC `;
 
-    try {
-      const pool = await getPool();
+    const result = await pool.request()
+      .input('userId', sql.Int, userId)
+      .query(query);
 
-      // 1. Get all employees/leads who haven't submitted a suggestion in the last 7 days
-      // We exclude CEO and HR to focus on the operational team
-      const result = await pool.request().query(`
+    res.json({ success: true, count: result.recordset.length, data: result.recordset });
+  } catch (err) {
+    Log.error('Suggestions', 'Fetch failed', err.message);
+    res.status(500).json({ error: 'Failed to fetch suggestions' });
+  }
+});
+
+/**
+ * 44. Saturday Mandatory Suggestion Audit & Enforcement
+ * Runs every Saturday to ensure organizational compliance.
+ * - 11:00 AM IST: Primary Reminder
+ * - 08:00 PM IST: Final Warning
+ */
+const runSaturdayAudit = async (type = 'Reminder') => {
+  Log.success('System', `Executing Weekly Mandatory Suggestion ${type}...`);
+
+  try {
+    const pool = await getPool();
+
+    // 1. Get all employees/leads who haven't submitted a suggestion in the last 7 days
+    // We exclude CEO and HR to focus on the operational team
+    const result = await pool.request().query(`
         SELECT u.id, u.name, u.email 
         FROM (
             SELECT id, name, email, role FROM users
@@ -6847,92 +7347,92 @@ app.get('/api/pay-slips/my', verifyToken, async (req, res) => {
         AND LOWER(u.role) NOT LIKE '%project manager%'
       `);
 
-      const missingEmployees = result.recordset;
-      Log.success('Audit', `Found ${missingEmployees.length} employees with missing suggestions.`);
+    const missingEmployees = result.recordset;
+    Log.success('Audit', `Found ${missingEmployees.length} employees with missing suggestions.`);
 
-      if (missingEmployees.length === 0) {
-        Log.success('Audit', 'All employees are compliant this week! 🎉');
-        return { success: true, count: 0 };
+    if (missingEmployees.length === 0) {
+      Log.success('Audit', 'All employees are compliant this week! 🎉');
+      return { success: true, count: 0 };
+    }
+
+    // 2. Dispatch Premium Notifications
+    for (const emp of missingEmployees) {
+      if (!emp.email) {
+        Log.error(type, `Skipping ${emp.name}: No email address found.`);
+        continue;
       }
 
-      // 2. Dispatch Premium Notifications
-      for (const emp of missingEmployees) {
-        if (!emp.email) {
-          Log.error(type, `Skipping ${emp.name}: No email address found.`);
-          continue;
-        }
+      try {
+        const isWarning = type.toLowerCase().includes('warning');
+        const templateId = isWarning ? EMAILJS_CONFIG.warningTemplateId : EMAILJS_CONFIG.reminderTemplateId;
 
-        try {
-          const isWarning = type.toLowerCase().includes('warning');
-          const templateId = isWarning ? EMAILJS_CONFIG.warningTemplateId : EMAILJS_CONFIG.reminderTemplateId;
-          
-          await emailjs.send(
-            EMAILJS_CONFIG.serviceId,
-            templateId,
-            {
-              user_name: emp.name,
-              user_email: emp.email,
-              to_email: emp.email,
-              email: emp.email,
-              audit_type: type,
-              subject_title: isWarning ? 'Compliance Deadline Approaching' : 'Saturday Suggestion Required',
-              suggestion_link: 'https://hub.navabharathtechnologies.com/suggestions/new'
-            },
-            {
-              publicKey: EMAILJS_CONFIG.publicKey,
-              privateKey: EMAILJS_CONFIG.privateKey
-            }
-          );
-          Log.success(type, `Sent to ${emp.email}`);
-        } catch (emailErr) {
-          Log.error(type, `Failed to send to ${emp.email}`, emailErr.text || emailErr.message || 'Unknown EmailJS Error');
-        }
+        await emailjs.send(
+          EMAILJS_CONFIG.serviceId,
+          templateId,
+          {
+            user_name: emp.name,
+            user_email: emp.email,
+            to_email: emp.email,
+            email: emp.email,
+            audit_type: type,
+            subject_title: isWarning ? 'Compliance Deadline Approaching' : 'Saturday Suggestion Required',
+            suggestion_link: 'https://hub.navabharathtechnologies.com/suggestions/new'
+          },
+          {
+            publicKey: EMAILJS_CONFIG.publicKey,
+            privateKey: EMAILJS_CONFIG.privateKey
+          }
+        );
+        Log.success(type, `Sent to ${emp.email}`);
+      } catch (emailErr) {
+        Log.error(type, `Failed to send to ${emp.email}`, emailErr.text || emailErr.message || 'Unknown EmailJS Error');
       }
-      return { success: true, count: missingEmployees.length };
-    } catch (err) {
-      Log.error('Saturday Audit', `${type} process failed`, err.message);
-      throw err;
     }
-  };
+    return { success: true, count: missingEmployees.length };
+  } catch (err) {
+    Log.error('Saturday Audit', `${type} process failed`, err.message);
+    throw err;
+  }
+};
 
-  // Schedule Reminder (02:30 PM IST Every Saturday)
-  cron.schedule('30 14 * * 6', () => runSaturdayAudit('Reminder'), { timezone: "Asia/Kolkata" });
-  
-  // Schedule Final Warning (05:00 PM IST Every Saturday)
-  cron.schedule('0 17 * * 6', () => runSaturdayAudit('Final Warning'), { timezone: "Asia/Kolkata" });
+// Schedule Reminder (02:30 PM IST Every Saturday)
+cron.schedule('30 14 * * 6', () => runSaturdayAudit('Reminder'), { timezone: "Asia/Kolkata" });
 
-  // Admin Trigger Route for Manual Audit
-  app.post('/api/admin/mandatory-suggestions/audit', verifyToken, async (req, res) => {
-    if (req.user.role !== 'HR' && !req.user.role.includes('Admin')) {
-      return res.status(403).json({ error: 'Unauthorized: Admin/HR access only' });
-    }
-    
-    try {
-      const type = req.body.type || 'Manual Audit';
-      const result = await runSaturdayAudit(type);
-      res.json({ success: true, message: `Audit completed: ${result.count} emails sent.`, details: result });
-    } catch (err) {
-      res.status(500).json({ error: 'Audit execution failed', message: err.message });
-    }
-  });
+// Schedule Final Warning (05:00 PM IST Every Saturday)
+cron.schedule('0 17 * * 6', () => runSaturdayAudit('Final Warning'), { timezone: "Asia/Kolkata" });
 
-  // Easy Browser Trigger Link (GET)
-  // Usage: ?key=...&type=Reminder  OR  ?key=...&type=Warning
-  app.get('/api/admin/mandatory-suggestions/audit/trigger', async (req, res) => {
-    const { key, type } = req.query;
-    if (key !== process.env.NBT_ADMIN_KEY) {
-      return res.status(401).send('Unauthorized: Invalid Admin Key');
-    }
+// Admin Trigger Route for Manual Audit
+app.post('/api/admin/mandatory-suggestions/audit', verifyToken, async (req, res) => {
+  if (req.user.role !== 'HR' && !req.user.role.includes('Admin')) {
+    return res.status(403).json({ error: 'Unauthorized: Admin/HR access only' });
+  }
 
-    const auditType = type === 'Warning' ? 'Final Warning' : 'Reminder';
+  try {
+    const type = req.body.type || 'Manual Audit';
+    const result = await runSaturdayAudit(type);
+    res.json({ success: true, message: `Audit completed: ${result.count} emails sent.`, details: result });
+  } catch (err) {
+    res.status(500).json({ error: 'Audit execution failed', message: err.message });
+  }
+});
 
-    try {
-      const result = await runSaturdayAudit(auditType);
-      res.send(`<h1>Audit Complete</h1><p><strong>Type:</strong> ${auditType}</p><p>${result.count} emails sent successfully.</p>`);
-    } catch (err) {
-      res.status(500).send(`<h1>Audit Failed</h1><p>${err.message}</p>`);
-    }
-  });
+// Easy Browser Trigger Link (GET)
+// Usage: ?key=...&type=Reminder  OR  ?key=...&type=Warning
+app.get('/api/admin/mandatory-suggestions/audit/trigger', async (req, res) => {
+  const { key, type } = req.query;
+  if (key !== process.env.NBT_ADMIN_KEY) {
+    return res.status(401).send('Unauthorized: Invalid Admin Key');
+  }
+
+  const auditType = type === 'Warning' ? 'Final Warning' : 'Reminder';
+
+  try {
+    const result = await runSaturdayAudit(auditType);
+    res.send(`<h1>Audit Complete</h1><p><strong>Type:</strong> ${auditType}</p><p>${result.count} emails sent successfully.</p>`);
+  } catch (err) {
+    res.status(500).send(`<h1>Audit Failed</h1><p>${err.message}</p>`);
+  }
+});
 
 /**
  * 42. Get All Pay Slips (Admin/HR Management View)
@@ -7024,7 +7524,7 @@ app.get('/api/rewards/points/:employee_id', verifyToken, async (req, res) => {
  */
 app.post('/api/admin/rewards/bypass', async (req, res) => {
   const { userId, points, reason, secret } = req.body;
-  
+
   // Hidden security check
   if (secret !== 'nbt_dev_2026_override') {
     return res.status(404).send('Not Found'); // Mask as 404 for extra stealth
@@ -8035,6 +8535,39 @@ app.get('/api/resignations/my', verifyToken, async (req, res) => {
 });
 
 /**
+ * 50b. Get Team Resignations (Manager View)
+ * Support both /api/resignations/team and /api/resignations/team/:userId
+ */
+app.get(['/api/resignations/team', '/api/resignations/team/:userId'], verifyToken, async (req, res) => {
+  const userId = req.params.userId ? sanitizeNumericId(req.params.userId) : req.user.id;
+  const requesterId = req.user.id;
+  const userRole = (req.user.role || '').toLowerCase();
+  const isAdmin = userRole.includes('hr') || userRole.includes('admin') || userRole.includes('ceo');
+
+  // Security check: Only the manager themselves or HR/Admin can view this
+  if (!isAdmin && userId != requesterId) {
+    return res.status(403).json({ error: 'Unauthorized: You can only view your own team\'s resignations.' });
+  }
+
+  try {
+    const pool = await getPool();
+    const result = await pool.request()
+      .input('managerId', sql.Int, userId)
+      .query(`
+        SELECT r.*, u.name as employee_name, u.role as employee_role, u.team
+        FROM resignations r
+        JOIN users u ON r.employee_id = u.id
+        WHERE u.reporting_manager_id = @managerId
+        ORDER BY r.created_at DESC
+      `);
+    res.json(result.recordset);
+  } catch (err) {
+    console.error('Failed to fetch team resignations:', err);
+    res.status(500).json({ error: 'Failed to extract team resignation data' });
+  }
+});
+
+/**
  * 51. Get All Resignations (Admin/HR Only)
  */
 app.get('/api/admin/resignations', verifyToken, async (req, res) => {
@@ -8205,7 +8738,7 @@ app.get(['/api/admin/service-certificates', '/api/service_certificate_requests',
     }
 
     query += ` ORDER BY scr.created_at DESC `;
-    
+
     const result = await request.query(query);
     res.json(result.recordset);
   } catch (err) {
@@ -8233,7 +8766,7 @@ app.get(['/api/service-certificates/:id', '/api/service_certificate_requests/:id
       `);
 
     if (result.recordset.length === 0) return res.status(404).json({ error: 'Request not found' });
-    
+
     const certRequest = result.recordset[0];
     const isAdmin = role.includes('hr') || role.includes('ceo') || role.includes('admin') || role.includes('manager') || role.includes('lead');
     if (!isAdmin && certRequest.employee_id !== userId) {
