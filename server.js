@@ -732,7 +732,7 @@ app.post('/api/login', async (req, res) => {
         employee_id: user.id,
         userType: userType,
         phone_number: user.phone_number,
-        profile_picture: user.profile_picture,
+        profile_picture: user.profile_picture ? `/api/users/${user.id}/photo` : null,
         about_me: user.about_me
       }
     });
@@ -1530,9 +1530,21 @@ app.get('/api/profile/picture/:email', async (req, res) => {
       return res.status(503).json({ error: 'Database is currently offline' });
     }
 
-    const result = await pool.request()
+    let result = await pool.request()
       .input('email', sql.NVarChar, email)
       .query('SELECT profile_picture FROM users WHERE email = @email');
+
+    if (result.recordset.length === 0 || !result.recordset[0].profile_picture) {
+      result = await pool.request()
+        .input('email', sql.NVarChar, email)
+        .query('SELECT profile_picture FROM interns WHERE email = @email');
+    }
+
+    if (result.recordset.length === 0 || !result.recordset[0].profile_picture) {
+      result = await pool.request()
+        .input('email', sql.NVarChar, email)
+        .query('SELECT profile_picture FROM new_joinees WHERE email_id = @email');
+    }
 
     if (result.recordset.length === 0 || !result.recordset[0].profile_picture) {
       // Return 200 with null instead of 404 to avoid frontend fetch/broken image breakage
@@ -1569,9 +1581,21 @@ app.get('/api/users/:id/photo', async (req, res) => {
   const { id } = req.params;
   try {
     const pool = await getPool();
-    const result = await pool.request()
+    let result = await pool.request()
       .input('id', sql.Int, id)
       .query('SELECT profile_picture FROM users WHERE id = @id');
+
+    if (result.recordset.length === 0 || !result.recordset[0].profile_picture) {
+      result = await pool.request()
+        .input('id', sql.Int, id)
+        .query('SELECT profile_picture FROM interns WHERE id = @id');
+    }
+
+    if (result.recordset.length === 0 || !result.recordset[0].profile_picture) {
+      result = await pool.request()
+        .input('id', sql.Int, id)
+        .query('SELECT profile_picture FROM new_joinees WHERE id = @id');
+    }
 
     if (result.recordset.length === 0 || !result.recordset[0].profile_picture) {
       return res.status(404).send('Not Found');
@@ -1632,22 +1656,33 @@ app.get('/api/threads/:id/media', async (req, res) => {
 });
 
 // 4C. Dedicated Profile Picture Upload (Handles 404 for /api/profile/upload-image)
-app.post('/api/profile/upload-image', memoryUpload.single('image'), async (req, res) => {
-  const { userId, email } = req.body;
+app.post('/api/profile/upload-image', memoryUpload.any(), async (req, res) => {
+  let { userId, email, employee_id, id } = req.body;
 
-  console.log(`[PROFILE UPLOAD] Upload attempt for ${email || userId || 'Unknown'}`);
+  // Handle "undefined" or "null" strings that can come from FormData
+  if (userId === 'undefined' || userId === 'null') userId = null;
+  if (email === 'undefined' || email === 'null') email = null;
+  if (employee_id === 'undefined' || employee_id === 'null') employee_id = null;
+  if (id === 'undefined' || id === 'null') id = null;
 
-  if (!userId && !email) {
-    return res.status(400).json({ error: 'User ID or Email is required for image synchronization' });
+  const targetId = userId || employee_id || id;
+  const targetEmail = email;
+
+  console.log(`[PROFILE UPLOAD] Upload attempt for ${targetEmail || targetId || 'Unknown'}`);
+
+  if (!targetId && !targetEmail) {
+    return res.status(400).json({ error: 'User identifier or Email is required for image synchronization' });
   }
 
-  if (!req.file) {
-    return res.status(400).json({ error: 'No image file provided in "image" field' });
+  const file = req.files && req.files.length > 0 ? req.files[0] : null;
+
+  if (!file) {
+    return res.status(400).json({ error: 'No image file provided in the form data' });
   }
 
   // Convert image to base64 Data URI
-  const base64Image = req.file.buffer.toString('base64');
-  const imageUrl = `data:${req.file.mimetype};base64,${base64Image}`;
+  const base64Image = file.buffer.toString('base64');
+  const imageUrl = `data:${file.mimetype};base64,${base64Image}`;
 
   try {
     const pool = await getPool();
@@ -1655,24 +1690,55 @@ app.post('/api/profile/upload-image', memoryUpload.single('image'), async (req, 
       return res.status(503).json({ error: 'Database is offline' });
     }
 
-    // Update the users table using userId OR email
     const request = pool.request();
-    request.input('userId', sql.Int, userId || null);
-    request.input('email', sql.NVarChar, email || null);
+    request.input('targetId', sql.NVarChar, String(targetId || ''));
+    request.input('targetEmail', sql.NVarChar, targetEmail || '');
     request.input('profilePicture', sql.NVarChar(sql.MAX), imageUrl);
 
-    await request.query(`
+    let rowsAffected = 0;
+
+    // Update users table
+    const r1 = await request.query(`
       UPDATE users 
       SET profile_picture = @profilePicture 
-      WHERE (id = @userId AND @userId IS NOT NULL) 
-         OR (email = @email AND @email IS NOT NULL)
+      WHERE (CAST(id AS NVARCHAR) = @targetId AND @targetId != '') 
+         OR (email = @targetEmail AND @targetEmail != '')
     `);
+    rowsAffected += r1.rowsAffected[0] || 0;
 
-    console.log(`[PROFILE UPLOAD] Success: Profile updated for ${email || userId} with base64 data`);
+    // Update interns table
+    const r2 = await request.query(`
+      UPDATE interns 
+      SET profile_picture = @profilePicture 
+      WHERE (CAST(id AS NVARCHAR) = @targetId AND @targetId != '') 
+         OR (email = @targetEmail AND @targetEmail != '')
+    `);
+    rowsAffected += r2.rowsAffected[0] || 0;
+
+    // Update new_joinees table
+    const r3 = await request.query(`
+      UPDATE new_joinees 
+      SET profile_picture = @profilePicture 
+      WHERE (CAST(id AS NVARCHAR) = @targetId AND @targetId != '') 
+         OR (email_id = @targetEmail AND @targetEmail != '')
+    `);
+    rowsAffected += r3.rowsAffected[0] || 0;
+
+    if (rowsAffected === 0) {
+      console.log(`[PROFILE UPLOAD] Warning: No user found for ${targetEmail || targetId}`);
+      return res.status(404).json({ error: 'User not found to update profile picture' });
+    }
+
+    console.log(`[PROFILE UPLOAD] Success: Profile updated for ${targetEmail || targetId} with base64 data`);
+
+    const returnUrl = targetId 
+        ? `/api/users/${targetId}/photo?t=${Date.now()}` 
+        : `/api/profile/picture/${targetEmail}?t=${Date.now()}`;
 
     res.json({
       message: 'Upload successful',
-      profileImage: imageUrl
+      profileImage: returnUrl,
+      profile_picture: returnUrl
     });
   } catch (err) {
     console.error('[PROFILE UPLOAD ERROR]:', err);
@@ -1687,8 +1753,8 @@ app.post('/api/profile/upload-direct', verifyToken, async (req, res) => {
   if (!req.body) {
     return res.status(400).json({ error: 'Request body is missing. Please ensure Content-Type is application/json.' });
   }
-  const { userId, email, profilePicture } = req.body;
-  const identifier = userId || email || req.user.id;
+  const { userId, email, employee_id, id, profilePicture } = req.body;
+  const identifier = userId || employee_id || id || email || (req.user ? req.user.id : null);
   const picData = profilePicture || req.body.profileImage || req.body.image;
 
   if (!identifier || !picData) {
@@ -1701,20 +1767,94 @@ app.post('/api/profile/upload-direct', verifyToken, async (req, res) => {
     request.input('id', sql.NVarChar, String(identifier));
     request.input('pic', sql.NVarChar(sql.MAX), picData);
 
-    const result = await request.query(`
+    let rowsAffected = 0;
+
+    const r1 = await request.query(`
       UPDATE users 
       SET profile_picture = @pic 
       WHERE CAST(id AS NVARCHAR) = @id OR email = @id
     `);
+    rowsAffected += r1.rowsAffected[0] || 0;
 
-    if (result.rowsAffected[0] === 0) {
+    const r2 = await request.query(`
+      UPDATE interns 
+      SET profile_picture = @pic 
+      WHERE CAST(id AS NVARCHAR) = @id OR email = @id
+    `);
+    rowsAffected += r2.rowsAffected[0] || 0;
+
+    const r3 = await request.query(`
+      UPDATE new_joinees 
+      SET profile_picture = @pic 
+      WHERE CAST(id AS NVARCHAR) = @id OR email_id = @id
+    `);
+    rowsAffected += r3.rowsAffected[0] || 0;
+
+    if (rowsAffected === 0) {
       return res.status(404).json({ error: 'User not found to update profile picture' });
     }
 
     Log.success('Profile', `Direct picture update successful for ${identifier}`);
-    res.json({ success: true, message: 'Profile picture updated directly in users table.' });
+    res.json({ success: true, message: 'Profile picture updated directly in users/interns table.' });
   } catch (err) {
     res.status(500).json({ error: 'Direct upload failed', details: err.message });
+  }
+});
+
+// 4E. Dedicated Manager Profile Picture Upload API
+app.post('/api/managers/upload-image', verifyToken, memoryUpload.any(), async (req, res) => {
+  let { managerId, email } = req.body;
+  if (managerId === 'undefined' || managerId === 'null') managerId = null;
+
+  const targetId = managerId || req.body.id || req.body.employee_id || req.body.userId;
+  const targetEmail = email || req.body.email_id;
+
+  if (!targetId && !targetEmail) {
+    return res.status(400).json({ error: 'Manager ID or Email is required' });
+  }
+
+  const file = req.files && req.files.length > 0 ? req.files[0] : null;
+
+  if (!file) {
+    return res.status(400).json({ error: 'No image file provided in the form data' });
+  }
+
+  const base64Image = file.buffer.toString('base64');
+  const imageUrl = `data:${file.mimetype};base64,${base64Image}`;
+
+  try {
+    const pool = await getPool();
+    const request = pool.request();
+    request.input('targetId', sql.NVarChar, String(targetId || ''));
+    request.input('targetEmail', sql.NVarChar, email || '');
+    request.input('profilePicture', sql.NVarChar(sql.MAX), imageUrl);
+
+    // Specifically target the users table where the managers reside
+    const result = await request.query(`
+      UPDATE users 
+      SET profile_picture = @profilePicture 
+      WHERE (CAST(id AS NVARCHAR) = @targetId AND @targetId != '') 
+         OR (email = @targetEmail AND @targetEmail != '')
+    `);
+
+    if (result.rowsAffected[0] === 0) {
+      return res.status(404).json({ error: 'Manager not found in the users table or unauthorized role.' });
+    }
+
+    Log.success('Manager Profile', `Profile picture updated for manager ${targetEmail || targetId}`);
+    const returnUrl = targetId 
+        ? `/api/users/${targetId}/photo?t=${Date.now()}` 
+        : `/api/profile/picture/${targetEmail}?t=${Date.now()}`;
+
+    res.json({
+      success: true,
+      message: 'Manager profile picture updated successfully',
+      profile_picture: returnUrl,
+      profileImage: returnUrl
+    });
+  } catch (err) {
+    Log.error('Manager Profile', err.message);
+    res.status(500).json({ error: 'Failed to update manager profile picture', details: err.message });
   }
 });
 
