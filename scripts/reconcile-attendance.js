@@ -122,8 +122,17 @@ async function calculateUserMonthlyStats(userId, month, year) {
                 return d >= s && d <= e;
             });
 
-            if (dayStatus === 'P') {
-                if (isTargetMonth) monthlyPresent++;
+            if (dayStatus === 'P' || dayStatus === 'Half Day') {
+                const dayValue = dayStatus === 'Half Day' ? 0.5 : 1;
+                if (isTargetMonth) {
+                    monthlyPresent += dayValue;
+                    if (dayStatus === 'Half Day') monthlyAbsents += 0.5;
+                }
+                
+                // Half-day counts as 0.5 unaccounted gap for leave deduction
+                if (dayStatus === 'Half Day' && d >= ABSENT_DEDUCTION_START && d > probationEndDate) {
+                    totalUnaccountedGaps += 0.5;
+                }
                 continue;
             }
 
