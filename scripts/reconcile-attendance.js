@@ -1,4 +1,4 @@
-const { poolPromise, sql } = require('../db');
+const { getPool, sql } = require('../db');
 const cron = require('node-cron');
 
 /**
@@ -18,7 +18,7 @@ async function reconcileAttendance(userId = null, lookbackDays = null) {
     console.log(`\n[FULL AUDIT] Starting High-Precision Leave Reconciliation...`);
 
     try {
-        const pool = await poolPromise;
+        const pool = await getPool();
         const users = userId ?
             (await pool.request().input('uid', sql.Int, userId).query('SELECT id FROM users WHERE id = @uid')).recordset :
             (await pool.request().query('SELECT id FROM users')).recordset;
@@ -54,7 +54,7 @@ async function reconcileAttendance(userId = null, lookbackDays = null) {
  */
 async function calculateUserMonthlyStats(userId, month, year) {
     try {
-        const pool = await poolPromise;
+        const pool = await getPool();
         const targetMonth = parseInt(month);
         const targetYear = parseInt(year);
 

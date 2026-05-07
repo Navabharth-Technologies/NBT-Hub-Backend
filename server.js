@@ -77,31 +77,13 @@ const BANNER = `
 \x1b[90m──────────────────────────────────────────────\x1b[0m
 `;
 
-// Ensure the uploads directory exists in the backend root
-const uploadsDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir);
-}
-
 app.use(compression()); // 0. Enable Gzip Compression for high-performance dashboard analytics
 const PORT = process.env.PORT || 5000;
 
 // Initialize Database connection
-const { sql, poolPromise } = require('./db');
+const { sql, getPool: getDbPool } = require('./db');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
-
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    // Store in the 'uploads' folder
-    cb(null, 'uploads/');
-  },
-  filename: (req, file, cb) => {
-    // Make sure the file name is unique by appending the current timestamp & replacing spaces with hyphens
-    cb(null, Date.now() + '-' + file.originalname.replace(/\s+/g, '-'));
-  }
-});
-const upload = multer({ storage: storage });
 
 // NEW: Multer configuration for memory storage (direct to DB as base64 or cloud storage)
 const memoryStorage = multer.memoryStorage();
@@ -153,10 +135,13 @@ const safeUploadToDrive = async (file) => {
 // --- PERFORMANCE: Cached Pool & Shared Utilities --- //
 let _pool = null;
 const getPool = async () => {
-  if (_pool) return _pool;
-  _pool = await poolPromise;
+  // Use the resilient pool from db.js
+  const pool = await getDbPool();
 
-  // Initialize Suggestions Table if not exists
+  if (_pool === pool) return _pool;
+  _pool = pool;
+
+  // Initialize Suggestions Table if not exists (only run once per new pool instance)
   try {
     await _pool.request().query(`
       IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[employee_suggestions]') AND type in (N'U'))
@@ -192,11 +177,72 @@ const getPool = async () => {
  * Shared image normalizer (extracted from 6+ inline copies)
  */
 const normalizeImage = (img) => {
-  if (!img) return null;
-  if (typeof img !== 'string') return img;
-  if (img.startsWith('data:') || img.startsWith('http') || img.startsWith('/')) return img;
-  if (img.startsWith('GgoAAAANSUhEUg')) return `data:image/png;base64,iVBORw0KGgo${img}`;
-  return `data:image/png;base64,${img}`;
+  if (!img || typeof img !== 'string') return img;
+  
+  const val = img.trim();
+  if (!val || val === 'null' || val === 'undefined') return null;
+
+  // Already a valid URL or Data URL
+  if (val.startsWith('data:') || val.startsWith('http') || val.startsWith('/') || val.startsWith('blob:')) {
+    return val;
+  }
+
+  // Detect common base64 signatures to apply correct mime type
+  if (val.startsWith('iVBORw0KGgo')) return `data:image/png;base64,${val}`;
+  if (val.startsWith('/9j/')) return `data:image/jpeg;base64,${val}`;
+  if (val.startsWith('JVBERi0')) return `data:application/pdf;base64,${val}`;
+  
+  // Legacy fix for specific PNG header truncation
+  if (val.startsWith('GgoAAAANSUhEUg')) return `data:image/png;base64,iVBORw0KGgo${val}`;
+
+  // If it's a long string with no spaces, it's highly likely to be base64
+  // We only prefix if it's long enough to be an actual image/doc (>100 chars)
+  if (val.length > 100 && !val.includes(' ') && !val.includes('\n')) {
+    // Default to PNG if unknown, but at least we're reasonably sure it's base64
+    return `data:image/png;base64,${val}`;
+  }
+
+  // Check if it's a local filename (short, has extension, no spaces)
+  if (val.length < 255 && /\.(jpg|jpeg|png|gif|pdf|webp)$/i.test(val) && !val.includes(' ')) {
+    return `/uploads/${val}`;
+  }
+
+  // Otherwise, return as-is (might be a plain ID or text)
+  return val;
+};
+
+/**
+ * Normalizes all photo fields within a profile object
+ */
+const normalizeProfile = (profile) => {
+  if (!profile) return profile;
+
+  const photoFields = [
+    'profile_picture', 'pancard_photo', 'adharcard_photo', 'experience_letter_photo',
+    'voter_id_photo', 'passport_photo', 'previous_company_payslip',
+    'passbook_photo', 'sslc_markscard', 'puc_markscard', 'ug_pg_markscard'
+  ];
+
+  photoFields.forEach(field => {
+    if (profile[field]) {
+      profile[field] = normalizeImage(profile[field]);
+    }
+  });
+
+  // Ensure Reporting Manager info is available in camelCase for frontend consistency
+  if (profile.reporting_manager_id) {
+    profile.reportingManagerId = profile.reporting_manager_id;
+    profile.managerId = profile.reporting_manager_id;
+    profile.rmId = profile.reporting_manager_id;
+  }
+  if (profile.reporting_manager_name) {
+    profile.reportingManagerName = profile.reporting_manager_name;
+    profile.reportingManager = profile.reporting_manager_name; // Legacy support
+    profile.managerName = profile.reporting_manager_name;
+    profile.rmName = profile.reporting_manager_name;
+  }
+
+  return profile;
 };
 
 // --- ASSET DATA MAPPING HELPER ---
@@ -257,7 +303,6 @@ const emojiMap = {
 app.use(cors({
   origin: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'employee_id', 'employee-id', 'x-user-id'],
   credentials: true,
   maxAge: 86400 // Cache preflight results for 24 hours (86400 seconds)
 }));
@@ -277,7 +322,7 @@ const REWARD_CATEGORIES = ['Performance', 'Peer Recognition', 'Service Anniversa
 
 
 // 2.5 Static Folder Serving (for uploaded images/videos)
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+// app.use('/uploads', express.static(path.join(__dirname, 'uploads'))); // Retired local storage
 
 // 2.6 NBT Career Portal Webhooks (Incoming Applications)
 app.use('/webhooks/nbt', incomingRouter);
@@ -670,7 +715,7 @@ app.post('/api/login', async (req, res) => {
       // 2C. FALLBACK: Check New Joinees table
       const joineeResult = await pool.request()
         .input('email', sql.NVarChar, email)
-        .query('SELECT id, name, email_id, password, role FROM new_joinees WHERE email_id = @email');
+        .query('SELECT id, name, email_id, password, role, joining_date, course_completion, is_blocked, block_reason FROM new_joinees WHERE email_id = @email');
 
       if (joineeResult.recordset.length === 0) {
         // 3D. FALLBACK: Check Interns table
@@ -690,6 +735,29 @@ app.post('/api/login', async (req, res) => {
         user.email = user.email_id; // Normalize key
         userType = 'new_joinee';
         user.role = 'new_joinee';
+
+        // --- NEW JOINEE AUTO-BLOCK LOGIC (10-Day Course Enforcement) ---
+        const jDate = new Date(user.joining_date);
+        const now = new Date();
+        const diffDays = Math.ceil(Math.abs(now - jDate) / (1000 * 60 * 60 * 24));
+        const courseCompleted = (user.course_completion || 0) >= 100;
+
+        if ((diffDays > 10 && !courseCompleted) || user.is_blocked === 1) {
+          // If not already marked as blocked in DB, mark it now
+          if (user.is_blocked === 0) {
+            await pool.request()
+              .input('id', sql.Int, user.id)
+              .input('reason', sql.NVarChar, 'Course not completed within 10 days of joining.')
+              .query('UPDATE new_joinees SET is_blocked = 1, block_reason = @reason WHERE id = @id');
+            user.is_blocked = 1;
+            user.block_reason = 'Course not completed within 10 days of joining.';
+          }
+          return res.status(403).json({ 
+            error: 'Account Blocked', 
+            message: user.block_reason || 'Your account has been blocked. Please contact your Manager or HR to unblock.',
+            is_blocked: true
+          });
+        }
       }
     } else {
       user = userResult.recordset[0];
@@ -760,7 +828,7 @@ app.post('/api/new-joinee/login', async (req, res) => {
     // Use email_id as the primary lookup for joinees
     const joineeResult = await pool.request()
       .input('email', sql.NVarChar, email)
-      .query('SELECT id, name, email_id, password, role FROM new_joinees WHERE email_id = @email');
+      .query('SELECT id, name, email_id, password, role, joining_date, course_completion, is_blocked, block_reason FROM new_joinees WHERE email_id = @email');
 
     if (joineeResult.recordset.length === 0) {
       return res.status(401).json({ error: 'Invalid email or password' });
@@ -786,6 +854,28 @@ app.post('/api/new-joinee/login', async (req, res) => {
       process.env.JWT_SECRET || 'fallback_secret_key',
       { expiresIn: '365d' } // Extended session timeout for seamless work experience
     );
+
+    // --- NEW JOINEE AUTO-BLOCK LOGIC (10-Day Course Enforcement) ---
+    const jDate = new Date(joinee.joining_date);
+    const now = new Date();
+    const diffDays = Math.ceil(Math.abs(now - jDate) / (1000 * 60 * 60 * 24));
+    const courseCompleted = (joinee.course_completion || 0) >= 100;
+
+    if ((diffDays > 10 && !courseCompleted) || joinee.is_blocked === 1) {
+      if (joinee.is_blocked === 0) {
+        await pool.request()
+          .input('id', sql.Int, joinee.id)
+          .input('reason', sql.NVarChar, 'Course not completed within 10 days of joining.')
+          .query('UPDATE new_joinees SET is_blocked = 1, block_reason = @reason WHERE id = @id');
+        joinee.is_blocked = 1;
+        joinee.block_reason = 'Course not completed within 10 days of joining.';
+      }
+      return res.status(403).json({ 
+        error: 'Account Blocked', 
+        message: joinee.block_reason || 'Your account has been blocked. Please contact your Manager or HR to unblock.',
+        is_blocked: true
+      });
+    }
 
     res.json({
       message: 'New Joinee Login successful',
@@ -900,7 +990,7 @@ app.post('/api/password/reset-with-otp', async (req, res) => {
 /**
  * 2.F Change Password with Old Password (Authenticated)
  */
-app.post('/api/password/change-password', verifyToken, async (req, res) => {
+app.post(['/api/password/change-password', '/api/profile/update-password'], verifyToken, async (req, res) => {
   const { oldPassword, newPassword } = req.body;
   const email = req.user.email;
   const userType = req.user.userType;
@@ -1064,7 +1154,7 @@ async function syncSpecificTeamTable(pool, transaction, teamName) {
  */
 app.post('/api/hierarchy/sync-all', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  if (!role.includes('admin') && !role.includes('hr')) {
+  if (!role.includes('admin') && !role.includes('hr') && !role.includes('human resource')) {
     return res.status(403).json({ error: 'Unauthorized: Global sync requires Admin/HR privileges' });
   }
 
@@ -1108,7 +1198,7 @@ app.post('/api/hierarchy/realign', verifyToken, async (req, res) => {
   }
 
   const role = (req.user.role || '').toLowerCase();
-  const isAdminOrHR = role.includes('admin') || role.includes('hr') || role.includes('manager') || role.includes('lead');
+  const isAdminOrHR = role.includes('admin') || role.includes('hr') || role.includes('human resource') || role.includes('manager') || role.includes('lead');
 
   if (!isAdminOrHR) {
     return res.status(403).json({ error: 'Unauthorized: Only Managers or HR can realign hierarchy' });
@@ -1343,7 +1433,9 @@ const handleProfileGet = async (req, res) => {
       profilePicture: userRow.profile_picture,
       aboutMe: userRow.about_me,
       dateOfBirth: userRow.date_of_birth,
-      reportingManager: userRow.reporting_manager_name,
+      reportingManagerId: userRow.reporting_manager_id,
+      reportingManagerName: userRow.reporting_manager_name,
+      reportingManager: userRow.reporting_manager_name, // Support for existing UI fields
       assets: assetData
     });
 
@@ -1512,6 +1604,23 @@ app.put('/api/profile/update', verifyToken, memoryUpload.single('profilePicture'
     } else {
       // Standard update (No team change)
       await request.query(updateQuery);
+    }
+
+    // --- SYNC DOB TO EMPLOYEE_PROFILES --- //
+    if (dateOfBirth !== undefined) {
+      const userRes = await pool.request().input('email', sql.NVarChar, email).query('SELECT id FROM users WHERE email = @email');
+      if (userRes.recordset.length > 0) {
+        const userId = userRes.recordset[0].id;
+        await pool.request()
+          .input('userId', sql.Int, userId)
+          .input('dob', sql.NVarChar, dateOfBirth)
+          .query(`
+            IF EXISTS (SELECT 1 FROM employee_profiles WHERE employee_id = @userId)
+            UPDATE employee_profiles SET dob = @dob WHERE employee_id = @userId
+            ELSE
+            INSERT INTO employee_profiles (employee_id, dob) VALUES (@userId, @dob)
+          `);
+      }
     }
 
     res.json({ message: 'Profile payload saved structurally to MS SQL database' });
@@ -1731,9 +1840,9 @@ app.post('/api/profile/upload-image', memoryUpload.any(), async (req, res) => {
 
     console.log(`[PROFILE UPLOAD] Success: Profile updated for ${targetEmail || targetId} with base64 data`);
 
-    const returnUrl = targetId 
-        ? `/api/users/${targetId}/photo?t=${Date.now()}` 
-        : `/api/profile/picture/${targetEmail}?t=${Date.now()}`;
+    const returnUrl = targetId
+      ? `/api/users/${targetId}/photo?t=${Date.now()}`
+      : `/api/profile/picture/${targetEmail}?t=${Date.now()}`;
 
     res.json({
       message: 'Upload successful',
@@ -1842,9 +1951,9 @@ app.post('/api/managers/upload-image', verifyToken, memoryUpload.any(), async (r
     }
 
     Log.success('Manager Profile', `Profile picture updated for manager ${targetEmail || targetId}`);
-    const returnUrl = targetId 
-        ? `/api/users/${targetId}/photo?t=${Date.now()}` 
-        : `/api/profile/picture/${targetEmail}?t=${Date.now()}`;
+    const returnUrl = targetId
+      ? `/api/users/${targetId}/photo?t=${Date.now()}`
+      : `/api/profile/picture/${targetEmail}?t=${Date.now()}`;
 
     res.json({
       success: true,
@@ -1861,13 +1970,14 @@ app.post('/api/managers/upload-image', verifyToken, memoryUpload.any(), async (r
 /**
  * 4E. Dedicated Document Upload (Handles Onboarding Docs)
  */
-app.post(['/api/profile/upload-doc', '/api/profile/upload-document'], verifyToken, memoryUpload.single('file'), async (req, res) => {
+app.post(['/api/profile/upload-doc', '/api/profile/upload-document'], verifyToken, memoryUpload.any(), async (req, res) => {
   const { userId, docType } = req.body;
   let fileData = req.body.fileData || req.body.base64;
 
-  if (req.file) {
-    const base64 = req.file.buffer.toString('base64');
-    fileData = `data:${req.file.mimetype};base64,${base64}`;
+  const uploadedFile = req.files && req.files.length > 0 ? req.files[0] : req.file;
+  if (uploadedFile) {
+    const base64 = uploadedFile.buffer.toString('base64');
+    fileData = `data:${uploadedFile.mimetype};base64,${base64}`;
   }
 
   if (!userId || !docType || !fileData) {
@@ -1880,7 +1990,14 @@ app.post(['/api/profile/upload-doc', '/api/profile/upload-document'], verifyToke
     'aadhar': 'adharcard_photo',
     'experience': 'experience_letter_photo',
     'pan_card': 'pancard_photo',
-    'aadhar_card': 'adharcard_photo'
+    'aadhar_card': 'adharcard_photo',
+    'voterid': 'voter_id_photo',
+    'passport': 'passport_photo',
+    'payslip': 'previous_company_payslip',
+    'passbook': 'passbook_photo',
+    'sslc_marks': 'sslc_markscard',
+    'puc_marks': 'puc_markscard',
+    'ug_pg_marks': 'ug_pg_markscard'
   };
 
   const dbColumn = columnMap[docType.toLowerCase()] || docType;
@@ -1907,6 +2024,38 @@ app.post(['/api/profile/upload-doc', '/api/profile/upload-document'], verifyToke
   } catch (err) {
     console.error('[DOC UPLOAD ERROR]:', err);
     res.status(500).json({ error: 'Failed to upload document', details: err.message });
+  }
+});
+
+// --- 4F. Utility: Fetch Bank Details via IFSC --- //
+app.get('/api/bank/ifsc/:code', async (req, res) => {
+  const { code } = req.params;
+  if (!code || code.length !== 11) {
+    return res.status(400).json({ error: 'Invalid IFSC Code length' });
+  }
+
+  try {
+    const response = await fetch(`https://ifsc.razorpay.com/${code}`);
+    if (!response.ok) {
+      if (response.status === 404) {
+        return res.status(404).json({ error: 'Bank details not found for this IFSC code' });
+      }
+      return res.status(response.status).json({ error: 'Failed to fetch bank details' });
+    }
+
+    const data = await response.json();
+    res.json({
+      success: true,
+      bank: data.BANK,
+      branch: data.BRANCH,
+      city: data.CITY,
+      state: data.STATE,
+      address: data.ADDRESS,
+      ifsc: data.IFSC
+    });
+  } catch (err) {
+    console.error('[IFSC FETCH ERROR]:', err);
+    res.status(500).json({ error: 'Internal server error while fetching bank details', details: err.message });
   }
 });
 
@@ -2078,7 +2227,7 @@ const handleAboutUpdate = async (req, res) => {
 // --- LEAVE MANAGEMENT ROUTES --- //
 
 // 1. Post a new leave request
-app.post('/api/leaves', verifyToken, async (req, res) => {
+app.post(['/api/leaves', '/api/leave'], verifyToken, async (req, res) => {
   const leave_type = req.body.leave_type || req.body.leaveType;
   const start_date = req.body.start_date || req.body.startDate;
   const end_date = req.body.end_date || req.body.endDate;
@@ -2122,11 +2271,11 @@ app.post('/api/leaves', verifyToken, async (req, res) => {
       .input('uId', sql.Int, userId)
       .input('sDate', sql.Date, start_date)
       .query("SELECT id FROM leaves WITH (NOLOCK) WHERE user_id = @uId AND start_date = @sDate AND (rm_status <> 'Rejected' AND pm_status <> 'Rejected' AND hr_status <> 'Rejected')");
-    
+
     if (duplicateCheck.recordset.length > 0) {
-      return res.status(409).json({ 
-        error: 'Duplicate Request', 
-        message: `You already have an active leave request starting on ${start_date}. Please check your history.` 
+      return res.status(409).json({
+        error: 'Duplicate Request',
+        message: `You already have an active leave request starting on ${start_date}. Please check your history.`
       });
     }
 
@@ -2162,7 +2311,7 @@ app.post('/api/leaves', verifyToken, async (req, res) => {
       if (diffDays < 90 && leave_type !== 'Unpaid Leave' && leave_type !== 'LOP') {
         // NEW: Allow Casual Leave during probation if they have a pre-existing balance
         if (leave_type === 'Casual Leave' && leave_balance >= requestedDays) {
-           console.log(`[LEAVE] Allowing Casual Leave during probation for User ${userId} due to existing balance.`);
+          console.log(`[LEAVE] Allowing Casual Leave during probation for User ${userId} due to existing balance.`);
         } else {
           return res.status(403).json({
             error: 'Probation Period Restriction',
@@ -2181,7 +2330,7 @@ app.post('/api/leaves', verifyToken, async (req, res) => {
           FROM leaves 
           WHERE user_id = @uId AND leave_type = 'Casual Leave' AND hr_status = 'Pending' AND (rm_status <> 'Rejected' AND pm_status <> 'Rejected')
         `);
-      
+
       const pendingDays = pendingRes.recordset[0]?.pending_days || 0;
       const effectiveBalance = leave_balance - pendingDays;
 
@@ -2230,7 +2379,7 @@ app.post('/api/leaves', verifyToken, async (req, res) => {
 });
 
 // 2. Get user's personal leave history (Self-Service View)
-app.get('/api/leaves', verifyToken, async (req, res) => {
+app.get(['/api/leaves', '/api/leave'], verifyToken, async (req, res) => {
   const userId = req.user.id;
   try {
     const pool = await getPool();
@@ -2419,7 +2568,7 @@ app.get(['/api/attendance_logs', '/api/attendance logs', '/api/attendance%20logs
     }
 
     const role = (req.user.role || '').toLowerCase();
-    const isManagerial = role.includes('hr') || role.includes('admin') || role.includes('manager') || role.includes('lead') || role.includes('ceo');
+    const isManagerial = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('manager') || role.includes('lead') || role.includes('ceo');
 
     if (!isManagerial) {
       // Force security lock: Employees can ONLY view their own records
@@ -2484,7 +2633,7 @@ app.get(['/api/attendance_logs', '/api/attendance logs', '/api/attendance%20logs
 // 1c. Get raw historical logs directly from Etime Office (Admin Only)
 app.get('/api/admin/etime-logs', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  if (!role.includes('hr') && !role.includes('admin')) {
+  if (!role.includes('hr') && !role.includes('human resource') && !role.includes('admin')) {
     return res.status(403).json({ error: 'Unauthorized: High-level clearance required for Etime Office raw logs.' });
   }
 
@@ -2614,7 +2763,7 @@ app.post('/api/attendance_logs/punch', verifyToken, async (req, res) => {
 app.get('/api/manager/attendance', verifyToken, async (req, res) => {
   // Only allow HR or Managers/Admins to view all attendance
   const role = (req.user.role || '').toLowerCase();
-  const isAuthorized = role.includes('hr') || role.includes('admin') || role.includes('manager') || role.includes('lead') || role.includes('ceo');
+  const isAuthorized = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('manager') || role.includes('lead') || role.includes('ceo');
 
   if (!isAuthorized) {
     return res.status(403).json({ error: 'Unauthorized: High-level clearance required for attendance matrix.' });
@@ -2670,7 +2819,7 @@ app.get('/api/manager/attendance', verifyToken, async (req, res) => {
  */
 app.post('/api/attendance/update-punch-time', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  const isAuthorized = role.includes('hr') || role.includes('admin') || role.includes('manager') || role.includes('lead') || role.includes('ceo');
+  const isAuthorized = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('manager') || role.includes('lead') || role.includes('ceo');
 
   if (!isAuthorized) {
     return res.status(403).json({ error: 'Unauthorized: Only HR or Managers can alter attendance logs.' });
@@ -3101,6 +3250,87 @@ app.get('/api/holidays', async (req, res) => {
   }
 });
 
+/**
+ * Admin: Add Holiday (HR/Admin Only)
+ */
+app.post('/api/admin/holidays', verifyToken, async (req, res) => {
+  const role = (req.user.role || '').toLowerCase();
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo');
+  if (!isAdmin) return res.status(403).json({ error: 'Unauthorized: Admin/HR access required.' });
+
+  const { name, holiday_date, classification, description } = req.body;
+  if (!name || !holiday_date) return res.status(400).json({ error: 'Name and date are required.' });
+
+  try {
+    const pool = await getPool();
+    await pool.request()
+      .input('name', sql.NVarChar, name)
+      .input('date', sql.Date, holiday_date)
+      .input('class', sql.NVarChar, classification || 'All Shifts')
+      .input('desc', sql.NVarChar, description || 'Holiday')
+      .query('INSERT INTO holidays (name, holiday_date, classification, description) VALUES (@name, @date, @class, @desc)');
+    
+    holidaysCache = null; // Invalidate cache
+    res.json({ success: true, message: 'Holiday added successfully!' });
+  } catch (err) {
+    console.error('[ADMIN HOLIDAY POST ERROR]:', err);
+    res.status(500).json({ error: 'Failed to add holiday record' });
+  }
+});
+
+/**
+ * Admin: Update Holiday (HR/Admin Only)
+ */
+app.put('/api/admin/holidays/:id', verifyToken, async (req, res) => {
+  const role = (req.user.role || '').toLowerCase();
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo');
+  if (!isAdmin) return res.status(403).json({ error: 'Unauthorized: Admin/HR access required.' });
+
+  const { id } = req.params;
+  const { name, holiday_date, classification, description } = req.body;
+  if (!name || !holiday_date) return res.status(400).json({ error: 'Name and date are required.' });
+
+  try {
+    const pool = await getPool();
+    await pool.request()
+      .input('id', sql.Int, id)
+      .input('name', sql.NVarChar, name)
+      .input('date', sql.Date, holiday_date)
+      .input('class', sql.NVarChar, classification)
+      .input('desc', sql.NVarChar, description)
+      .query('UPDATE holidays SET name = @name, holiday_date = @date, classification = @class, description = @desc WHERE id = @id');
+    
+    holidaysCache = null; // Invalidate cache
+    res.json({ success: true, message: 'Holiday updated successfully!' });
+  } catch (err) {
+    console.error('[ADMIN HOLIDAY PUT ERROR]:', err);
+    res.status(500).json({ error: 'Failed to update holiday record' });
+  }
+});
+
+/**
+ * Admin: Delete Holiday (HR/Admin Only)
+ */
+app.delete('/api/admin/holidays/:id', verifyToken, async (req, res) => {
+  const role = (req.user.role || '').toLowerCase();
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo');
+  if (!isAdmin) return res.status(403).json({ error: 'Unauthorized: Admin/HR access required.' });
+
+  const { id } = req.params;
+  try {
+    const pool = await getPool();
+    await pool.request()
+      .input('id', sql.Int, id)
+      .query('DELETE FROM holidays WHERE id = @id');
+    
+    holidaysCache = null; // Invalidate cache
+    res.json({ success: true, message: 'Holiday deleted successfully!' });
+  } catch (err) {
+    console.error('[ADMIN HOLIDAY DELETE ERROR]:', err);
+    res.status(500).json({ error: 'Failed to delete holiday record' });
+  }
+});
+
 // 8. Universal Roster Fetching (Role or Team)
 app.get('/api/roster/:type', async (req, res) => {
   const table = req.params.type.toLowerCase();
@@ -3221,6 +3451,45 @@ app.get('/api/birthdays', fetchBirthdaysAsJSON);
 app.get('/api/birthday-list', fetchBirthdaysAsJSON);
 app.get('/api/employees/birthdays', fetchBirthdaysAsJSON);
 
+/**
+ * Admin: Update User Birthday (HR/Admin Only)
+ * Allows HR to quickly correct birthdays without needing full profile edit permissions.
+ */
+app.put('/api/admin/birthdays/:userId', verifyToken, async (req, res) => {
+  const role = (req.user.role || '').toLowerCase();
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo');
+  if (!isAdmin) return res.status(403).json({ error: 'Unauthorized: Admin/HR access required.' });
+
+  const userId = sanitizeNumericId(req.params.userId);
+  const { date_of_birth } = req.body;
+
+  if (!date_of_birth) return res.status(400).json({ error: 'date_of_birth is required (Format: DD/MM/YYYY)' });
+
+  try {
+    const pool = await getPool();
+    await pool.request()
+      .input('id', sql.Int, userId)
+      .input('dob', sql.NVarChar, date_of_birth)
+      .query('UPDATE users SET date_of_birth = @dob WHERE id = @id');
+    
+    // Sync to employee_profiles
+    await pool.request()
+      .input('id', sql.Int, userId)
+      .input('dob', sql.NVarChar, date_of_birth)
+      .query(`
+        IF EXISTS (SELECT 1 FROM employee_profiles WHERE employee_id = @id)
+        UPDATE employee_profiles SET dob = @dob WHERE employee_id = @id
+        ELSE
+        INSERT INTO employee_profiles (employee_id, dob) VALUES (@id, @dob)
+      `);
+
+    res.json({ success: true, message: `Birthday for User ${userId} updated to ${date_of_birth}` });
+  } catch (err) {
+    console.error('[ADMIN BIRTHDAY PUT ERROR]:', err);
+    res.status(500).json({ error: 'Failed to update birthday' });
+  }
+});
+
 // --- DASHBOARD ANALYTICS ROUTES --- //
 
 // 10. Get All Users (for Metrics)
@@ -3340,7 +3609,7 @@ app.get('/api/teams', async (req, res) => {
  */
 app.put('/api/admin/teams/rename', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  const isAuthorized = role.includes('manager') || role.includes('ceo') || role.includes('hr') || role.includes('admin');
+  const isAuthorized = role.includes('manager') || role.includes('ceo') || role.includes('hr') || role.includes('human resource') || role.includes('admin');
 
   if (!isAuthorized) {
     return res.status(403).json({ error: 'Unauthorized: Only Managers/HR/Admin can rename teams.' });
@@ -3398,7 +3667,7 @@ app.put('/api/admin/teams/rename', verifyToken, async (req, res) => {
 
 // --- DYNAMIC TASK DELEGATION SYSTEM --- //
 
-app.post(['/api/assign-task', '/api/tasks'], async (req, res) => {
+app.post(['/api/assign-task', '/api/tasks', '/api/master-task'], async (req, res) => {
   const {
     assignerId, assigneeId, task_name, taskName, title, project_name, description,
     attachment_data, attachment_name,
@@ -3478,6 +3747,7 @@ app.get('/api/tasks/all-assigned', async (req, res) => {
         CASE WHEN at.attachment_data IS NOT NULL THEN 1 ELSE 0 END as has_attachment,
         at.task_review,
         at.task_review as taskReview,
+        at.verify,
         at.owner_id, at.assignee_id, at.status, at.progress, at.deadline,
         u.name as assigner_name,
         u.profile_picture as assigner_picture,
@@ -3532,6 +3802,7 @@ app.get('/api/master-task/:id', async (req, res) => {
         userRole: row.userRole,
         tasks: parsedTasks,
         badge: row.badge,
+        verify: row.badge,
         overallStatus: row.overall_status || (row.badge === 'VERIFIED' ? 'Completed' : 'Pending'),
         timestamp: row.created_at
       });
@@ -3584,6 +3855,7 @@ app.get('/api/tasks/assigned/:userId', async (req, res) => {
         t.attachment_name,
         CASE WHEN t.attachment_data IS NOT NULL THEN 1 ELSE 0 END as has_attachment,
         t.task_review,
+        t.verify,
         t.created_at,
         u.name as assigner_name
       FROM master_tasks t WITH (NOLOCK)
@@ -3670,6 +3942,7 @@ app.get('/api/tasks/manager/:managerId', async (req, res) => {
         userRole: row.employee_role,
         tasks: parsedTasks,
         overallStatus: row.status || 'Pending',
+        verify: row.verify,
         timestamp: row.updated_at
       };
     });
@@ -3715,6 +3988,7 @@ app.get('/api/tasks/team/:teamName', async (req, res) => {
         userRole: row.employee_role,
         tasks: parsedTasks,
         overallStatus: row.status || 'Pending',
+        verify: row.verify,
         timestamp: row.updated_at
       };
     });
@@ -3728,7 +4002,7 @@ app.get('/api/tasks/team/:teamName', async (req, res) => {
 
 
 // 17. Update Task Properties (General Endpoint for Status, Progress, Verify, etc.)
-app.put(['/api/tasks/:id', '/api/tasks/status/:taskId', '/api/task-updates/:id'], async (req, res) => {
+app.put(['/api/tasks/:id', '/api/tasks/status/:taskId', '/api/task-updates/:id', '/api/master-task/:id'], async (req, res) => {
   const rawId = req.params.id || req.params.taskId;
   const taskId = parseInt(rawId); // Handles "2:1" or similar by taking only the first integer
   const { status, progress, verify, title, description, deadline } = req.body;
@@ -4953,6 +5227,45 @@ app.put('/api/notifications/:id/read', async (req, res) => {
   }
 });
 
+// POST: Handle notification creation or bulk actions (e.g., Mark All Read)
+app.post('/api/notifications', async (req, res) => {
+  const { target_user_id, message, type, action, userId } = req.body;
+
+  // 1. Handle "Mark All as Read" logic
+  if (action === 'markAllRead' || action === 'readAll') {
+    const uid = target_user_id || userId;
+    if (!uid) return res.status(400).json({ error: 'User ID required for bulk update' });
+    try {
+      const pool = await getPool();
+      await pool.request()
+        .input('uid', sql.Int, uid)
+        .query('UPDATE notifications SET is_read = 1 WHERE target_user_id = @uid AND is_read = 0');
+      return res.json({ success: true, message: 'All notifications marked as read' });
+    } catch (err) {
+      console.error('[NOTIFICATIONS MARK-ALL-READ ERROR]', err);
+      return res.status(500).json({ error: 'Failed to update notifications' });
+    }
+  }
+
+  // 2. Handle Notification Creation
+  if (!target_user_id || !message) {
+    return res.status(400).json({ error: 'target_user_id and message are required' });
+  }
+
+  try {
+    const pool = await getPool();
+    await pool.request()
+      .input('uid', sql.Int, target_user_id)
+      .input('msg', sql.NVarChar, message)
+      .input('type', sql.NVarChar, type || 'General')
+      .query('INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@uid, @msg, @type, 0, DATEADD(MINUTE, 330, GETUTCDATE()))');
+    res.json({ success: true, message: 'Notification created successfully' });
+  } catch (err) {
+    console.error('[NOTIFICATIONS CREATE ERROR]', err);
+    res.status(500).json({ error: 'Failed to create notification' });
+  }
+});
+
 // POST: Global compliance audit for all joinees
 app.post('/api/new-joinees/audit-compliance', async (req, res) => {
   try {
@@ -4972,12 +5285,44 @@ app.post('/api/new-joinees/audit-compliance', async (req, res) => {
 });
 
 /**
+ * Admin: Manual Compliance Audit Trigger
+ * Allows HR/Admin to manually force a block-check for all joinees.
+ */
+app.get('/api/admin/new-joinees/audit-now', verifyToken, async (req, res) => {
+  const role = (req.user.role || '').toLowerCase();
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo');
+  if (!isAdmin) return res.status(403).json({ error: 'Unauthorized: Admin access required.' });
+
+  try {
+    const pool = await getPool();
+    const joineesResult = await pool.request().query('SELECT id FROM new_joinees WITH (NOLOCK) WHERE is_blocked = 0');
+    const results = [];
+
+    for (const joinee of joineesResult.recordset) {
+      const audit = await auditJoineeCompliance(joinee.id);
+      if (audit.blocked) results.push({ id: joinee.id, reason: audit.reason });
+    }
+
+    res.json({
+      success: true,
+      message: 'Compliance audit completed manually.',
+      scanned_count: joineesResult.recordset.length,
+      newly_blocked_count: results.length,
+      blocked_details: results
+    });
+  } catch (err) {
+    console.error('[MANUAL AUDIT ERROR]:', err);
+    res.status(500).json({ error: 'Manual audit failed.' });
+  }
+});
+
+/**
  * 25.4 Bulk Unblock: Restore access for all compliance-blocked joinees
  * SECURED: HR/Admin/CEO only
  */
 app.post('/api/admin/new-joinees/unblock-all', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  const isAdmin = role.includes('hr') || role.includes('admin') || role.includes('ceo');
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo');
 
   if (!isAdmin) {
     Log.auth(`Unauthorized bulk unblock attempt by ${req.user.name}`, 'Action requires elevated privileges');
@@ -5012,7 +5357,7 @@ app.post('/api/admin/new-joinees/unblock-all', verifyToken, async (req, res) => 
 app.post('/api/admin/new-joinees/unblock', verifyToken, async (req, res) => {
   const { id, email } = req.body;
   const role = (req.user.role || '').toLowerCase();
-  const isAdmin = role.includes('hr') || role.includes('admin') || role.includes('ceo');
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo');
 
   if (!isAdmin) return res.status(403).json({ error: 'Unauthorized: Admin access required' });
 
@@ -5637,8 +5982,8 @@ app.post('/api/courses', memoryUpload.fields([{ name: 'pdf', maxCount: 1 }, { na
   }
 });
 
-// PUT: Update Course status (e.g. mark as completed or update metadata)
-app.put('/api/courses/:id', upload.fields([{ name: 'pdf', maxCount: 1 }, { name: 'video', maxCount: 1 }]), async (req, res) => {
+// PUT: Update Course status (e.g. mark as completed or update metadata - Migrated to Google Drive)
+app.put('/api/courses/:id', memoryUpload.fields([{ name: 'pdf', maxCount: 1 }, { name: 'video', maxCount: 1 }]), async (req, res) => {
   const { id } = req.params;
   const {
     title,
@@ -5669,10 +6014,10 @@ app.put('/api/courses/:id', upload.fields([{ name: 'pdf', maxCount: 1 }, { name:
       request.input('category', sql.NVarChar, category);
     }
 
-    // Handle file uploads (Multipart) OR explicit URLs (JSON)
+    // Handle file uploads (Migrated to Google Drive Cloud Storage)
     let finalPdf = pdf_url !== undefined ? pdf_url : pdfUrl;
     if (req.files && req.files['pdf']) {
-      finalPdf = `/uploads/${req.files['pdf'][0].filename}`;
+      finalPdf = await safeUploadToDrive(req.files['pdf'][0]);
     }
 
     if (finalPdf !== undefined) {
@@ -5682,7 +6027,7 @@ app.put('/api/courses/:id', upload.fields([{ name: 'pdf', maxCount: 1 }, { name:
 
     let finalVideo = video_url !== undefined ? video_url : videoUrl;
     if (req.files && req.files['video']) {
-      finalVideo = `/uploads/${req.files['video'][0].filename}`;
+      finalVideo = await safeUploadToDrive(req.files['video'][0]);
     }
 
     if (finalVideo !== undefined) {
@@ -6029,7 +6374,7 @@ app.post('/api/leaves/request', verifyToken, async (req, res) => {
           AND hr_status = 'Pending' 
           AND (rm_status <> 'Rejected' AND pm_status <> 'Rejected')
         `);
-      
+
       const pendingDays = pendingRes.recordset[0]?.pending_days || 0;
       const effectiveBalance = employee.leave_balance - pendingDays;
 
@@ -6046,11 +6391,11 @@ app.post('/api/leaves/request', verifyToken, async (req, res) => {
       .input('uId', sql.Int, userId)
       .input('sDate', sql.Date, startDate)
       .query("SELECT id FROM leaves WITH (NOLOCK) WHERE user_id = @uId AND start_date = @sDate AND (rm_status <> 'Rejected' AND pm_status <> 'Rejected' AND hr_status <> 'Rejected')");
-    
+
     if (duplicateCheck.recordset.length > 0) {
-      return res.status(409).json({ 
-        error: 'Duplicate Request', 
-        message: `You already have an active leave request starting on ${startDate}. Please check your history.` 
+      return res.status(409).json({
+        error: 'Duplicate Request',
+        message: `You already have an active leave request starting on ${startDate}. Please check your history.`
       });
     }
 
@@ -6065,7 +6410,7 @@ app.post('/api/leaves/request', verifyToken, async (req, res) => {
     // If Member: PM is their RM's RM
     const managerId = employee.reporting_manager_id;
     let projectManagerId = isTL ? managerId : (employee.hierarchy_pm_id || 20251);
-    
+
     if (isManager || isHR) {
       projectManagerId = 20250; // Set CEO as their direct PM/Approver
     }
@@ -6370,7 +6715,8 @@ const masterLeaveListHandler = async (req, res) => {
 app.get('/api/leaves/all', verifyToken, masterLeaveListHandler);
 app.get('/api/admin/leaves', verifyToken, masterLeaveListHandler);
 app.get('/api/admin/leaves/all', verifyToken, masterLeaveListHandler);
-app.get('/api/leaves/team', verifyToken, masterLeaveListHandler);
+app.get(['/api/leaves/team', '/api/leave/team'], verifyToken, masterLeaveListHandler);
+app.get('/api/leaves/comprehensive', verifyToken, masterLeaveListHandler);
 
 /**
  * 32.5 Get Monthly Leave Stats
@@ -6378,7 +6724,7 @@ app.get('/api/leaves/team', verifyToken, masterLeaveListHandler);
  */
 app.get('/api/admin/leaves/stats', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  const isAdmin = role.includes('hr') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead') || role.includes('tl');
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead') || role.includes('tl');
 
   console.log(`[GET /api/admin/leaves/stats] Accessed by user ${req.user.id} (Role: ${req.user.role}, isAdmin: ${isAdmin})`);
 
@@ -6448,7 +6794,7 @@ app.get('/api/admin/leaves/stats', verifyToken, async (req, res) => {
  */
 app.put('/api/admin/leaves/stats', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  const isAdmin = role.includes('hr') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead') || role.includes('tl');
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead') || role.includes('tl');
 
   if (!isAdmin) {
     return res.status(403).json({ error: 'Unauthorized: Admin/HR access required to modify stats.' });
@@ -6462,7 +6808,7 @@ app.put('/api/admin/leaves/stats', verifyToken, async (req, res) => {
 
   try {
     const pool = await getPool();
-    
+
     // Check if record exists
     const checkRes = await pool.request()
       .input('eid', sql.Int, employeeId)
@@ -6517,7 +6863,7 @@ app.put('/api/admin/leaves/stats', verifyToken, async (req, res) => {
  */
 app.get('/api/leave-stats', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  const isAdmin = role.includes('hr') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead') || role.includes('tl');
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead') || role.includes('tl');
 
   let { userId, employeeId, month, year } = req.query;
   const targetId = userId || employeeId;
@@ -6671,10 +7017,10 @@ app.put(['/api/leaves/:id/status', '/api/ceo/leaves/:id/status'], verifyToken, a
 
     if (actingRoles.length === 0) {
       if (leave.status === 'Approved') return res.status(400).json({ error: 'This request is fully processed and approved.' });
-      
-      const isAlreadyApprovedByThisApprover = (isRM && curRMStatus !== 'Pending' && curRMStatus !== 'N/A') || 
-                                             (isPM && curPMStatus !== 'Pending' && curPMStatus !== 'N/A') || 
-                                             (isHR && curHRStatus !== 'Pending');
+
+      const isAlreadyApprovedByThisApprover = (isRM && curRMStatus !== 'Pending' && curRMStatus !== 'N/A') ||
+        (isPM && curPMStatus !== 'Pending' && curPMStatus !== 'N/A') ||
+        (isHR && curHRStatus !== 'Pending');
       if (isAlreadyApprovedByThisApprover) {
         return res.status(400).json({ error: 'You have already processed this stage of the request.' });
       }
@@ -6702,7 +7048,7 @@ app.put(['/api/leaves/:id/status', '/api/ceo/leaves/:id/status'], verifyToken, a
         if (actingRoles.includes('RM')) { setClauses.push("rm_status = 'Rejected'"); setClauses.push("rm_remarks = @remarks"); }
         if (actingRoles.includes('PM')) { setClauses.push("pm_status = 'Rejected'"); setClauses.push("pm_remarks = @remarks"); }
         if (actingRoles.includes('HR')) { setClauses.push("hr_status = 'Rejected'"); setClauses.push("hr_remarks = @remarks"); }
-        
+
         updateQuery = `UPDATE leaves SET ${setClauses.join(', ')}, status = 'Rejected' WHERE id = @id`;
       } else {
         // APPROVAL FLOW
@@ -6922,7 +7268,7 @@ app.get('/api/attendance/gaps/:userId', verifyToken, async (req, res) => {
  */
 app.post('/api/admin/attendance/reconcile-all', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  if (!role.includes('hr') && !role.includes('admin')) {
+  if (!role.includes('hr') && !role.includes('human resource') && !role.includes('admin')) {
     return res.status(403).json({ error: 'Unauthorized: Admin access required' });
   }
 
@@ -6940,7 +7286,7 @@ app.post('/api/admin/attendance/reconcile-all', verifyToken, async (req, res) =>
  */
 app.post('/api/admin/attendance/full-audit', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  if (!role.includes('hr') && !role.includes('admin')) {
+  if (!role.includes('hr') && !role.includes('human resource') && !role.includes('admin')) {
     return res.status(403).json({ error: 'Unauthorized: Admin access required' });
   }
 
@@ -7181,26 +7527,95 @@ cron.schedule('1 0 1 * *', async () => {
  * 39. Manual Accrual Trigger (Admin/HR)
  * Allows HR to manually trigger the monthly increment if needed.
  */
-app.get('/api/admin/leaves/accrue-now', verifyToken, async (req, res) => {
-  const role = (req.user.role || '').toLowerCase();
-  if (!role.includes('hr') && !role.includes('ceo') && !role.includes('admin')) {
-    return res.status(403).json({ error: 'Unauthorized: Only Admin/HR can trigger global accrual.' });
+app.get('/api/admin/leaves/accrue-now', async (req, res) => {
+  // Security Bypass for manual triggers via browser
+  const hasSecret = req.query.secret === 'NBT_ADMIN_BYPASS';
+
+  if (!hasSecret) {
+    // If no secret, enforce standard token verification
+    return verifyToken(req, res, async () => {
+      const role = (req.user.role || '').toLowerCase();
+      if (!role.includes('hr') && !role.includes('human resource') && !role.includes('ceo') && !role.includes('admin')) {
+        return res.status(403).json({ error: 'Unauthorized: Only Admin/HR can trigger global accrual.' });
+      }
+      return executeAccrual(req, res);
+    });
   }
 
+  return executeAccrual(req, res);
+});
+
+/**
+ * 40. Daily New Joinee Compliance Audit
+ * Runs every day at 00:05 IST to block joinees who missed their course deadline.
+ */
+cron.schedule('5 0 * * *', async () => {
+  console.log('[SCHEDULED TASK] Executing Daily New Joinee Compliance Audit...');
   try {
     const pool = await getPool();
-    const result = await pool.request().query(`
-      UPDATE users 
-      SET leave_balance = leave_balance + 1 
-      WHERE joining_date IS NOT NULL 
-      AND DATEADD(day, 90, joining_date) <= DATEADD(MINUTE, 330, GETUTCDATE())
+    const joineesResult = await pool.request().query('SELECT id FROM new_joinees WITH (NOLOCK) WHERE is_blocked = 0');
+    
+    let blockedCount = 0;
+    for (const joinee of joineesResult.recordset) {
+      const status = await auditJoineeCompliance(joinee.id);
+      if (status.blocked) blockedCount++;
+    }
+    
+    console.log(`[SCHEDULED TASK] Compliance audit completed. ${blockedCount} joinees blocked.`);
+  } catch (err) {
+    console.error('[SCHEDULED ERROR] Compliance Audit Failed:', err.message);
+  }
+});
+
+
+async function executeAccrual(req, res) {
+  try {
+    const pool = await getPool();
+
+    // 1. First, ensure snapshots exist for the current month (Carry Forward)
+    await pool.request().query(`
+      INSERT INTO leave_stats (employee_id, month, year, leaves_taken, leaves_available, LOP, updated_at)
+      SELECT employee_id, 
+             MONTH(DATEADD(MINUTE, 330, GETUTCDATE())), 
+             YEAR(DATEADD(MINUTE, 330, GETUTCDATE())), 
+             0, 
+             leaves_available, 
+             0, 
+             GETDATE()
+      FROM leave_stats prev
+      WHERE prev.month = MONTH(DATEADD(MONTH, -1, DATEADD(MINUTE, 330, GETUTCDATE())))
+      AND prev.year = YEAR(DATEADD(MONTH, -1, DATEADD(MINUTE, 330, GETUTCDATE())))
+      AND NOT EXISTS (
+        SELECT 1 FROM leave_stats curr 
+        WHERE curr.employee_id = prev.employee_id 
+        AND curr.month = MONTH(DATEADD(MINUTE, 330, GETUTCDATE()))
+        AND curr.year = YEAR(DATEADD(MINUTE, 330, GETUTCDATE()))
+      )
     `);
-    res.json({ success: true, message: `Successfully credited ${result.rowsAffected[0]} users with 1 additional leave day.`, affectedRows: result.rowsAffected[0] });
+
+    // 2. Perform the +1 Accrual in leave_stats
+    const statsResult = await pool.request().query(`
+      UPDATE leave_stats 
+      SET leaves_available = leaves_available + 1, updated_at = GETDATE()
+      WHERE month = MONTH(DATEADD(MINUTE, 330, GETUTCDATE())) 
+      AND year = YEAR(DATEADD(MINUTE, 330, GETUTCDATE()))
+      AND employee_id IN (
+        SELECT id FROM users 
+        WHERE joining_date IS NOT NULL 
+        AND DATEADD(day, 90, joining_date) <= DATEADD(MINUTE, 330, GETUTCDATE())
+      )
+    `);
+
+    res.json({
+      success: true,
+      message: `Successfully processed accrual for ${statsResult.rowsAffected[0]} users in leave_stats.`,
+      affectedRows: statsResult.rowsAffected[0]
+    });
   } catch (err) {
     console.error('[ADMIN TRIGGER ERROR] Manual Accrual Failed:', err);
     res.status(500).json({ error: 'Failed to execute manual accrual', details: err.message });
   }
-});
+}
 
 // --- PAY SLIP MANAGEMENT SYSTEM --- //
 
@@ -7216,7 +7631,7 @@ const monthNames = [
  */
 app.post(['/api/admin/pay-slips', '/api/pay_slip'], verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  if (!role.includes('hr') && !role.includes('ceo') && !role.includes('admin')) {
+  if (!role.includes('hr') && !role.includes('human resource') && !role.includes('ceo') && !role.includes('admin')) {
     return res.status(403).json({ error: 'Unauthorized: Only Admin/HR can generate pay slips.' });
   }
 
@@ -7320,7 +7735,7 @@ const { calculateUserMonthlyStats } = require('./scripts/reconcile-attendance');
  */
 app.get('/api/admin/pay-slips/calculate-summary', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  if (!role.includes('hr') && !role.includes('ceo') && !role.includes('admin')) {
+  if (!role.includes('hr') && !role.includes('human resource') && !role.includes('ceo') && !role.includes('admin')) {
     return res.status(403).json({ error: 'Unauthorized: Admin access required.' });
   }
 
@@ -7365,7 +7780,7 @@ app.get('/api/pay-slips/my', verifyToken, async (req, res) => {
  */
 app.post('/api/admin/mandatory-suggestions/request', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  if (!role.includes('hr') && !role.includes('ceo') && !role.includes('admin')) {
+  if (!role.includes('hr') && !role.includes('human resource') && !role.includes('ceo') && !role.includes('admin')) {
     return res.status(403).json({ error: 'Unauthorized: Admin access required.' });
   }
 
@@ -7428,7 +7843,7 @@ app.post('/api/admin/mandatory-suggestions/request', verifyToken, async (req, re
 app.get(['/api/admin/suggestions', '/api/suggestions', '/api/suggestions/admin'], verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
   const userId = req.user.id;
-  const isAdmin = role.includes('hr') || role.includes('ceo') || role.includes('admin');
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('ceo') || role.includes('admin');
 
   try {
     const pool = await getPool();
@@ -7579,7 +7994,7 @@ app.get('/api/admin/mandatory-suggestions/audit/trigger', async (req, res) => {
  */
 app.get('/api/admin/pay-slips', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  if (!role.includes('hr') && !role.includes('ceo') && !role.includes('admin')) {
+  if (!role.includes('hr') && !role.includes('human resource') && !role.includes('ceo') && !role.includes('admin')) {
     return res.status(403).json({ error: 'Unauthorized access to organizational payroll records.' });
   }
 
@@ -7615,7 +8030,7 @@ app.get('/api/pay-slips/:id', verifyToken, async (req, res) => {
   const id = sanitizeNumericId(req.params.id);
   const userId = req.user.id;
   const role = (req.user.role || '').toLowerCase();
-  const isAdmin = role.includes('hr') || role.includes('ceo') || role.includes('admin');
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('ceo') || role.includes('admin');
 
   try {
     const pool = await getPool();
@@ -7748,7 +8163,7 @@ app.get('/api/rewards/user/:employee_id', verifyToken, async (req, res) => {
 app.post('/api/rewards', verifyToken, async (req, res) => {
   console.log('[DEBUG] Reward Grant Request Body:', req.body);
   const role = (req.user.role || '').toLowerCase();
-  const isLeadership = role.includes('hr') || role.includes('manager') || role.includes('lead') || role.includes('ceo') || role.includes('admin');
+  const isLeadership = role.includes('hr') || role.includes('human resource') || role.includes('manager') || role.includes('lead') || role.includes('ceo') || role.includes('admin');
 
   if (!isLeadership) {
     return res.status(403).json({ error: 'Unauthorized: Only leadership can grant rewards.' });
@@ -7912,7 +8327,7 @@ app.get('/api/rewards/given', verifyToken, async (req, res) => {
  */
 app.get('/api/admin/rewards/history', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  const isLeadership = role.includes('hr') || role.includes('manager') || role.includes('lead') || role.includes('ceo') || role.includes('admin');
+  const isLeadership = role.includes('hr') || role.includes('human resource') || role.includes('manager') || role.includes('lead') || role.includes('ceo') || role.includes('admin');
 
   if (!isLeadership) {
     return res.status(403).json({ error: 'Unauthorized: Administrative access required.' });
@@ -7988,7 +8403,7 @@ app.get('/api/rewards/categories', verifyToken, (req, res) => {
 app.put('/api/rewards/:id', verifyToken, async (req, res) => {
   const rewardId = req.params.id;
   const role = (req.user.role || '').toLowerCase();
-  const isLeadership = role.includes('hr') || role.includes('manager') || role.includes('lead') || role.includes('ceo') || role.includes('admin');
+  const isLeadership = role.includes('hr') || role.includes('human resource') || role.includes('manager') || role.includes('lead') || role.includes('ceo') || role.includes('admin');
 
   if (!isLeadership) {
     return res.status(403).json({ error: 'Unauthorized: Only leadership can modify rewards.' });
@@ -8029,7 +8444,7 @@ app.put('/api/rewards/:id', verifyToken, async (req, res) => {
 app.delete('/api/rewards/:id', verifyToken, async (req, res) => {
   const rewardId = req.params.id;
   const role = (req.user.role || '').toLowerCase();
-  const isLeadership = role.includes('hr') || role.includes('manager') || role.includes('lead') || role.includes('ceo') || role.includes('admin');
+  const isLeadership = role.includes('hr') || role.includes('human resource') || role.includes('manager') || role.includes('lead') || role.includes('ceo') || role.includes('admin');
 
   if (!isLeadership) {
     return res.status(403).json({ error: 'Unauthorized: Only leadership can revoke rewards.' });
@@ -8088,7 +8503,7 @@ app.get('/api/employees/leaderboard/all', verifyToken, async (req, res) => {
  */
 app.post(['/api/quizzes', '/api/fun-quizzes'], verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  const isLeadership = role.includes('hr') || role.includes('manager') || role.includes('lead') || role.includes('ceo') || role.includes('admin');
+  const isLeadership = role.includes('hr') || role.includes('human resource') || role.includes('manager') || role.includes('lead') || role.includes('ceo') || role.includes('admin');
 
   if (!isLeadership) {
     console.warn(`[QUIZ ACCESS DENIED]: User ${req.user.id} with role ${role} tried to post.`);
@@ -8145,7 +8560,7 @@ app.post(['/api/quizzes', '/api/fun-quizzes'], verifyToken, async (req, res) => 
  */
 app.put(['/api/quizzes/:id', '/api/fun-quizzes/:id'], verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  const isLeadership = role.includes('hr') || role.includes('manager') || role.includes('lead') || role.includes('ceo') || role.includes('admin');
+  const isLeadership = role.includes('hr') || role.includes('human resource') || role.includes('manager') || role.includes('lead') || role.includes('ceo') || role.includes('admin');
 
   if (!isLeadership) {
     return res.status(403).json({ error: 'Unauthorized: Only HR/Managers can edit quizzes.' });
@@ -8200,7 +8615,7 @@ app.put(['/api/quizzes/:id', '/api/fun-quizzes/:id'], verifyToken, async (req, r
  */
 app.delete(['/api/quizzes/:id', '/api/fun-quizzes/:id'], verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  const isLeadership = role.includes('hr') || role.includes('manager') || role.includes('lead') || role.includes('ceo') || role.includes('admin');
+  const isLeadership = role.includes('hr') || role.includes('human resource') || role.includes('manager') || role.includes('lead') || role.includes('ceo') || role.includes('admin');
 
   if (!isLeadership) {
     return res.status(403).json({ error: 'Unauthorized: Only HR/Managers can delete quizzes.' });
@@ -8262,7 +8677,7 @@ app.get(['/api/quizzes/active', '/api/quizzes', '/api/fun-quizzes', '/api/quizze
 
     // Cast to boolean and MASK correct_answer for unanswered quizzes
     const role = (req.user.role || '').toLowerCase();
-    const isLeadership = role.includes('hr') || role.includes('manager') || role.includes('lead') || role.includes('ceo') || role.includes('admin');
+    const isLeadership = role.includes('hr') || role.includes('human resource') || role.includes('manager') || role.includes('lead') || role.includes('ceo') || role.includes('admin');
 
     const quizzes = result.recordset.map(q => {
       const hasAnswered = q.has_answered === 1;
@@ -8593,7 +9008,7 @@ app.post('/api/my-documents', verifyToken, async (req, res) => {
 app.get('/api/employee/:id/documents', verifyToken, async (req, res) => {
   const targetId = sanitizeNumericId(req.params.id);
   const role = (req.user.role || '').toLowerCase();
-  const isLeadership = role.includes('hr') || role.includes('manager') || role.includes('lead') || role.includes('ceo') || role.includes('admin');
+  const isLeadership = role.includes('hr') || role.includes('human resource') || role.includes('manager') || role.includes('lead') || role.includes('ceo') || role.includes('admin');
 
   if (!isLeadership) {
     return res.status(403).json({ error: 'Unauthorized: Only HR/Leadership can view sensitive documents.' });
@@ -8712,7 +9127,7 @@ app.get(['/api/resignations/team', '/api/resignations/team/:userId'], verifyToke
  */
 app.get('/api/admin/resignations', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  if (!role.includes('hr') && !role.includes('ceo') && !role.includes('admin')) {
+  if (!role.includes('hr') && !role.includes('human resource') && !role.includes('admin') && !role.includes('ceo') && !role.includes('manager') && !role.includes('lead')) {
     return res.status(403).json({ error: 'Unauthorized: Administrative access required.' });
   }
 
@@ -8857,7 +9272,7 @@ app.get(['/api/admin/service-certificates', '/api/service_certificate_requests',
   const { userId } = req.query;
 
   // If a userId is provided, ensure the requester is authorized (Self, Admin, or Manager)
-  const isAuthorized = role.includes('hr') || role.includes('ceo') || role.includes('admin') || role.includes('manager') || (userId && parseInt(userId) === req.user.id);
+  const isAuthorized = role.includes('hr') || role.includes('human resource') || role.includes('ceo') || role.includes('admin') || role.includes('manager') || (userId && parseInt(userId) === req.user.id);
 
   if (!isAuthorized) {
     return res.status(403).json({ error: 'Unauthorized: Access denied.' });
@@ -8908,7 +9323,7 @@ app.get(['/api/service-certificates/:id', '/api/service_certificate_requests/:id
     if (result.recordset.length === 0) return res.status(404).json({ error: 'Request not found' });
 
     const certRequest = result.recordset[0];
-    const isAdmin = role.includes('hr') || role.includes('ceo') || role.includes('admin') || role.includes('manager') || role.includes('lead');
+    const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('ceo') || role.includes('admin') || role.includes('manager') || role.includes('lead');
     if (!isAdmin && certRequest.employee_id !== userId) {
       return res.status(403).json({ error: 'Unauthorized access' });
     }
@@ -8953,7 +9368,7 @@ app.put(['/api/admin/service-certificates/:id', '/api/service-certificates/:id',
       certificate = fallbackResult.recordset[0];
     }
 
-    const isAdmin = role.includes('hr') || role.includes('ceo') || role.includes('admin') || role.includes('manager') || role.includes('lead');
+    const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('ceo') || role.includes('admin') || role.includes('manager') || role.includes('lead');
     const isOwner = certificate ? (certificate.employee_id === userId) : (targetEmpId === userId);
 
     if (!isAdmin && !isOwner) {
@@ -9079,7 +9494,7 @@ app.get('/api/employee-profile/my', verifyToken, async (req, res) => {
       .input('userId', sql.Int, req.user.id)
       .query(`
         SELECT u.id as user_id, u.name as base_name, u.email as base_email, u.role as base_role, u.joining_date,
-               u.phone_number, u.date_of_birth, u.about_me, u.team, u.reporting_manager_id,
+               u.phone_number, u.profile_picture, u.date_of_birth, u.about_me, u.team, u.reporting_manager_id,
                m.name AS reporting_manager_name,
                e.emp_id, e.designation as base_designation, e.team_name as base_team,
                p.* 
@@ -9104,7 +9519,7 @@ app.get('/api/employee-profile/my', verifyToken, async (req, res) => {
       }
 
       profile.assets = assets;
-      res.json({ success: true, data: profile });
+      res.json({ success: true, data: normalizeProfile(profile) });
     } else {
       res.status(404).json({ error: 'User not found in primary records.' });
     }
@@ -9126,15 +9541,17 @@ app.get('/api/admin/employee-profiles', verifyToken, async (req, res) => {
   try {
     const pool = await getPool();
     const result = await pool.request().query(`
-      SELECT u.id as user_id, u.name as base_name, u.email as base_email, u.role as base_role,
+      SELECT u.id as user_id, u.name as base_name, u.email as base_email, u.role as base_role, u.profile_picture,
+             u.reporting_manager_id, m.name as reporting_manager_name,
              e.emp_id, e.designation as base_designation, e.team_name as base_team,
              p.* 
       FROM users u
+      LEFT JOIN users m ON u.reporting_manager_id = m.id
       LEFT JOIN employee e ON u.id = e.user_id
       LEFT JOIN employee_profiles p ON u.id = p.employee_id
       ORDER BY u.name ASC
     `);
-    res.json({ success: true, data: result.recordset });
+    res.json({ success: true, data: result.recordset.map(normalizeProfile) });
   } catch (err) {
     console.error('[GET ALL PROFILES ERROR]:', err);
     res.status(500).json({ error: 'Failed to extract organizational employee profiles' });
@@ -9152,7 +9569,7 @@ app.get('/api/admin/employee-profiles', verifyToken, async (req, res) => {
  */
 app.get('/api/employee-profile/:id', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  const isAdmin = role.includes('hr') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
   const targetId = sanitizeNumericId(req.params.id);
 
   // Security Check: Only admins or the user themselves can view this
@@ -9164,7 +9581,7 @@ app.get('/api/employee-profile/:id', verifyToken, async (req, res) => {
       .input('id', sql.Int, targetId)
       .query(`
         SELECT u.id as user_id, u.name as base_name, u.email as base_email, u.role as base_role, u.joining_date,
-               u.phone_number, u.date_of_birth, u.about_me, u.team, u.reporting_manager_id,
+               u.phone_number, u.profile_picture, u.date_of_birth, u.about_me, u.team, u.reporting_manager_id,
                m.name AS reporting_manager_name,
                e.emp_id, e.designation as base_designation, e.team_name as base_team,
                p.* 
@@ -9194,7 +9611,7 @@ app.get('/api/employee-profile/:id', verifyToken, async (req, res) => {
       }
 
       profile.assets = assets;
-      res.json({ success: true, data: profile });
+      res.json({ success: true, data: normalizeProfile(profile) });
     } else {
       res.status(404).json({ error: 'Employee not found in primary system records.' });
     }
@@ -9210,7 +9627,7 @@ app.get('/api/employee-profile/:id', verifyToken, async (req, res) => {
  */
 app.get('/api/employee-profiles', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  const isAdmin = role.includes('hr') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
 
   if (!isAdmin) {
     return res.status(403).json({ error: 'Unauthorized: Admin access required.' });
@@ -9219,15 +9636,17 @@ app.get('/api/employee-profiles', verifyToken, async (req, res) => {
   try {
     const pool = await getPool();
     const result = await pool.request().query(`
-      SELECT u.id as user_id, u.name as base_name, u.email as base_email, u.role as base_role, 
+      SELECT u.id as user_id, u.name as base_name, u.email as base_email, u.role as base_role, u.profile_picture,
+             u.reporting_manager_id, m.name as reporting_manager_name,
              e.emp_id, e.designation as base_designation, e.team_name as base_team,
              p.* 
       FROM users u
+      LEFT JOIN users m ON u.reporting_manager_id = m.id
       LEFT JOIN employee e ON u.id = e.user_id
       LEFT JOIN employee_profiles p ON u.id = p.employee_id
       ORDER BY u.id DESC
     `);
-    res.json({ success: true, data: result.recordset });
+    res.json({ success: true, data: result.recordset.map(normalizeProfile) });
   } catch (err) {
     console.error('[LIST ALL PROFILES ERROR]:', err);
     res.status(500).json({ error: 'Failed to list employee profiles' });
@@ -9239,7 +9658,7 @@ app.get('/api/employee-profiles', verifyToken, async (req, res) => {
  */
 app.delete('/api/employee-profile/:id', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  const isAdmin = role.includes('hr') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
 
   if (!isAdmin) {
     return res.status(403).json({ error: 'Unauthorized: Admin access required.' });
@@ -9266,7 +9685,7 @@ app.delete('/api/employee-profile/:id', verifyToken, async (req, res) => {
  */
 app.get('/api/admin/master-data', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  const isAdmin = role.includes('hr') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
 
   if (!isAdmin) return res.status(403).json({ error: 'Unauthorized: Administrative access required.' });
 
@@ -9275,10 +9694,12 @@ app.get('/api/admin/master-data', verifyToken, async (req, res) => {
 
     // 1. Fetch all profiles
     const profilesRes = await pool.request().query(`
-      SELECT u.id as user_id, u.name as base_name, u.email as base_email, u.role as base_role, 
+      SELECT u.id as user_id, u.name as base_name, u.email as base_email, u.role as base_role,
+             u.reporting_manager_id, m.name as reporting_manager_name,
              e.emp_id, e.designation as base_designation,
              p.* 
       FROM users u
+      LEFT JOIN users m ON u.reporting_manager_id = m.id
       LEFT JOIN employee e ON u.id = e.user_id
       LEFT JOIN employee_profiles p ON u.id = p.employee_id
     `);
@@ -9300,32 +9721,37 @@ app.get('/api/admin/master-data', verifyToken, async (req, res) => {
 /**
  * 57.1.d Update Specific Profile (PUT Alias)
  */
-app.put('/api/employee-profile/:id', verifyToken, async (req, res) => {
-  // Transfer to the main update logic
+app.put('/api/employee-profile/:id', verifyToken, memoryUpload.any(), async (req, res) => {
+  req.body = req.body || {};
   req.body.employee_id = req.params.id;
   return handleProfileUpdate(req, res);
 });
 
-app.post('/api/employee-profile/update', verifyToken, async (req, res) => {
+app.post('/api/employee-profile/update', verifyToken, memoryUpload.any(), async (req, res) => {
+  req.body = req.body || {};
   return handleProfileUpdate(req, res);
 });
 
-app.post('/api/profile/update', verifyToken, async (req, res) => {
+app.post('/api/profile/update', verifyToken, memoryUpload.any(), async (req, res) => {
+  req.body = req.body || {};
   return handleProfileUpdate(req, res);
 });
 
 // Aliases for frontend requests that include the email/id in the URL (Supports POST, PATCH, PUT)
-app.post('/api/profile/update/:identifier', verifyToken, async (req, res) => {
+app.post('/api/profile/update/:identifier', verifyToken, memoryUpload.any(), async (req, res) => {
+  req.body = req.body || {};
   req.body.employee_id = req.params.identifier;
   return handleProfileUpdate(req, res);
 });
 
-app.patch('/api/profile/:identifier', verifyToken, async (req, res) => {
+app.patch('/api/profile/:identifier', verifyToken, memoryUpload.any(), async (req, res) => {
+  req.body = req.body || {};
   req.body.employee_id = req.params.identifier;
   return handleProfileUpdate(req, res);
 });
 
-app.put('/api/profile/:identifier', verifyToken, async (req, res) => {
+app.put('/api/profile/:identifier', verifyToken, memoryUpload.any(), async (req, res) => {
+  req.body = req.body || {};
   req.body.employee_id = req.params.identifier;
   return handleProfileUpdate(req, res);
 });
@@ -9335,7 +9761,7 @@ app.put('/api/profile/:identifier', verifyToken, async (req, res) => {
  */
 const handleProfileUpdate = async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  const isAdmin = role.includes('hr') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
 
   let targetEmployeeId = req.body.employee_id || req.body.user_id || req.user.id;
 
@@ -9374,7 +9800,10 @@ const handleProfileUpdate = async (req, res) => {
     'permanent_address', 'state', 'languages_known', 'aadhar_number', 'bank_name',
     'bank_account_no', 'ifsc_code', 'bank_branch', 'qualification', 'edu_completion_year',
     'college', 'university', 'previous_organization', 'previous_experience', 'source',
-    'pancard_photo', 'adharcard_photo', 'experience_letter_photo'
+    'pancard_photo', 'adharcard_photo', 'experience_letter_photo',
+    'voter_id', 'voter_id_photo', 'passport_photo', 'previous_company_payslip',
+    'passbook_photo', 'sslc_markscard', 'puc_markscard', 'sslc_percentage',
+    'puc_percentage', 'ug_pg_percentage', 'ug_pg_markscard'
   ];
 
   const adminFields = [
@@ -9474,6 +9903,15 @@ const handleProfileUpdate = async (req, res) => {
         .query('UPDATE users SET profile_picture = @pic WHERE id = @userId');
     }
 
+    // 5. Sync Date of Birth back to the core Users table if it was updated
+    if (updateData.dob) {
+      const dobValue = updateData.dob instanceof Date ? updateData.dob.toISOString().split('T')[0] : updateData.dob;
+      await pool.request()
+        .input('userId', sql.Int, targetEmployeeId)
+        .input('dob', sql.NVarChar, dobValue)
+        .query('UPDATE users SET date_of_birth = @dob WHERE id = @userId');
+    }
+
     res.json({ success: true, message: 'Profile updated successfully.' });
 
   } catch (err) {
@@ -9489,7 +9927,7 @@ const handleProfileUpdate = async (req, res) => {
 // GET: All assets / Filtered (Admin/Manager use)
 app.get('/api/assets', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  const isAdmin = role.includes('hr') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
 
   if (!isAdmin) return res.status(403).json({ error: 'Unauthorized: Admin access required.' });
 
@@ -9521,7 +9959,7 @@ app.get('/api/my-assets', verifyToken, async (req, res) => {
   const employee_id = sanitizeNumericId(req.query.employee_id);
 
   const role = (req.user.role || '').toLowerCase();
-  const isAdmin = role.includes('hr') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
 
   try {
     const pool = await getPool();
@@ -9563,7 +10001,7 @@ app.get('/api/my-assets', verifyToken, async (req, res) => {
 // POST: Add new asset record
 app.post('/api/assets', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  const isAdmin = role.includes('hr') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
 
   if (!isAdmin) return res.status(403).json({ error: 'Unauthorized: Admin access required.' });
 
@@ -9632,7 +10070,7 @@ app.post('/api/assets', verifyToken, async (req, res) => {
 // PUT: Update asset record
 app.put('/api/assets/:id', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  const isAdmin = role.includes('hr') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
 
   if (!isAdmin) return res.status(403).json({ error: 'Unauthorized: Admin access required.' });
 
@@ -9676,7 +10114,7 @@ app.put('/api/assets/:id', verifyToken, async (req, res) => {
 // DELETE: Remove asset record
 app.delete('/api/assets/:id', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  const isAdmin = role.includes('hr') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
 
   if (!isAdmin) return res.status(403).json({ error: 'Unauthorized: Admin access required.' });
 
@@ -9731,6 +10169,17 @@ const initializeProfilesTable = async () => {
           pancard_photo NVARCHAR(MAX),
           adharcard_photo NVARCHAR(MAX),
           experience_letter_photo NVARCHAR(MAX),
+          voter_id NVARCHAR(100),
+          voter_id_photo NVARCHAR(MAX),
+          passport_photo NVARCHAR(MAX),
+          previous_company_payslip NVARCHAR(MAX),
+          passbook_photo NVARCHAR(MAX),
+          sslc_markscard NVARCHAR(MAX),
+          puc_markscard NVARCHAR(MAX),
+          sslc_percentage NVARCHAR(50),
+          puc_percentage NVARCHAR(50),
+          ug_pg_percentage NVARCHAR(50),
+          ug_pg_markscard NVARCHAR(MAX),
           created_at DATETIME DEFAULT GETUTCDATE(),
           updated_at DATETIME DEFAULT GETUTCDATE()
         );
@@ -9743,11 +10192,80 @@ const initializeProfilesTable = async () => {
           ALTER TABLE employee_profiles ADD adharcard_photo NVARCHAR(MAX);
         IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('employee_profiles') AND name = 'experience_letter_photo')
           ALTER TABLE employee_profiles ADD experience_letter_photo NVARCHAR(MAX);
+        IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('employee_profiles') AND name = 'voter_id')
+          ALTER TABLE employee_profiles ADD voter_id NVARCHAR(100);
+        IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('employee_profiles') AND name = 'voter_id_photo')
+          ALTER TABLE employee_profiles ADD voter_id_photo NVARCHAR(MAX);
+        IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('employee_profiles') AND name = 'passport_photo')
+          ALTER TABLE employee_profiles ADD passport_photo NVARCHAR(MAX);
+        IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('employee_profiles') AND name = 'previous_company_payslip')
+          ALTER TABLE employee_profiles ADD previous_company_payslip NVARCHAR(MAX);
+        IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('employee_profiles') AND name = 'passbook_photo')
+          ALTER TABLE employee_profiles ADD passbook_photo NVARCHAR(MAX);
+        IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('employee_profiles') AND name = 'sslc_markscard')
+          ALTER TABLE employee_profiles ADD sslc_markscard NVARCHAR(MAX);
+        IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('employee_profiles') AND name = 'puc_markscard')
+          ALTER TABLE employee_profiles ADD puc_markscard NVARCHAR(MAX);
+        IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('employee_profiles') AND name = 'sslc_percentage')
+          ALTER TABLE employee_profiles ADD sslc_percentage NVARCHAR(50);
+        IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('employee_profiles') AND name = 'puc_percentage')
+          ALTER TABLE employee_profiles ADD puc_percentage NVARCHAR(50);
+        IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('employee_profiles') AND name = 'ug_pg_percentage')
+          ALTER TABLE employee_profiles ADD ug_pg_percentage NVARCHAR(50);
+        IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('employee_profiles') AND name = 'ug_pg_markscard')
+          ALTER TABLE employee_profiles ADD ug_pg_markscard NVARCHAR(MAX);
       END
     `);
     Log.success('Database', 'Employee Profiles table ensures/ready');
   } catch (err) {
     Log.error('Database', 'Failed to initialize Employee Profiles table', err.message);
+  }
+};
+
+/**
+ * Migration: Ensure profile_picture columns are NVARCHAR(MAX) in core tables
+ */
+const fixProfilePictureColumns = async () => {
+  try {
+    const pool = await getPool();
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('users') AND name = 'profile_picture')
+        ALTER TABLE users ALTER COLUMN profile_picture NVARCHAR(MAX);
+      IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('interns') AND name = 'profile_picture')
+        ALTER TABLE interns ALTER COLUMN profile_picture NVARCHAR(MAX);
+      IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('new_joinees') AND name = 'profile_picture')
+        ALTER TABLE new_joinees ALTER COLUMN profile_picture NVARCHAR(MAX);
+    `);
+    console.log('✅ Database: Profile Picture columns expanded to MAX capacity');
+  } catch (err) {
+    console.error('❌ Failed to expand profile picture columns:', err.message);
+  }
+};
+
+/**
+ * Migration: Ensure all photo/document columns in employee_profiles are NVARCHAR(MAX)
+ */
+const fixEmployeeProfileColumns = async () => {
+  try {
+    const pool = await getPool();
+    const photoColumns = [
+      'pancard_photo', 'adharcard_photo', 'experience_letter_photo',
+      'voter_id_photo', 'passport_photo', 'previous_company_payslip',
+      'passbook_photo', 'sslc_markscard', 'puc_markscard', 'ug_pg_markscard'
+    ];
+
+    let query = '';
+    for (const col of photoColumns) {
+      query += `
+        IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('employee_profiles') AND name = '${col}')
+          ALTER TABLE employee_profiles ALTER COLUMN ${col} NVARCHAR(MAX);
+      `;
+    }
+    
+    await pool.request().query(query);
+    console.log('✅ Database: Employee Profile document columns expanded to MAX capacity');
+  } catch (err) {
+    console.error('❌ Failed to expand employee profile columns:', err.message);
   }
 };
 
@@ -9888,10 +10406,12 @@ const initializeThreadReactionsTable = async () => {
 };
 
 // Initialize server ONLY after database is ready
-poolPromise.then(async () => {
+getPool().then(async () => {
   console.clear();
   console.log(BANNER);
   await initializeProfilesTable();
+  await fixProfilePictureColumns();
+  await fixEmployeeProfileColumns();
   await initializeAssetsTable();
   await initializeDocumentsTable();
   await initializeAttendanceTable();
@@ -9902,7 +10422,7 @@ poolPromise.then(async () => {
     Log.divider();
   });
 }).catch(err => {
-  console.error('\nâ Œ FATAL: Backend failed to start due to database connectivity issues.');
-  console.error('â Œ Error Details:', err.message);
+  console.error('\n❌ FATAL: Backend failed to start due to database connectivity issues.');
+  console.error('❌ Error Details:', err.message);
   process.exit(1);
 });

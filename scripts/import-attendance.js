@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { poolPromise } = require('../db');
+const { getPool } = require('../db');
 const sql = require('mssql');
 // Using global fetch (available in Node 18+)
 
@@ -14,7 +14,7 @@ async function importAttendance() {
     }
 
     try {
-        const pool = await poolPromise;
+        const pool = await getPool();
         const daysToImport = 2;
         const now = new Date();
 
@@ -43,11 +43,19 @@ async function importAttendance() {
                     // --- DYNAMIC ID BRIDGE: AUTO-CORRECT 6-DIGIT EMPCODE (20250X -> 2025X) ---
                     const autoCorrectId = (code) => {
                         if (!code) return code;
-                        const strId = String(code);
-                        if (strId.startsWith('20250') && strId.length === 6) {
-                            return parseInt(strId.replace('20250', '2025'));
+                        let strId = String(code).trim();
+                        
+                        // Handle 7-digit pattern (e.g. 2025110 -> 202510)
+                        if (strId.length === 7 && strId.substring(4, 5) === '1') {
+                            strId = strId.slice(0, 4) + strId.slice(5);
                         }
-                        return parseInt(code);
+
+                        // Handle 6-digit pattern (e.g. 202501 -> 20251)
+                        if (strId.length === 6 && strId.substring(4, 5) === '0') {
+                            strId = strId.slice(0, 4) + strId.slice(5);
+                        }
+                        
+                        return parseInt(strId);
                     };
 
                     const empId = autoCorrectId(log.Empcode);
@@ -75,9 +83,13 @@ async function importAttendance() {
                                         VALUES (@userId, @punchDate, @inTime, @outTime, @workTime, @status, @remark, 'Biometric Terminal', 'Biometric Terminal');
                                 END
                             `);
-                        if (res.rowsAffected[0] > 0) successCount++;
+                        if (res.rowsAffected[0] > 0) {
+                            successCount++;
+                        } else {
+                            console.warn(`   ⚠️ User not found in DB for Empcode: ${log.Empcode} (Mapped ID: ${empId})`);
+                        }
                     } catch (e) {
-                        // Silently handle if user doesn't exist in our DB
+                        console.error(`   ⚠️ Sync failed for Empcode ${log.Empcode} (ID: ${empId}):`, e.message);
                     }
                 }
                 console.log(`   ✅ Synced ${successCount} records into attendance_logs.`);
