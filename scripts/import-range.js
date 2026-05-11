@@ -4,10 +4,12 @@ const { getPool } = require('../db');
 const sql = require('mssql');
 
 async function importRange(fromDateStr, toDateStr) {
-    console.log(`--- 🚀 STARTING MANUAL RANGE IMPORT: ${fromDateStr} to ${toDateStr} ---`);
+    console.log(`--- 🚀 STARTING ROBUST CHUNKED RANGE IMPORT: ${fromDateStr} to ${toDateStr} ---`);
 
     const baseUrl = process.env.TEAM_OFFICE_BASE_URL || 'https://api.etimeoffice.com/api';
     const authToken = process.env.TEAM_OFFICE_AUTH_TOKEN;
+    const company = process.env.TEAM_OFFICE_COMPANY || 'Navabharath Technologies';
+    const EXCLUDED_EMPCODES = ['0088', '0099', '2025102', '20250'];
 
     if (!authToken) {
         console.error('❌ Error: TEAM_OFFICE_AUTH_TOKEN not found in .env');
@@ -17,139 +19,166 @@ async function importRange(fromDateStr, toDateStr) {
     try {
         const pool = await getPool();
 
-        // --- NEW: Fetch Holidays List ---
+        // 1. Fetch Users
+        const usersRes = await pool.request().query('SELECT id, name FROM users');
+        const users = usersRes.recordset;
+        console.log(`👥 Tracking ${users.length} users from database.`);
+
+        // 2. Fetch Holidays
         const holidaysRes = await pool.request().query('SELECT holiday_date, name FROM holidays');
         const holidayMap = holidaysRes.recordset.reduce((acc, h) => {
-            acc[h.holiday_date.toISOString().split('T')[0]] = h.name;
+            const d = h.holiday_date;
+            const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+            acc[key] = h.name;
             return acc;
         }, {});
 
-        const loggedDates = new Set();
-        const url = `${baseUrl}/DownloadInOutPunchData?Empcode=ALL&FromDate=${fromDateStr}&ToDate=${toDateStr}`;
-
-        console.log(`📡 Fetching from Etime Office: ${url}`);
-        const response = await fetch(url, { headers: { 'Authorization': `Basic ${authToken}` } });
-
-        if (!response.ok) {
-            throw new Error(`HTTP Error: ${response.status}`);
+        // 3. Generate Date Range
+        const [d1, m1, y1] = fromDateStr.split('/').map(Number);
+        const [d2, m2, y2] = toDateStr.split('/').map(Number);
+        const startDate = new Date(y1, m1 - 1, d1, 12, 0, 0);
+        const endDate = new Date(y2, m2 - 1, d2, 12, 0, 0);
+        
+        const dateArray = [];
+        let curr = new Date(startDate);
+        while (curr <= endDate) {
+            dateArray.push(new Date(curr));
+            curr.setDate(curr.getDate() + 1);
         }
+        console.log(`📅 Processing ${dateArray.length} days individually to prevent API truncation.`);
 
-        const data = await response.json();
-        const logs = data.InOutPunchData || [];
+        const getCleanId = (code) => {
+            if (!code) return null;
+            return parseInt(String(code).trim());
+        };
 
-        console.log(`📊 Found ${logs.length} total logs for this range.`);
+        const clean = (s) => (s || '').toLowerCase().replace(/[^a-z]/g, '');
 
-        let successCount = 0;
-        for (const log of logs) {
-            // --- DYNAMIC ID BRIDGE: AUTO-CORRECT 6-DIGIT EMPCODE (20250X -> 2025X) ---
-            const autoCorrectId = (code) => {
-                if (!code) return code;
-                let strId = String(code).trim();
+        let totalProcessed = 0;
+        let totalInserted = 0;
 
-                // Handle 7-digit pattern (e.g. 2025110 -> 202510)
-                if (strId.length === 7 && strId.substring(4, 5) === '1') {
-                    strId = strId.slice(0, 4) + strId.slice(5);
-                }
+        // 4. Iterate through Every Date
+        for (const dateObj of dateArray) {
+            const day = String(dateObj.getDate()).padStart(2, '0');
+            const month = String(dateObj.getMonth() + 1).padStart(2, '0');
+            const year = dateObj.getFullYear();
+            const formattedDate = `${day}/${month}/${year}`;
+            const dateKey = `${year}-${month}-${day}`;
 
-                // Handle 6-digit pattern (e.g. 202501 -> 20251)
-                if (strId.length === 6 && strId.substring(4, 5) === '0') {
-                    strId = strId.slice(0, 4) + strId.slice(5);
-                }
-
-                return parseInt(strId);
-            };
-
-            const empId = autoCorrectId(log.Empcode);
-            if (isNaN(empId)) continue;
-
-            // Convert DD/MM/YYYY to Date object safely
-            const [d, m, y] = log.DateString.split('/');
-            const punchDate = new Date(`${y}-${m}-${d}`);
-
-            // --- NEW: Calculate WorkTime manually from IN/OUT times ---
-            const calcWorkTime = (inT, outT) => {
-                if (!inT || !outT || inT === '00:00' || outT === '00:00') return "00:00";
-                try {
-                    const [inH, inM] = inT.split(':').map(Number);
-                    const [outH, outM] = outT.split(':').map(Number);
-                    let diff = (outH * 60 + outM) - (inH * 60 + inM);
-                    if (diff < 0) diff += 1440; // Handle shifts crossing midnight
-                    return `${String(Math.floor(diff / 60)).padStart(2, '0')}:${String(diff % 60).padStart(2, '0')}`;
-                } catch { return "00:00"; }
-            };
-
-            const manualWorkTime = calcWorkTime(log.INTime, log.OUTTime);
-
-            // --- NEW RULE: WorkTime calculation ---
-            let finalStatus = log.Status;
-            if (manualWorkTime && manualWorkTime.includes(':')) {
-                try {
-                    const [h, m] = manualWorkTime.split(':').map(n => parseInt(n, 10));
-                    const totalHours = h + (m / 60);
-
-                    if (totalHours >= 8) {
-                        finalStatus = 'P';
-                    } else if (totalHours > 5 && totalHours < 8) {
-                        finalStatus = 'Half Day';
-                    } else {
-                        finalStatus = 'A';
-                    }
-                } catch (e) {
-                    // fallback to log.Status
-                }
-            }
-
-            // --- NEW: Mark Sundays as Week Off (WO) if not already Present ---
-            if (punchDate.getDay() === 0 && finalStatus !== 'P' && finalStatus !== 'Half Day') {
-                finalStatus = 'WO';
-            }
-
-            // --- NEW: Check for Holidays ---
-            const dateKey = punchDate.toISOString().split('T')[0];
-            let finalRemark = log.Remark;
-            if (holidayMap[dateKey]) {
-                if (!loggedDates.has(dateKey)) {
-                    console.log(`   ✨ Holiday Detected: ${holidayMap[dateKey]}`);
-                    loggedDates.add(dateKey);
-                }
-                finalStatus = 'Holiday';
-                finalRemark = holidayMap[dateKey];
-            }
-
+            console.log(`\n📡 Fetching for ${formattedDate}...`);
+            const url = `${baseUrl}/DownloadInOutPunchData?Empcode=ALL&FromDate=${formattedDate}&ToDate=${formattedDate}&Company=${encodeURIComponent(company)}`;
+            
+            let dailyLogs = [];
             try {
-                const res = await pool.request()
-                    .input('userId', sql.Int, empId)
-                    .input('punchDate', sql.Date, punchDate)
-                    .input('inTime', sql.NVarChar, log.INTime)
-                    .input('outTime', sql.NVarChar, log.OUTTime)
-                    .input('workTime', sql.NVarChar, manualWorkTime)
-                    .input('status', sql.NVarChar, finalStatus)
-                    .input('remark', sql.NVarChar, finalRemark)
-                    .query(`
-                        IF EXISTS (SELECT 1 FROM users WHERE id = @userId)
-                        BEGIN
+                const response = await fetch(url, { headers: { 'Authorization': `Basic ${authToken}` } });
+                if (response.ok) {
+                    const data = await response.json();
+                    dailyLogs = data.InOutPunchData || [];
+                }
+            } catch (e) {
+                console.error(`   ⚠️ API Fetch failed for ${formattedDate}:`, e.message);
+            }
+
+            // Organize daily logs into a map for quick lookup
+            const dailyLogMap = {};
+            for (const log of dailyLogs) {
+                const empId = getCleanId(log.Empcode);
+                if (empId) dailyLogMap[empId] = log;
+            }
+
+            // 5. Process Every User for this specific Date
+            for (const user of users) {
+                if (EXCLUDED_EMPCODES.includes(String(user.id))) continue;
+
+                const apiLog = dailyLogMap[user.id];
+                
+                let finalStatus = 'A';
+                let inTime = null;
+                let outTime = null;
+                let workTime = null;
+                let remark = null;
+                let isCollision = false;
+
+                if (apiLog) {
+                    const apiName = clean(apiLog.Name);
+                    const dbName = clean(user.name);
+                    if (apiName && dbName && !apiName.includes(dbName) && !dbName.includes(apiName)) {
+                        if (apiName.length > 3 && dbName.length > 3) {
+                            isCollision = true;
+                        }
+                    }
+
+                    if (!isCollision) {
+                        inTime = (apiLog.INTime === '--:--' || apiLog.INTime === '00:00') ? null : apiLog.INTime;
+                        outTime = (apiLog.OUTTime === '--:--' || apiLog.OUTTime === '00:00') ? null : apiLog.OUTTime;
+                        remark = apiLog.Remark;
+                        
+                        if (inTime && outTime) {
+                            try {
+                                const [inH, inM] = inTime.split(':').map(Number);
+                                const [outH, outM] = outTime.split(':').map(Number);
+                                let diff = (outH * 60 + outM) - (inH * 60 + inM);
+                                if (diff < 0) diff += 1440;
+                                workTime = `${String(Math.floor(diff / 60)).padStart(2, '0')}:${String(diff % 60).padStart(2, '0')}`;
+                                
+                                const totalHours = Math.floor(diff / 60) + (diff % 60 / 60);
+                                if (totalHours >= 8) finalStatus = 'P';
+                                else if (totalHours >= 5) finalStatus = 'Half Day';
+                                else finalStatus = 'A';
+                            } catch (e) { finalStatus = apiLog.Status || 'A'; }
+                        } else if (inTime) {
+                            const isToday = dateKey === new Date().toISOString().split('T')[0];
+                            finalStatus = isToday ? 'In Office' : 'A';
+                        }
+                    }
+                }
+
+                // Global Rules (Sundays/Holidays)
+                if (finalStatus === 'A') {
+                    if (dateObj.getDay() === 0) finalStatus = 'WO';
+                    if (holidayMap[dateKey]) {
+                        finalStatus = 'Holiday';
+                        remark = holidayMap[dateKey];
+                    }
+                }
+
+                try {
+                    const result = await pool.request()
+                        .input('userId', sql.Int, user.id)
+                        .input('punchDate', sql.Date, dateObj)
+                        .input('inTime', sql.NVarChar, inTime)
+                        .input('outTime', sql.NVarChar, outTime)
+                        .input('workTime', sql.NVarChar, workTime)
+                        .input('status', sql.NVarChar, finalStatus)
+                        .input('remark', sql.NVarChar, remark)
+                        .query(`
                             MERGE INTO attendance_logs WITH (HOLDLOCK) AS target
                             USING (SELECT @userId AS user_id, @punchDate AS punch_date) AS source
                             ON (target.user_id = source.user_id AND target.punch_date = source.punch_date)
                             WHEN MATCHED THEN
-                                UPDATE SET in_time = @inTime, out_time = @outTime, work_time = @workTime, status = @status, remark = @remark, last_sync = GETDATE(), punchin_location = 'Biometric Terminal', punchout_location = 'Biometric Terminal'
+                                UPDATE SET in_time = @inTime, out_time = @outTime, work_time = @workTime, status = @status, remark = @remark, last_sync = GETDATE()
                             WHEN NOT MATCHED THEN
                                 INSERT (user_id, punch_date, in_time, out_time, work_time, status, remark, punchin_location, punchout_location)
                                 VALUES (@userId, @punchDate, @inTime, @outTime, @workTime, @status, @remark, 'Biometric Terminal', 'Biometric Terminal');
-                        END
-                    `);
-                if (res.rowsAffected[0] > 0) successCount++;
-            } catch (e) {
-                console.error(`   ⚠️ Sync failed for Empcode ${log.Empcode} (ID: ${empId}):`, e.message);
+                        `);
+                    if (result.rowsAffected.length > 0) {
+                        totalInserted++;
+                    }
+                } catch (e) {
+                    console.error(`   ❌ DB Error for ${user.id} on ${dateKey}:`, e.message);
+                }
+                totalProcessed++;
             }
+            console.log(`   ✅ Finished processing all users for ${formattedDate}.`);
         }
-        console.log(`✅ Successfully imported/updated ${successCount} records into attendance_logs.`);
+
+        console.log(`\n✅ Robust Chunked import complete. Processed ${totalProcessed} user-days, updated ${totalInserted} records.`);
+
     } catch (err) {
-        console.error('❌ Import Failed:', err.message);
+        console.error('❌ Robust Import Failed:', err.message);
     }
 }
 
-// Get dates from CLI arguments
 const [, , from, to] = process.argv;
 if (from && to) {
     importRange(from, to).then(() => {
@@ -161,6 +190,5 @@ if (from && to) {
     });
 } else {
     console.log('Usage: node scripts/import-range.js DD/MM/YYYY DD/MM/YYYY');
-    console.log('Example: node scripts/import-range.js 21/04/2026 27/04/2026');
     process.exit(1);
 }

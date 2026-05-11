@@ -10,15 +10,15 @@ const dbConfig = {
         encrypt: false,
         trustServerCertificate: true,
         enableArithAbort: true,
-        requestTimeout: 300000, 
-        connectionTimeout: 300000,
-        connectTimeout: 300000, // Explicitly set for tedious
+        requestTimeout: 45000,    // Increased to 45s for heavier migrations
+        connectionTimeout: 15000, 
+        cancelTimeout: 15000,     // NEW: Prevent "Failed to cancel request in 5000ms"
     },
     pool: {
-        max: 50,
-        min: 5,
+        max: 100, // Increased for concurrent dashboard users
+        min: 10,
         idleTimeoutMillis: 30000,
-        acquireTimeoutMillis: 60000 // Increased to prevent acquisition timeouts
+        acquireTimeoutMillis: 90000 // Higher buffer for high load
     }
 };
 

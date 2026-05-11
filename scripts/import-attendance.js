@@ -9,6 +9,7 @@ async function importAttendance() {
 
     const baseUrl = process.env.TEAM_OFFICE_BASE_URL;
     const authToken = process.env.TEAM_OFFICE_AUTH_TOKEN;
+    const EXCLUDED_EMPCODES = ['0088', '0099', '2025102', '20250'];
 
     if (!authToken || authToken === 'c3VwcG9ydDpzdXBwb3J0OnN1cHBvcnRAMTp0cnVl') {
         console.warn('⚠️ WARNING: You are using Demo Credentials (support@1). Data may not match your employees.');
@@ -39,7 +40,8 @@ async function importAttendance() {
 
             console.log(`\n📅 Processing Date: ${formattedDate} (${i === 0 ? 'Today' : i + ' days ago'})`);
 
-            const url = `${baseUrl}/DownloadInOutPunchData?Empcode=ALL&FromDate=${formattedDate}&ToDate=${formattedDate}`;
+            const company = process.env.TEAM_OFFICE_COMPANY || 'Navabharath Technologies';
+            const url = `${baseUrl}/DownloadInOutPunchData?Empcode=ALL&FromDate=${formattedDate}&ToDate=${formattedDate}&Company=${encodeURIComponent(company)}`;
 
             try {
                 const response = await fetch(url, { headers: { 'Authorization': `Basic ${authToken}` } });
@@ -51,32 +53,51 @@ async function importAttendance() {
                 let successCount = 0;
                 for (const log of logs) {
                     // --- DYNAMIC ID BRIDGE: AUTO-CORRECT 6-DIGIT EMPCODE (20250X -> 2025X) ---
-                    const autoCorrectId = (code) => {
-                        if (!code) return code;
-                        let strId = String(code).trim();
+                    const empId = parseInt(String(log.Empcode).trim());
+                    if (isNaN(empId) || EXCLUDED_EMPCODES.includes(String(log.Empcode).trim())) continue;
 
-                        // Handle 7-digit pattern (e.g. 2025110 -> 202510)
-                        if (strId.length === 7 && strId.substring(4, 5) === '1') {
-                            strId = strId.slice(0, 4) + strId.slice(5);
+                    // --- NEW: FETCH USER NAME FROM DB TO PREVENT COLLISIONS ---
+                    // This prevents "Mohan Kumar P" (ID 2025101 -> 20251) from overwriting "Anish V N" (ID 20251)
+                    let userMatch = null;
+                    try {
+                        const userRes = await pool.request()
+                            .input('id', sql.Int, empId)
+                            .query('SELECT name FROM users WHERE id = @id');
+                        if (userRes.recordset.length > 0) {
+                            userMatch = userRes.recordset[0];
                         }
+                    } catch (e) {
+                        console.error(`   ⚠️ Failed to verify user ${empId}:`, e.message);
+                    }
 
-                        // Handle 6-digit pattern (e.g. 202501 -> 20251)
-                        if (strId.length === 6 && strId.substring(4, 5) === '0') {
-                            strId = strId.slice(0, 4) + strId.slice(5);
+                    if (!userMatch) {
+                        console.warn(`   ⚠️ User not found in DB for Empcode: ${log.Empcode} (Mapped ID: ${empId})`);
+                        continue;
+                    }
+
+                    // Strict Name Check: If the API name and DB name are completely different, skip this record
+                    // (Ignore case, handle reversed names like "V N Anish" vs "Anish V N")
+                    const clean = (s) => (s || '').toLowerCase().replace(/[^a-z]/g, '');
+                    const apiName = clean(log.Name);
+                    const dbName = clean(userMatch.name);
+                    
+                    // Simple check: if one name doesn't contain a significant part of the other, warn/skip
+                    // But for now, we'll just log a warning and skip if they are totally different
+                    if (apiName && dbName && !apiName.includes(dbName) && !dbName.includes(apiName)) {
+                        // Special case: ignore if names are too short or empty
+                        if (apiName.length > 3 && dbName.length > 3) {
+                            console.warn(`   🛑 COLLISION DETECTED: API Name "${log.Name}" does not match DB Name "${userMatch.name}" for ID ${empId}. Skipping.`);
+                            continue;
                         }
-
-                        return parseInt(strId);
-                    };
-
-                    const empId = autoCorrectId(log.Empcode);
-                    if (isNaN(empId)) continue;
+                    }
 
                     // --- NEW: Calculate WorkTime manually from IN/OUT times ---
                     const calcWorkTime = (inT, outT) => {
-                        if (!inT || !outT || inT === '00:00' || outT === '00:00') return "00:00";
+                        if (!inT || !outT || inT === '00:00' || outT === '00:00' || inT === '--:--' || outT === '--:--') return "00:00";
                         try {
                             const [inH, inM] = inT.split(':').map(Number);
                             const [outH, outM] = outT.split(':').map(Number);
+                            if (isNaN(inH) || isNaN(inM) || isNaN(outH) || isNaN(outM)) return "00:00";
                             let diff = (outH * 60 + outM) - (inH * 60 + inM);
                             if (diff < 0) diff += 1440; // Handle shifts crossing midnight
                             return `${String(Math.floor(diff / 60)).padStart(2, '0')}:${String(diff % 60).padStart(2, '0')}`;
@@ -85,16 +106,36 @@ async function importAttendance() {
 
                     const manualWorkTime = calcWorkTime(log.INTime, log.OUTTime);
 
-                    // --- NEW RULE: WorkTime calculation ---
+                    // --- IMPROVED: Use Date from API if available ---
+                    const [d, m, y] = log.DateString.split('/');
+                    const punchDate = new Date(`${y}-${m}-${d}`);
+                    const dateKey = punchDate.toISOString().split('T')[0];
+
+                    // --- NEW RULE: Status calculation based on criteria ---
                     let finalStatus = log.Status;
-                    if (manualWorkTime && manualWorkTime.includes(':')) {
+                    
+                    const isMissing = (time) => !time || time === '--:--' || time === '00:00';
+                    const todayStr = new Date().toISOString().split('T')[0];
+                    const recordDateStr = punchDate.toISOString().split('T')[0];
+                    const isToday = recordDateStr === todayStr;
+
+                    if (!isMissing(log.INTime) && isMissing(log.OUTTime)) {
+                        // User has punched in but not out
+                        if (isToday) {
+                            finalStatus = 'In Office';
+                        } else {
+                            // If it was a past day and they never punched out, it's Absent
+                            finalStatus = 'A';
+                        }
+                    } else if (!isMissing(log.INTime) && !isMissing(log.OUTTime)) {
+                        // Both punches exist, calculate based on hours
                         try {
                             const [h, m] = manualWorkTime.split(':').map(n => parseInt(n, 10));
                             const totalHours = h + (m / 60);
 
                             if (totalHours >= 8) {
                                 finalStatus = 'P';
-                            } else if (totalHours > 5 && totalHours < 8) {
+                            } else if (totalHours >= 5 && totalHours < 8) {
                                 finalStatus = 'Half Day';
                             } else {
                                 finalStatus = 'A';
@@ -102,6 +143,9 @@ async function importAttendance() {
                         } catch (e) {
                             console.warn(`   ⚠️ Failed to parse WorkTime for Empcode ${log.Empcode}: ${manualWorkTime}`);
                         }
+                    } else {
+                        // No punches at all
+                        finalStatus = 'A';
                     }
 
                     // --- NEW: Mark Sundays as Week Off (WO) if not already Present ---
@@ -109,8 +153,7 @@ async function importAttendance() {
                         finalStatus = 'WO';
                     }
 
-                    // --- NEW: Check for Holidays ---
-                    const dateKey = syncDate.toISOString().split('T')[0];
+
                     let finalRemark = log.Remark;
                     if (holidayMap[dateKey]) {
                         if (!loggedDates.has(dateKey)) {
@@ -124,10 +167,10 @@ async function importAttendance() {
                     try {
                         const res = await pool.request()
                             .input('userId', sql.Int, empId)
-                            .input('punchDate', sql.Date, syncDate)
-                            .input('inTime', sql.NVarChar, log.INTime)
-                            .input('outTime', sql.NVarChar, log.OUTTime)
-                            .input('workTime', sql.NVarChar, manualWorkTime)
+                            .input('punchDate', sql.Date, punchDate)
+                            .input('inTime', sql.NVarChar, (log.INTime === '--:--' || log.INTime === '00:00') ? null : log.INTime)
+                            .input('outTime', sql.NVarChar, (log.OUTTime === '--:--' || log.OUTTime === '00:00') ? null : log.OUTTime)
+                            .input('workTime', sql.NVarChar, (manualWorkTime === '00:00') ? null : manualWorkTime)
                             .input('status', sql.NVarChar, finalStatus)
                             .input('remark', sql.NVarChar, finalRemark)
                             .query(`
@@ -145,8 +188,6 @@ async function importAttendance() {
                             `);
                         if (res.rowsAffected[0] > 0) {
                             successCount++;
-                        } else {
-                            console.warn(`   ⚠️ User not found in DB for Empcode: ${log.Empcode} (Mapped ID: ${empId})`);
                         }
                     } catch (e) {
                         console.error(`   ⚠️ Sync failed for Empcode ${log.Empcode} (ID: ${empId}):`, e.message);

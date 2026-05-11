@@ -16,6 +16,17 @@ const EMAILJS_CONFIG = {
   privateKey: process.env.EMAILJS_PRIVATE_KEY
 };
 
+// --- CRITICAL ERROR LOGGING --- //
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('\n🚨 [FATAL] UNHANDLED REJECTION:', reason);
+});
+process.on('uncaughtException', (err) => {
+    console.error('\n🚨 [FATAL] UNCAUGHT EXCEPTION:', err.message);
+    console.error(err.stack);
+    // Give logs time to flush before exiting
+    setTimeout(() => process.exit(1), 1000);
+});
+
 const app = express();
 app.get('/api/test-sync', (req, res) => res.send('Backend is Working!'));
 
@@ -178,7 +189,7 @@ const getPool = async () => {
  */
 const normalizeImage = (img) => {
   if (!img || typeof img !== 'string') return img;
-  
+
   const val = img.trim();
   if (!val || val === 'null' || val === 'undefined') return null;
 
@@ -191,7 +202,7 @@ const normalizeImage = (img) => {
   if (val.startsWith('iVBORw0KGgo')) return `data:image/png;base64,${val}`;
   if (val.startsWith('/9j/')) return `data:image/jpeg;base64,${val}`;
   if (val.startsWith('JVBERi0')) return `data:application/pdf;base64,${val}`;
-  
+
   // Legacy fix for specific PNG header truncation
   if (val.startsWith('GgoAAAANSUhEUg')) return `data:image/png;base64,iVBORw0KGgo${val}`;
 
@@ -358,11 +369,35 @@ const verifyToken = (req, res, next) => {
     return res.status(403).json({ error: 'No token provided' });
   }
 
-  jwt.verify(token, process.env.JWT_SECRET || 'fallback_secret_key', { clockTolerance: 300 }, (err, decoded) => {
+  jwt.verify(token, process.env.JWT_SECRET || 'fallback_secret_key', { clockTolerance: 300 }, async (err, decoded) => {
     if (err) {
       Log.auth('Invalid or Expired Token signature', 'Your session might have timed out. Try logging in again.');
       return res.status(401).json({ error: 'Failed to authenticate token' });
     }
+
+    // --- Logout From All Devices Check ---
+    try {
+      const pool = await getPool();
+      let table = 'users';
+      if (decoded.userType === 'new_joinee') table = 'new_joinees';
+      if (decoded.userType === 'intern') table = 'interns';
+
+      const result = await pool.request()
+        .input('id', sql.Int, decoded.id)
+        .query(`SELECT token_version FROM ${table} WHERE id = @id`);
+
+      if (result.recordset.length > 0) {
+        const currentVersion = result.recordset[0].token_version || 0;
+        // If token has a version and it's older than current DB version, reject it
+        if (decoded.token_version !== undefined && decoded.token_version < currentVersion) {
+          Log.auth(`Session invalidated for ${decoded.email}: Outdated token version`, 'User likely performed a Global Logout.');
+          return res.status(401).json({ error: 'Session expired due to password change. Please log in again.', globalLogout: true });
+        }
+      }
+    } catch (dbErr) {
+      console.error('[VERIFY TOKEN DB SYNC ERROR]:', dbErr.message);
+    }
+
     req.user = decoded;
     next();
   });
@@ -706,7 +741,7 @@ app.post('/api/login', async (req, res) => {
     // Find user by email â€” only select needed fields
     let userResult = await pool.request()
       .input('email', sql.NVarChar, email)
-      .query('SELECT id, name, email, password, role, phone_number, profile_picture, about_me, team, joining_date FROM users WHERE email = @email');
+      .query('SELECT id, name, email, password, role, phone_number, profile_picture, about_me, team, joining_date, token_version FROM users WHERE email = @email');
 
     let user;
     let userType = 'employee';
@@ -715,13 +750,13 @@ app.post('/api/login', async (req, res) => {
       // 2C. FALLBACK: Check New Joinees table
       const joineeResult = await pool.request()
         .input('email', sql.NVarChar, email)
-        .query('SELECT id, name, email_id, password, role, joining_date, course_completion, is_blocked, block_reason FROM new_joinees WHERE email_id = @email');
+        .query('SELECT id, name, email_id, password, role, joining_date, course_completion, is_blocked, block_reason, token_version FROM new_joinees WHERE email_id = @email');
 
       if (joineeResult.recordset.length === 0) {
         // 3D. FALLBACK: Check Interns table
         const internResult = await pool.request()
           .input('email', sql.NVarChar, email)
-          .query('SELECT id, name, email, password, role FROM interns WHERE email = @email');
+          .query('SELECT id, name, email, password, role, token_version FROM interns WHERE email = @email');
 
         if (internResult.recordset.length === 0) {
           return res.status(401).json({ error: 'Invalid email or password' });
@@ -752,8 +787,8 @@ app.post('/api/login', async (req, res) => {
             user.is_blocked = 1;
             user.block_reason = 'Course not completed within 10 days of joining.';
           }
-          return res.status(403).json({ 
-            error: 'Account Blocked', 
+          return res.status(403).json({
+            error: 'Account Blocked',
             message: user.block_reason || 'Your account has been blocked. Please contact your Manager or HR to unblock.',
             is_blocked: true
           });
@@ -783,7 +818,8 @@ app.post('/api/login', async (req, res) => {
         role: user.role,
         name: user.name,
         employee_id: user.id,
-        userType: userType
+        userType: userType,
+        token_version: user.token_version || 0
       },
       process.env.JWT_SECRET || 'fallback_secret_key',
       { expiresIn: '365d' } // Extended session timeout for seamless work experience
@@ -828,7 +864,7 @@ app.post('/api/new-joinee/login', async (req, res) => {
     // Use email_id as the primary lookup for joinees
     const joineeResult = await pool.request()
       .input('email', sql.NVarChar, email)
-      .query('SELECT id, name, email_id, password, role, joining_date, course_completion, is_blocked, block_reason FROM new_joinees WHERE email_id = @email');
+      .query('SELECT id, name, email_id, password, role, joining_date, course_completion, is_blocked, block_reason, token_version FROM new_joinees WHERE email_id = @email');
 
     if (joineeResult.recordset.length === 0) {
       return res.status(401).json({ error: 'Invalid email or password' });
@@ -849,7 +885,8 @@ app.post('/api/new-joinee/login', async (req, res) => {
         email: joinee.email_id,
         role: 'new_joinee',
         name: joinee.name,
-        userType: 'new_joinee'
+        userType: 'new_joinee',
+        token_version: joinee.token_version || 0
       },
       process.env.JWT_SECRET || 'fallback_secret_key',
       { expiresIn: '365d' } // Extended session timeout for seamless work experience
@@ -870,8 +907,8 @@ app.post('/api/new-joinee/login', async (req, res) => {
         joinee.is_blocked = 1;
         joinee.block_reason = 'Course not completed within 10 days of joining.';
       }
-      return res.status(403).json({ 
-        error: 'Account Blocked', 
+      return res.status(403).json({
+        error: 'Account Blocked',
         message: joinee.block_reason || 'Your account has been blocked. Please contact your Manager or HR to unblock.',
         is_blocked: true
       });
@@ -963,19 +1000,19 @@ app.post('/api/password/reset-with-otp', async (req, res) => {
 
   try {
     const pool = await getPool();
-    const userRes = await pool.request().input('email', sql.NVarChar, email).query('SELECT id FROM users WHERE email = @email');
+    const userRes = await pool.request().input('email', sql.NVarChar, email).query('SELECT id, token_version FROM users WHERE email = @email');
 
     if (userRes.recordset.length > 0) {
       const hashedValue = await bcrypt.hash(newPassword, 10);
       await pool.request()
         .input('pass', sql.NVarChar, hashedValue)
         .input('email', sql.NVarChar, email)
-        .query('UPDATE users SET password = @pass WHERE email = @email');
+        .query('UPDATE users SET password = @pass, token_version = ISNULL(token_version, 0) + 1 WHERE email = @email');
     } else {
       await pool.request()
         .input('pass', sql.NVarChar, newPassword)
         .input('email', sql.NVarChar, email)
-        .query('UPDATE new_joinees SET password = @pass WHERE email_id = @email');
+        .query('UPDATE new_joinees SET password = @pass, token_version = ISNULL(token_version, 0) + 1 WHERE email_id = @email');
     }
 
     otps.delete(email);
@@ -991,43 +1028,49 @@ app.post('/api/password/reset-with-otp', async (req, res) => {
  * 2.F Change Password with Old Password (Authenticated)
  */
 app.post(['/api/password/change-password', '/api/profile/update-password'], verifyToken, async (req, res) => {
-  const { oldPassword, newPassword } = req.body;
-  const email = req.user.email;
-  const userType = req.user.userType;
+    const { oldPassword, newPassword, logoutAllDevices } = req.body;
+    const email = req.user.email;
+    const userType = req.user.userType;
 
-  if (!oldPassword || !newPassword) return res.status(400).json({ error: 'Old and new passwords required' });
+    if (!oldPassword || !newPassword) return res.status(400).json({ error: 'Old and new passwords required' });
 
-  try {
-    const pool = await getPool();
-    const table = userType === 'new_joinee' ? 'new_joinees' : 'users';
-    const emailCol = userType === 'new_joinee' ? 'email_id' : 'email';
+    try {
+        const pool = await getPool();
+        const table = userType === 'new_joinee' ? 'new_joinees' : 'users';
+        const emailCol = userType === 'new_joinee' ? 'email_id' : 'email';
 
-    const result = await pool.request()
-      .input('email', sql.NVarChar, email)
-      .query(`SELECT password FROM ${table} WHERE ${emailCol} = @email`);
+        const result = await pool.request()
+            .input('email', sql.NVarChar, email)
+            .query(`SELECT password, token_version FROM ${table} WHERE ${emailCol} = @email`);
 
-    if (result.recordset.length === 0) return res.status(404).json({ error: 'User not found' });
+        if (result.recordset.length === 0) return res.status(404).json({ error: 'User not found' });
 
-    const currentPass = result.recordset[0].password;
-    let isMatch = false;
+        const currentPass = result.recordset[0].password;
+        let isMatch = false;
 
-    if (userType === 'new_joinee') {
-      isMatch = (oldPassword === currentPass);
-    } else {
-      isMatch = await bcrypt.compare(oldPassword, currentPass);
-    }
+        if (userType === 'new_joinee') {
+            isMatch = (oldPassword === currentPass);
+        } else {
+            isMatch = await bcrypt.compare(oldPassword, currentPass);
+        }
 
-    if (!isMatch) return res.status(401).json({ error: 'Incorrect old password' });
+        if (!isMatch) return res.status(401).json({ error: 'Incorrect old password' });
 
-    const finalValue = userType === 'new_joinee' ? newPassword : await bcrypt.hash(newPassword, 10);
+        const finalValue = userType === 'new_joinee' ? newPassword : await bcrypt.hash(newPassword, 10);
 
-    await pool.request()
-      .input('pass', sql.NVarChar, finalValue)
-      .input('email', sql.NVarChar, email)
-      .query(`UPDATE ${table} SET password = @pass WHERE ${emailCol} = @email`);
+        let query = `UPDATE ${table} SET password = @pass`;
+        if (logoutAllDevices === true || logoutAllDevices === 'true') {
+            query += `, token_version = ISNULL(token_version, 0) + 1`;
+        }
+        query += ` WHERE ${emailCol} = @email`;
 
-    Log.success('Auth', `Password changed by user for ${email}`);
-    res.json({ success: true, message: 'Password changed successfully' });
+        await pool.request()
+            .input('pass', sql.NVarChar, finalValue)
+            .input('email', sql.NVarChar, email)
+            .query(query);
+
+        Log.success('Auth', `Password changed by user for ${email}${logoutAllDevices ? ' (Global Logout triggered)' : ''}`);
+        res.json({ success: true, message: 'Password changed successfully', logoutAll: logoutAllDevices });
   } catch (err) {
     console.error('[CHANGE PASSWORD ERROR]:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -2466,16 +2509,98 @@ app.get(['/api/attendance', '/api/attendance ', '/api/attendance%20'], verifyTok
     const data = await response.json();
     const apiLog = (data.InOutPunchData && data.InOutPunchData.length > 0) ? data.InOutPunchData[0] : null;
 
+    // --- NEW: Name matching safety check ---
+    if (apiLog && apiLog.Name) {
+        const clean = (s) => (s || '').toLowerCase().replace(/[^a-z]/g, '');
+        const apiName = clean(apiLog.Name);
+        const dbName = clean(userResult.recordset[0].name);
+        
+        if (apiName && dbName && !apiName.includes(dbName) && !dbName.includes(apiName)) {
+            if (apiName.length > 3 && dbName.length > 3) {
+                console.warn(`[ATTENDANCE COLLISION] API Name "${apiLog.Name}" does not match DB Name "${userResult.recordset[0].name}" for User ID ${userId}`);
+                // Skip processing if names are clearly different to avoid saving wrong data
+                return res.json({
+                    success: false,
+                    error: 'Biometric record name mismatch.',
+                    message: 'The attendance record found does not match your profile name.'
+                });
+            }
+        }
+    }
+
     // --- NEW: PERSISTENT CACHING (UPSERT) --- //
     if (apiLog) {
+      // Calculate WorkTime manually to ensure consistency and handle biometric API glitches (--:--)
+      const calcWorkTime = (inT, outT) => {
+        if (!inT || !outT || inT === '00:00' || outT === '00:00' || inT === '--:--' || outT === '--:--') return "00:00";
+        try {
+          const [inH, inM] = inT.split(':').map(Number);
+          const [outH, outM] = outT.split(':').map(Number);
+          if (isNaN(inH) || isNaN(inM) || isNaN(outH) || isNaN(outM)) return "00:00";
+          let diff = (outH * 60 + outM) - (inH * 60 + inM);
+          if (diff < 0) diff += 1440; // Handle shifts crossing midnight
+          return `${String(Math.floor(diff / 60)).padStart(2, '0')}:${String(diff % 60).padStart(2, '0')}`;
+        } catch { return "00:00"; }
+      };
+
+      const manualWorkTime = calcWorkTime(apiLog.INTime, apiLog.OUTTime);
+
+      // --- NEW RULE: Status calculation based on criteria ---
+      let finalStatus = apiLog.Status;
+      
+      const isMissing = (time) => !time || time === '--:--' || time === '00:00';
+      const todayStr = new Date(new Date().getTime() + (330 * 60 * 1000)).toISOString().split('T')[0];
+      const recordDateStr = istTime.toISOString().split('T')[0];
+      const isToday = recordDateStr === todayStr;
+
+      if (!isMissing(apiLog.INTime) && isMissing(apiLog.OUTTime)) {
+          if (isToday) {
+              finalStatus = 'In Office';
+          } else {
+              finalStatus = 'A';
+          }
+      } else if (!isMissing(apiLog.INTime) && !isMissing(apiLog.OUTTime)) {
+          if (manualWorkTime && manualWorkTime.includes(':')) {
+              try {
+                  const [h, m] = manualWorkTime.split(':').map(Number);
+                  const totalHours = h + (m / 60);
+                  if (totalHours >= 8) {
+                      finalStatus = 'P';
+                  } else if (totalHours >= 5 && totalHours < 8) {
+                      finalStatus = 'Half Day';
+                  } else {
+                      finalStatus = 'A';
+                  }
+              } catch { }
+          }
+      } else {
+          finalStatus = 'A';
+      }
+
+      // --- Check for Holidays (Fetch from holidays table) ---
+      const dateKey = istTime.toISOString().split('T')[0];
+      const holidayCheck = await pool.request()
+        .input('dKey', sql.Date, istTime)
+        .query('SELECT holiday_name FROM holidays WHERE holiday_date = @dKey');
+
+      let finalRemark = apiLog.Remark;
+      if (holidayCheck.recordset.length > 0) {
+        finalStatus = 'H';
+        finalRemark = holidayCheck.recordset[0].holiday_name;
+      } else if (istTime.getDay() === 0 && finalStatus === 'A') {
+        // Week off logic
+        finalStatus = 'WO';
+        finalRemark = 'Week Off';
+      }
+
       await pool.request()
         .input('userId', sql.Int, userId)
-        .input('punchDate', sql.Date, istTime) // Date object is fine for DATE column
+        .input('punchDate', sql.Date, istTime)
         .input('inTime', sql.NVarChar, apiLog.INTime)
         .input('outTime', sql.NVarChar, apiLog.OUTTime)
-        .input('workTime', sql.NVarChar, apiLog.WorkTime)
-        .input('status', sql.NVarChar, apiLog.Status)
-        .input('remark', sql.NVarChar, apiLog.Remark)
+        .input('workTime', sql.NVarChar, manualWorkTime)
+        .input('status', sql.NVarChar, finalStatus)
+        .input('remark', sql.NVarChar, finalRemark)
         .query(`
                     MERGE INTO attendance_logs WITH (HOLDLOCK) AS target
                     USING (SELECT @userId AS user_id, @punchDate AS punch_date) AS source
@@ -2488,18 +2613,19 @@ app.get(['/api/attendance', '/api/attendance ', '/api/attendance%20'], verifyTok
                 `);
     }
 
-    res.json({
-      success: true,
-      date: formattedDate,
-      empCode: empCode,
-      attendance: apiLog ? {
-        inTime: apiLog.INTime,
-        outTime: apiLog.OUTTime,
-        workTime: apiLog.WorkTime,
-        status: apiLog.Status,
-        remark: apiLog.Remark
-      } : null
-    });
+      const cleanTime = (t) => (!t || t === '--:--' || t === '00:00' || String(t).trim() === '') ? null : t;
+      res.json({
+        success: true,
+        date: formattedDate,
+        empCode: empCode,
+        attendance: apiLog ? {
+          inTime: cleanTime(apiLog.INTime),
+          outTime: cleanTime(apiLog.OUTTime),
+          workTime: cleanTime(manualWorkTime),
+          status: finalStatus,
+          remark: finalRemark
+        } : null
+      });
 
   } catch (err) {
     console.error('[ATTENDANCE ERROR]:', err);
@@ -2516,10 +2642,18 @@ app.get(['/api/attendance', '/api/attendance ', '/api/attendance%20'], verifyTok
         .query('SELECT in_time as inTime, out_time as outTime, work_time as workTime, status, remark FROM attendance_logs WHERE user_id = @userId AND punch_date = @punchDate');
 
       if (cachedRes.recordset.length > 0) {
+        const cachedLog = cachedRes.recordset[0];
+        const cleanTime = (t) => (!t || t === '--:--' || t === '00:00' || String(t).trim() === '') ? null : t;
         return res.json({
           success: true,
           cached: true,
-          attendance: cachedRes.recordset[0]
+          attendance: {
+            inTime: cleanTime(cachedLog.inTime),
+            outTime: cleanTime(cachedLog.outTime),
+            workTime: cleanTime(cachedLog.workTime),
+            status: cachedLog.status,
+            remark: cachedLog.remark
+          }
         });
       }
     } catch (dbErr) {
@@ -2530,22 +2664,42 @@ app.get(['/api/attendance', '/api/attendance ', '/api/attendance%20'], verifyTok
   }
 });
 
+// --- HIGH PERFORMANCE METADATA CACHING --- //
+let usersMapCache = new Map();
+let lastUsersCacheUpdate = 0;
+
+async function getUsersMap() {
+    const now = Date.now();
+    if (usersMapCache.size > 0 && (now - lastUsersCacheUpdate < 300000)) return usersMapCache;
+    try {
+        const pool = await getPool();
+        const result = await pool.request().query('SELECT id, name, team, joining_date FROM users WITH (NOLOCK)');
+        const newMap = new Map();
+        result.recordset.forEach(u => newMap.set(u.id, u));
+        usersMapCache = newMap;
+        lastUsersCacheUpdate = now;
+        return usersMapCache;
+    } catch (err) { return usersMapCache; }
+}
+
 // 1b. Get raw historical database backup logs for all synced attendance entries
 app.get(['/api/attendance_logs', '/api/attendance logs', '/api/attendance%20logs'], verifyToken, async (req, res) => {
   const { startDate, endDate, team, status, page = 1, limit = 50 } = req.query;
   const userId = sanitizeNumericId(req.query.userId);
-  const offset = (parseInt(page) - 1) * parseInt(limit);
+  const safeLimit = Math.min(parseInt(limit) || 50, 100); 
+  const offset = (parseInt(page) - 1) * safeLimit;
 
   try {
     const pool = await getPool();
+    const usersMap = await getUsersMap();
+
+    // OPTIMIZED: Query ONLY the attendance_logs table (No JOIN) for maximum speed
     let queryStr = `
       SELECT 
-        a.id, a.user_id, u.name as user_name, u.team as user_team, a.punch_date, 
-        a.in_time, a.out_time, a.work_time, a.status, a.remark, a.last_sync,
+        a.id, a.user_id, a.punch_date, a.in_time, a.out_time, a.work_time, a.status, a.remark, a.last_sync,
         COUNT(*) OVER() as totalCount
-      FROM attendance_logs a WITH (NOLOCK)
-      INNER JOIN users u WITH (NOLOCK) ON a.user_id = u.id
-      WHERE (u.joining_date IS NULL OR a.punch_date >= u.joining_date)
+      FROM attendance_logs a WITH (NOLOCK, INDEX(IDX_ATTENDANCE_USER_DATE))
+      WHERE a.user_id <> 20250 -- Exclude CEO/Dinesh
     `;
 
     const request = pool.request();
@@ -2559,8 +2713,13 @@ app.get(['/api/attendance_logs', '/api/attendance logs', '/api/attendance%20logs
       request.input('endDate', sql.Date, endDate);
     }
     if (team) {
-      queryStr += ` AND u.team = @team`;
-      request.input('team', sql.NVarChar, team);
+      // Find user IDs belonging to this team to keep the query on the indexed column
+      const teamUserIds = Array.from(usersMap.values()).filter(u => u.team === team).map(u => u.id);
+      if (teamUserIds.length > 0) {
+        queryStr += ` AND a.user_id IN (${teamUserIds.join(',')})`;
+      } else {
+        queryStr += ` AND a.user_id = -1`; // Empty result
+      }
     }
     if (status) {
       queryStr += ` AND a.status = @status`;
@@ -2580,39 +2739,50 @@ app.get(['/api/attendance_logs', '/api/attendance logs', '/api/attendance%20logs
       request.input('queryUserId', sql.Int, userId);
     }
 
-    queryStr += ` ORDER BY a.punch_date DESC, u.name ASC`;
+    queryStr += ` ORDER BY a.punch_date DESC`;
     queryStr += ` OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY`;
 
     request.input('offset', sql.Int, offset);
-    request.input('limit', sql.Int, parseInt(limit));
+    request.input('limit', sql.Int, safeLimit);
 
     const result = await request.query(queryStr);
 
     const totalRecords = result.recordset.length > 0 ? result.recordset[0].totalCount : 0;
 
-    // Map backend snake_case simultaneously to Team Office capitalized formats
-    const mappedData = result.recordset.map(log => ({
-      // Modern Backend Syntax exactly matching my provided React snippet
-      id: log.id,
-      user_id: log.user_id,
-      user_name: log.user_name,
-      punch_date: log.punch_date,
-      in_time: log.in_time,
-      out_time: log.out_time,
-      work_time: log.work_time,
-      status: log.status,
-      remark: log.remark,
+    const cleanTime = (t) => (!t || t === '--:--' || t === '00:00' || String(t).trim() === '') ? null : t;
+    const mappedData = result.recordset.map(log => {
+      const u = usersMap.get(log.user_id) || { name: 'Unknown', team: 'N/A' };
+      
+      // Joining Date Filter (JS Level for speed)
+      if (u.joining_date && new Date(log.punch_date) < new Date(u.joining_date)) return null;
 
-      // Legacy TeamOffice Syntax for backward compatibility
-      Empcode: log.user_id ? log.user_id.toString() : '',
-      Name: log.user_name,
-      PunchDate: log.punch_date,
-      INTime: log.in_time || '--:--',
-      OUTTime: log.out_time || '--:--',
-      WorkTime: log.work_time || '--:--',
-      Status: log.status || 'A',
-      Remark: log.remark || '--'
-    }));
+      const inT = cleanTime(log.in_time);
+      const outT = cleanTime(log.out_time);
+      const workT = cleanTime(log.work_time);
+      const empCodeStr = log.user_id ? log.user_id.toString() : '';
+      
+      return {
+        id: log.id,
+        user_id: log.user_id,
+        user_name: u.name,
+        user_team: u.team,
+        punch_date: log.punch_date,
+        in_time: inT,
+        out_time: outT,
+        work_time: workT,
+        status: log.status,
+        remark: log.remark,
+        // Legacy Support
+        Empcode: empCodeStr,
+        Name: u.name,
+        PunchDate: log.punch_date,
+        INTime: inT,
+        OUTTime: outT,
+        WorkTime: workT,
+        Status: log.status || 'A',
+        Remark: log.remark || '--'
+      };
+    }).filter(x => x !== null);
 
     // Wrap dynamically for UI success mapping
     res.json({
@@ -2731,11 +2901,21 @@ app.post('/api/attendance_logs/punch', verifyToken, async (req, res) => {
         const [outH, outM] = currentTimeString.split(':').map(Number);
 
         let diffMins = (outH * 60 + outM) - (inH * 60 + inM);
-        if (diffMins < 0) diffMins = 0; // Safety guard
+        if (diffMins < 0) diffMins += 1440; // Handle overnight shifts if applicable
 
         const workH = Math.floor(diffMins / 60);
         const workM = diffMins % 60;
         workTimeStr = `${String(workH).padStart(2, '0')}:${String(workM).padStart(2, '0')}`;
+
+        // --- NEW: Calculate Status based on Work Time ---
+        const totalHours = workH + (workM / 60);
+        if (totalHours >= 8) {
+          status = 'P';
+        } else if (totalHours >= 5) {
+          status = 'Half Day';
+        } else {
+          status = 'A';
+        }
       }
 
       await pool.request()
@@ -2743,15 +2923,16 @@ app.post('/api/attendance_logs/punch', verifyToken, async (req, res) => {
         .input('punchDate', require('mssql').Date, punchDateString)
         .input('outTime', require('mssql').NVarChar, currentTimeString)
         .input('workTime', require('mssql').NVarChar, workTimeStr)
+        .input('status', require('mssql').NVarChar, status) // Include status update
         .input('remark', require('mssql').NVarChar, remark)
         .input('location', require('mssql').NVarChar, location)
         .query(`
           UPDATE attendance_logs 
-          SET out_time = @outTime, work_time = @workTime, remark = @remark, last_sync = GETDATE(), punchout_location = @location
+          SET out_time = @outTime, work_time = @workTime, status = @status, remark = @remark, last_sync = GETDATE(), punchout_location = @location
           WHERE user_id = @userId AND punch_date = @punchDate
         `);
 
-      return res.json({ success: true, action: 'PUNCH_OUT', time: currentTimeString, workTime: workTimeStr, message: 'Punched Out successfully via Web Application.' });
+      return res.json({ success: true, action: 'PUNCH_OUT', time: currentTimeString, workTime: workTimeStr, status: status, message: 'Punched Out successfully via Web Application.' });
     }
   } catch (err) {
     console.error('[MANUAL PUNCH ERROR]:', err.message);
@@ -2800,12 +2981,18 @@ app.get('/api/manager/attendance', verifyToken, async (req, res) => {
       importAttendance().catch(err => console.error('[BG SYNC ERROR]:', err.message));
     }
 
+    const cleanTime = (t) => (!t || t === '--:--' || t === '00:00' || String(t).trim() === '') ? null : t;
     res.json({
       success: true,
       cached: true,
       date: istDateOnly,
       count: result.recordset.length,
-      data: result.recordset
+      data: result.recordset.map(log => ({
+        ...log,
+        INTime: cleanTime(log.INTime),
+        OUTTime: cleanTime(log.OUTTime),
+        WorkTime: cleanTime(log.WorkTime)
+      }))
     });
 
   } catch (err) {
@@ -3269,7 +3456,7 @@ app.post('/api/admin/holidays', verifyToken, async (req, res) => {
       .input('class', sql.NVarChar, classification || 'All Shifts')
       .input('desc', sql.NVarChar, description || 'Holiday')
       .query('INSERT INTO holidays (name, holiday_date, classification, description) VALUES (@name, @date, @class, @desc)');
-    
+
     holidaysCache = null; // Invalidate cache
     res.json({ success: true, message: 'Holiday added successfully!' });
   } catch (err) {
@@ -3299,7 +3486,7 @@ app.put('/api/admin/holidays/:id', verifyToken, async (req, res) => {
       .input('class', sql.NVarChar, classification)
       .input('desc', sql.NVarChar, description)
       .query('UPDATE holidays SET name = @name, holiday_date = @date, classification = @class, description = @desc WHERE id = @id');
-    
+
     holidaysCache = null; // Invalidate cache
     res.json({ success: true, message: 'Holiday updated successfully!' });
   } catch (err) {
@@ -3322,7 +3509,7 @@ app.delete('/api/admin/holidays/:id', verifyToken, async (req, res) => {
     await pool.request()
       .input('id', sql.Int, id)
       .query('DELETE FROM holidays WHERE id = @id');
-    
+
     holidaysCache = null; // Invalidate cache
     res.json({ success: true, message: 'Holiday deleted successfully!' });
   } catch (err) {
@@ -3383,7 +3570,7 @@ const fetchBirthdaysAsJSON = async (req, res) => {
     const currentYear = new Date().getFullYear();
     const result = await pool.request().query(`
       WITH UserBirthdays AS (
-        SELECT id, name, role, team, profile_picture, date_of_birth,
+        SELECT id, name, role, team, date_of_birth,
                TRY_CONVERT(DATE, 
                  CASE 
                    WHEN date_of_birth LIKE '%/%/%' THEN date_of_birth 
@@ -3419,7 +3606,7 @@ const fetchBirthdaysAsJSON = async (req, res) => {
     today.setHours(0, 0, 0, 0);
 
     const birthdayList = result.recordset.map(row => {
-      const pfp = normalizeImage(row.profile_picture);
+      const pfp = `/api/users/${row.id}/photo`;
       const isToday = row.daysUntil === 0;
 
       return {
@@ -3471,7 +3658,7 @@ app.put('/api/admin/birthdays/:userId', verifyToken, async (req, res) => {
       .input('id', sql.Int, userId)
       .input('dob', sql.NVarChar, date_of_birth)
       .query('UPDATE users SET date_of_birth = @dob WHERE id = @id');
-    
+
     // Sync to employee_profiles
     await pool.request()
       .input('id', sql.Int, userId)
@@ -3493,16 +3680,22 @@ app.put('/api/admin/birthdays/:userId', verifyToken, async (req, res) => {
 // --- DASHBOARD ANALYTICS ROUTES --- //
 
 // 10. Get All Users (for Metrics)
+// --- CACHED DASHBOARD ANALYTICS --- //
+let allUsersCache = null;
+let lastAllUsersCacheUpdate = 0;
+
 app.get('/api/users', async (req, res) => {
+  const now = Date.now();
+  if (allUsersCache && (now - lastAllUsersCacheUpdate < 300000)) return res.json(allUsersCache);
+
   try {
     let pool = await getPool();
-    if (!pool || typeof pool.request !== 'function') {
-      return res.status(503).json({ error: 'Database is currently offline' });
-    }
     const result = await pool.request().query('SELECT id, name, email, role, team, joining_date FROM users WITH (NOLOCK)');
-    res.json(result.recordset);
+    allUsersCache = result.recordset;
+    lastAllUsersCacheUpdate = now;
+    res.json(allUsersCache);
   } catch (err) {
-    console.error('All users fetch error:', err);
+    if (allUsersCache) return res.json(allUsersCache);
     res.status(500).json({ error: 'Failed to fetch users' });
   }
 });
@@ -4138,7 +4331,8 @@ app.get('/api/threads', async (req, res) => {
 
   const viewerId = sanitizeNumericId(req.query.userId || req.query.user_id || req.query.viewerId || tokenViewerId);
   const page = parseInt(req.query.page) || 1;
-  const limit = parseInt(req.query.limit) || 10;
+  const requestedLimit = parseInt(req.query.limit) || 10;
+  const limit = Math.min(requestedLimit, 50); // DEFENSIVE: Hard cap to prevent pool exhaustion
   const offset = (page - 1) * limit;
 
   try {
@@ -4149,11 +4343,12 @@ app.get('/api/threads', async (req, res) => {
 
     let query = `
       WITH PagedThreads AS (
-        SELECT t.id, t.user_id, t.employee_name, t.role, t.tagline, t.content, t.media_url, t.media_type, t.created_at,
+        SELECT t.id, t.user_id, t.employee_name, t.role, t.tagline, t.content, t.media_type, t.created_at,
                t.likes_count as likes, t.heart_count as heartCount, t.thumbsup_count as thumbsupCount, 
                t.shocked_count as shockedCount, t.laugh_count as laughCount, t.fire_count as fireCount, 
                t.clap_count as clapCount, t.cake_count as cakeCount, t.comments_count as comments,
-               u.name as uName, u.role as uRole
+               u.name as uName, u.role as uRole,
+               CASE WHEN t.media_url IS NOT NULL AND t.media_url <> '' THEN 1 ELSE 0 END as hasMedia
         FROM threads t WITH (NOLOCK)
         JOIN users u WITH (NOLOCK) ON t.user_id = u.id
         ORDER BY t.created_at DESC
@@ -4211,10 +4406,10 @@ app.get('/api/threads', async (req, res) => {
         id: row.id,
         userId: row.user_id,
         content: row.content,
-        // Lazy load Thread Media URL instead of 3MB base64 blob
-        media_url: row.media_url ? `/api/threads/${row.id}/media` : null,
+        // Lazy load Thread Media URL instead of fetching 3MB base64 blob in list
+        media_url: row.hasMedia ? `/api/threads/${row.id}/media` : null,
         media_type: row.media_type,
-        media: row.media_url ? { url: `/api/threads/${row.id}/media`, type: row.media_type } : null,
+        media: row.hasMedia ? { url: `/api/threads/${row.id}/media`, type: row.media_type } : null,
         timestamp: row.created_at,
         createdAt: row.created_at,
         time: row.created_at,
@@ -5205,7 +5400,7 @@ app.get(['/api/notifications', '/api/notifications/:userId'], async (req, res) =
     const pool = await getPool();
     const result = await pool.request()
       .input('uid', sql.Int, userId)
-      .query('SELECT * FROM notifications WITH (NOLOCK) WHERE target_user_id = @uid ORDER BY created_at DESC');
+      .query('SELECT TOP 100 * FROM notifications WITH (NOLOCK) WHERE target_user_id = @uid ORDER BY created_at DESC');
     res.json(result.recordset);
   } catch (err) {
     console.error('[NOTIFICATIONS FETCH ERROR]', err);
@@ -6614,7 +6809,8 @@ const masterLeaveListHandler = async (req, res) => {
     limit = 10
   } = req.query;
 
-  const offset = (Math.max(1, parseInt(page)) - 1) * parseInt(limit);
+  const safeLimit = Math.min(parseInt(limit) || 10, 50); 
+  const offset = (Math.max(1, parseInt(page)) - 1) * safeLimit;
 
   try {
     const pool = await getPool();
@@ -6629,7 +6825,10 @@ const masterLeaveListHandler = async (req, res) => {
     }
 
     let queryStr = `
-      SELECT l.*, u.name as employeeName, u.role as employeeRole, u.team as employeeTeam,
+      SELECT l.id, l.user_id, l.leave_type, l.start_date, l.end_date, l.reason, l.created_at,
+             l.rm_status, l.pm_status, l.hr_status, l.rm_remarks, l.pm_remarks, l.hr_remarks,
+             l.is_half_day, l.half_day_slot,
+             u.name as employeeName, u.role as employeeRole, u.team as employeeTeam,
       CASE 
         WHEN l.rm_status = 'Rejected' OR l.pm_status = 'Rejected' OR l.hr_status = 'Rejected' THEN 'Rejected'
         WHEN l.hr_status = 'Approved' THEN 'Approved'
@@ -6690,7 +6889,7 @@ const masterLeaveListHandler = async (req, res) => {
     // --- ORDERING & PAGINATION ---
     queryStr += ` ORDER BY l.created_at DESC OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY`;
     request.input('offset', sql.Int, offset);
-    request.input('limit', sql.Int, parseInt(limit));
+    request.input('limit', sql.Int, safeLimit);
 
     const result = await request.query(queryStr);
 
@@ -6702,7 +6901,7 @@ const masterLeaveListHandler = async (req, res) => {
       pagination: {
         total: totalCount,
         page: parseInt(page),
-        limit: parseInt(limit),
+        limit: safeLimit,
         pages: Math.ceil(totalCount / parseInt(limit))
       }
     });
@@ -7554,13 +7753,13 @@ cron.schedule('5 0 * * *', async () => {
   try {
     const pool = await getPool();
     const joineesResult = await pool.request().query('SELECT id FROM new_joinees WITH (NOLOCK) WHERE is_blocked = 0');
-    
+
     let blockedCount = 0;
     for (const joinee of joineesResult.recordset) {
       const status = await auditJoineeCompliance(joinee.id);
       if (status.blocked) blockedCount++;
     }
-    
+
     console.log(`[SCHEDULED TASK] Compliance audit completed. ${blockedCount} joinees blocked.`);
   } catch (err) {
     console.error('[SCHEDULED ERROR] Compliance Audit Failed:', err.message);
@@ -10129,6 +10328,248 @@ app.delete('/api/assets/:id', verifyToken, async (req, res) => {
   }
 });
 
+
+// --- RESIGNATIONS MANAGEMENT --- //
+
+// GET: List resignations with role-based filtering
+app.get('/api/resignations', verifyToken, async (req, res) => {
+  const employeeId = sanitizeNumericId(req.query.employee_id);
+  const managerId = sanitizeNumericId(req.query.manager_id);
+  const { status } = req.query;
+
+  const role = (req.user.role || '').toLowerCase();
+  const isAdmin = role.includes('hr') || role.includes('admin') || role.includes('human resource') || role.includes('ceo');
+  const isManager = role.includes('manager') || role.includes('lead');
+
+  try {
+    const pool = await getPool();
+    // Using LEFT JOIN + COALESCE to ensure data shows up even if user record is partially synced
+    let query = `
+      SELECT r.*, 
+             ISNULL(u.name, 'Employee #' + CAST(r.employee_id AS NVARCHAR)) as employee_name, 
+             ISNULL(u.team, 'N/A') as employee_team 
+      FROM resignations r
+      LEFT JOIN users u ON r.employee_id = u.id
+      WHERE 1=1
+    `;
+    const request = pool.request();
+
+    // --- Role-Based Security Filter ---
+    if (!isAdmin) {
+        if (isManager) {
+            // Managers/Leads: See their direct team members OR their own resignation
+            query += ' AND (u.reporting_manager_id = @currentUserId OR r.employee_id = @currentUserId)';
+            request.input('currentUserId', sql.Int, req.user.id);
+        } else {
+            // Regular Employees: See only their own resignation
+            query += ' AND r.employee_id = @currentUserId';
+            request.input('currentUserId', sql.Int, req.user.id);
+        }
+    } else {
+        // Admin/HR: Full access, but respect filters if provided by frontend
+        if (employeeId) {
+            query += ' AND r.employee_id = @employeeId';
+            request.input('employeeId', sql.Int, employeeId);
+        }
+        if (managerId) {
+            query += ' AND u.reporting_manager_id = @managerId';
+            request.input('managerId', sql.Int, managerId);
+        }
+    }
+
+    if (status) {
+      query += ' AND r.status = @status';
+      request.input('status', sql.NVarChar, status);
+    }
+
+    query += ' ORDER BY r.created_at DESC';
+    const result = await request.query(query);
+    res.json(result.recordset);
+  } catch (err) {
+    Log.error('Resignations', 'Failed to fetch resignations', err.message);
+    res.status(500).json({ error: 'Failed to fetch resignations' });
+  }
+});
+
+// POST: Submit a new resignation
+app.post('/api/resignations', verifyToken, async (req, res) => {
+  const { employeeId, resignationDate, lastWorkingDay, reason, letterContent } = req.body;
+
+  if (!employeeId || !resignationDate || !reason) {
+    return res.status(400).json({ error: 'Missing required fields: employeeId, resignationDate, and reason are mandatory.' });
+  }
+
+  try {
+    const pool = await getPool();
+    await pool.request()
+      .input('empId', sql.Int, employeeId)
+      .input('resDate', sql.Date, resignationDate)
+      .input('lwd', sql.Date, lastWorkingDay || null)
+      .input('reason', sql.NVarChar, reason)
+      .input('content', sql.NVarChar, letterContent || '')
+      .input('status', sql.NVarChar, 'Pending')
+      .query(`
+        INSERT INTO resignations (employee_id, resignation_date, last_working_day, reason, letter_content, status, created_at, updated_at)
+        VALUES (@empId, @resDate, @lwd, @reason, @content, @status, GETDATE(), GETDATE())
+      `);
+    res.status(201).json({ success: true, message: 'Resignation submitted successfully' });
+  } catch (err) {
+    Log.error('Resignations', 'Failed to submit resignation', err.message);
+    res.status(500).json({ error: 'Failed to submit resignation' });
+  }
+});
+
+// PUT: Update resignation status or remarks (Approval/Rejection)
+app.put('/api/resignations/:id', verifyToken, async (req, res) => {
+  const { id } = req.params;
+  const { status, reporting_manager_remark, project_manager_remark, hr_remark, last_working_day } = req.body;
+
+  try {
+    const pool = await getPool();
+    const request = pool.request().input('id', sql.Int, id);
+    
+    let updates = ['updated_at = GETDATE()'];
+    if (status) { 
+      updates.push('status = @status'); 
+      request.input('status', sql.NVarChar, status); 
+    }
+    if (reporting_manager_remark) { 
+      updates.push('reporting_manager_remark = @rmRemark'); 
+      request.input('rmRemark', sql.NVarChar, reporting_manager_remark); 
+    }
+    if (project_manager_remark) { 
+      updates.push('project_manager_remark = @pmRemark'); 
+      request.input('pmRemark', sql.NVarChar, project_manager_remark); 
+    }
+    if (hr_remark) { 
+      updates.push('hr_remark = @hrRemark'); 
+      request.input('hrRemark', sql.NVarChar, hr_remark); 
+    }
+    if (last_working_day) { 
+      updates.push('last_working_day = @lwd'); 
+      request.input('lwd', sql.Date, last_working_day); 
+    }
+
+    if (updates.length === 1) return res.status(400).json({ error: 'No fields provided for update' });
+
+    await request.query(`UPDATE resignations SET ${updates.join(', ')} WHERE id = @id`);
+    res.json({ success: true, message: 'Resignation record updated successfully' });
+  } catch (err) {
+    Log.error('Resignations', 'Failed to update resignation', err.message);
+    res.status(500).json({ error: 'Failed to update resignation' });
+  }
+});
+
+
+// --- SERVICE CERTIFICATE REQUESTS --- //
+
+// GET: List certificate requests with role-based access
+app.get('/api/service-certificates', verifyToken, async (req, res) => {
+  const employeeId = sanitizeNumericId(req.query.employee_id);
+  const { status } = req.query;
+
+  const role = (req.user.role || '').toLowerCase();
+  const isAdmin = role.includes('hr') || role.includes('admin') || role.includes('human resource') || role.includes('ceo');
+  const isManager = role.includes('manager') || role.includes('lead');
+
+  try {
+    const pool = await getPool();
+    let query = `
+      SELECT sc.*, 
+             ISNULL(u.name, 'Employee #' + CAST(sc.employee_id AS NVARCHAR)) as employee_name, 
+             ISNULL(u.team, 'N/A') as employee_team
+      FROM service_certificate_requests sc
+      LEFT JOIN users u ON sc.employee_id = u.id
+      WHERE 1=1
+    `;
+    const request = pool.request();
+
+    if (!isAdmin) {
+      if (isManager) {
+        // Managers see their team's requests OR their own
+        query += ' AND (u.reporting_manager_id = @currentUserId OR sc.employee_id = @currentUserId)';
+        request.input('currentUserId', sql.Int, req.user.id);
+      } else {
+        // Employees see only their own requests
+        query += ' AND sc.employee_id = @currentUserId';
+        request.input('currentUserId', sql.Int, req.user.id);
+      }
+    } else if (employeeId) {
+      // Admin/HR can filter by specific employee
+      query += ' AND sc.employee_id = @employeeId';
+      request.input('employeeId', sql.Int, employeeId);
+    }
+
+    if (status) {
+      query += ' AND sc.status = @status';
+      request.input('status', sql.NVarChar, status);
+    }
+
+    query += ' ORDER BY sc.created_at DESC';
+    const result = await request.query(query);
+    res.json(result.recordset);
+  } catch (err) {
+    Log.error('Certificates', 'Failed to fetch certificates', err.message);
+    res.status(500).json({ error: 'Failed to fetch certificate requests' });
+  }
+});
+
+// POST: Submit a new certificate request
+app.post('/api/service-certificates', verifyToken, async (req, res) => {
+  const { employeeId, purpose, laptopDetails, serialNumber } = req.body;
+
+  if (!employeeId || !purpose) {
+    return res.status(400).json({ error: 'Missing required fields: employeeId and purpose are mandatory.' });
+  }
+
+  try {
+    const pool = await getPool();
+    await pool.request()
+      .input('empId', sql.Int, employeeId)
+      .input('purpose', sql.NVarChar, purpose)
+      .input('laptop', sql.NVarChar, laptopDetails || '')
+      .input('serial', sql.NVarChar, serialNumber || '')
+      .input('status', sql.NVarChar, 'Pending')
+      .query(`
+        INSERT INTO service_certificate_requests (employee_id, purpose, laptop_details, serial_number, status, created_at, updated_at)
+        VALUES (@empId, @purpose, @laptop, @serial, @status, GETDATE(), GETDATE())
+      `);
+    res.status(201).json({ success: true, message: 'Service certificate request submitted successfully' });
+  } catch (err) {
+    Log.error('Certificates', 'Failed to submit request', err.message);
+    res.status(500).json({ error: 'Failed to submit certificate request' });
+  }
+});
+
+// PUT: Approve/Reject or update certificate request (Admin/HR Only)
+app.put('/api/service-certificates/:id', verifyToken, async (req, res) => {
+  const { id } = req.params;
+  const { status, admin_remark, certificate_url } = req.body;
+
+  const role = (req.user.role || '').toLowerCase();
+  const isAdmin = role.includes('hr') || role.includes('admin') || role.includes('human resource') || role.includes('ceo');
+
+  if (!isAdmin) return res.status(403).json({ error: 'Unauthorized: Admin/HR access required for updates.' });
+
+  try {
+    const pool = await getPool();
+    const request = pool.request().input('id', sql.Int, id);
+    
+    let updates = ['updated_at = GETDATE()'];
+    if (status) { updates.push('status = @status'); request.input('status', sql.NVarChar, status); }
+    if (admin_remark) { updates.push('admin_remark = @remark'); request.input('remark', sql.NVarChar, admin_remark); }
+    if (certificate_url) { updates.push('certificate_url = @url'); request.input('url', sql.NVarChar, certificate_url); }
+
+    if (updates.length === 1) return res.status(400).json({ error: 'No data provided for update' });
+
+    await request.query(`UPDATE service_certificate_requests SET ${updates.join(', ')} WHERE id = @id`);
+    res.json({ success: true, message: 'Service certificate request updated' });
+  } catch (err) {
+    Log.error('Certificates', 'Failed to update request', err.message);
+    res.status(500).json({ error: 'Failed to update certificate request' });
+  }
+});
+
 // --- GLOBAL API 404 HANDLER (JSON-ONLY) --- //
 app.use('/api', (req, res) => {
   const clientIP = req.headers['x-forwarded-for']?.split(',')[0].trim() || req.ip;
@@ -10155,9 +10596,9 @@ app.use('/api', (req, res) => {
 });
 
 // DB Initialization for Employee Profiles table (ensure new photo columns exist)
-const initializeProfilesTable = async () => {
+const initializeProfilesTable = async (providedPool) => {
   try {
-    const pool = await getPool();
+    const pool = providedPool || await getPool();
     await pool.request().query(`
       IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'employee_profiles')
       BEGIN
@@ -10225,9 +10666,9 @@ const initializeProfilesTable = async () => {
 /**
  * Migration: Ensure profile_picture columns are NVARCHAR(MAX) in core tables
  */
-const fixProfilePictureColumns = async () => {
+const fixProfilePictureColumns = async (providedPool) => {
   try {
-    const pool = await getPool();
+    const pool = providedPool || await getPool();
     await pool.request().query(`
       IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('users') AND name = 'profile_picture')
         ALTER TABLE users ALTER COLUMN profile_picture NVARCHAR(MAX);
@@ -10245,9 +10686,9 @@ const fixProfilePictureColumns = async () => {
 /**
  * Migration: Ensure all photo/document columns in employee_profiles are NVARCHAR(MAX)
  */
-const fixEmployeeProfileColumns = async () => {
+const fixEmployeeProfileColumns = async (providedPool) => {
   try {
-    const pool = await getPool();
+    const pool = providedPool || await getPool();
     const photoColumns = [
       'pancard_photo', 'adharcard_photo', 'experience_letter_photo',
       'voter_id_photo', 'passport_photo', 'previous_company_payslip',
@@ -10261,7 +10702,7 @@ const fixEmployeeProfileColumns = async () => {
           ALTER TABLE employee_profiles ALTER COLUMN ${col} NVARCHAR(MAX);
       `;
     }
-    
+
     await pool.request().query(query);
     console.log('✅ Database: Employee Profile document columns expanded to MAX capacity');
   } catch (err) {
@@ -10270,9 +10711,9 @@ const fixEmployeeProfileColumns = async () => {
 };
 
 // DB Initialization for Assets table
-const initializeAssetsTable = async () => {
+const initializeAssetsTable = async (providedPool) => {
   try {
-    const pool = await getPool();
+    const pool = providedPool || await getPool();
     await pool.request().query(`
       IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'assets')
       BEGIN
@@ -10306,9 +10747,9 @@ const initializeAssetsTable = async () => {
 };
 
 // DB Initialization for Employee Documents table
-const initializeDocumentsTable = async () => {
+const initializeDocumentsTable = async (providedPool) => {
   try {
-    const pool = await getPool();
+    const pool = providedPool || await getPool();
     await pool.request().query(`
       IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'employee_documents')
       BEGIN
@@ -10355,9 +10796,9 @@ const initializeDocumentsTable = async () => {
 };
 
 // DB Initialization for Attendance Logs table (expand location columns)
-const initializeAttendanceTable = async () => {
+const initializeAttendanceTable = async (providedPool) => {
   try {
-    const pool = await getPool();
+    const pool = providedPool || await getPool();
     await pool.request().query(`
       IF EXISTS (SELECT * FROM sys.tables WHERE name = 'attendance_logs')
       BEGIN
@@ -10374,9 +10815,9 @@ const initializeAttendanceTable = async () => {
 };
 
 // DB Initialization for Thread Comments (relax FK constraint)
-const initializeThreadCommentsTable = async () => {
+const initializeThreadCommentsTable = async (providedPool) => {
   try {
-    const pool = await getPool();
+    const pool = providedPool || await getPool();
     await pool.request().query(`
       IF EXISTS (SELECT * FROM sys.foreign_keys WHERE name = 'FK__thread_co__user___5BAD9CC8')
       BEGIN
@@ -10390,9 +10831,9 @@ const initializeThreadCommentsTable = async () => {
 };
 
 // DB Initialization for Thread Reactions (relax FK constraint)
-const initializeThreadReactionsTable = async () => {
+const initializeThreadReactionsTable = async (providedPool) => {
   try {
-    const pool = await getPool();
+    const pool = providedPool || await getPool();
     await pool.request().query(`
       IF EXISTS (SELECT * FROM sys.foreign_keys WHERE name = 'FK__thread_re__user___56E8E7AB')
       BEGIN
@@ -10406,17 +10847,22 @@ const initializeThreadReactionsTable = async () => {
 };
 
 // Initialize server ONLY after database is ready
-getPool().then(async () => {
+getPool().then(async (pool) => {
   console.clear();
   console.log(BANNER);
-  await initializeProfilesTable();
-  await fixProfilePictureColumns();
-  await fixEmployeeProfileColumns();
-  await initializeAssetsTable();
-  await initializeDocumentsTable();
-  await initializeAttendanceTable();
-  await initializeThreadCommentsTable();
-  await initializeThreadReactionsTable();
+
+  const runMigration = async (name, fn) => {
+    try { await fn(pool); } catch (err) { Log.error('Migration', `Failed: ${name}`, err.message); }
+  };
+
+  await runMigration('Profiles', initializeProfilesTable);
+  await runMigration('Pics', fixProfilePictureColumns);
+  await runMigration('Columns', fixEmployeeProfileColumns);
+  await runMigration('Assets', initializeAssetsTable);
+  await runMigration('Docs', initializeDocumentsTable);
+  await runMigration('Attendance', initializeAttendanceTable);
+  await runMigration('Threads', initializeThreadCommentsTable);
+  await runMigration('Reactions', initializeThreadReactionsTable);
   app.listen(PORT, '0.0.0.0', () => {
     Log.ready(`System operational on port ${PORT}`);
     Log.divider();
