@@ -10,15 +10,15 @@ const dbConfig = {
         encrypt: false,
         trustServerCertificate: true,
         enableArithAbort: true,
-        requestTimeout: 45000,    // Increased to 45s for heavier migrations
-        connectionTimeout: 15000, 
-        cancelTimeout: 15000,     // NEW: Prevent "Failed to cancel request in 5000ms"
+        requestTimeout: 60000,    // Increased to 60s
+        connectionTimeout: 30000, // Increased to 30s
+        cancelTimeout: 30000,
     },
     pool: {
-        max: 100, // Increased for concurrent dashboard users
+        max: 150, // Increased pool size
         min: 10,
         idleTimeoutMillis: 30000,
-        acquireTimeoutMillis: 90000 // Higher buffer for high load
+        acquireTimeoutMillis: 120000 // Higher buffer for high load
     }
 };
 
@@ -64,7 +64,8 @@ async function getPool() {
                 poolPromise = null;
             });
 
-            console.log(`[DB] Attempting connection to ${dbConfig.server}...`);
+            console.log(`[DB] Attempting connection to ${dbConfig.server} as ${dbConfig.user}...`);
+            console.log(`[DB] Using database: ${dbConfig.database}, Port: ${dbConfig.port}`);
             await pool.connect();
             console.log('✅ --- DATABASE CONNECTION ESTABLISHED ---');
             console.log(`✅ Connected to: ${dbConfig.database} on ${dbConfig.server}`);

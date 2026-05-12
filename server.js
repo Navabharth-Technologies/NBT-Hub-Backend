@@ -6932,7 +6932,8 @@ app.get('/api/admin/leaves/stats', verifyToken, async (req, res) => {
     return res.status(403).json({ error: 'Unauthorized: Management access required.' });
   }
 
-  let { employeeId, month, year } = req.query;
+  const employeeId = sanitizeNumericId(req.query.employeeId);
+  let { month, year } = req.query;
 
   // Handle YYYY-MM format in month parameter (e.g., ?month=2026-04)
   if (month && typeof month === 'string' && month.includes('-')) {
@@ -7064,7 +7065,9 @@ app.get('/api/leave-stats', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
   const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead') || role.includes('tl');
 
-  let { userId, employeeId, month, year } = req.query;
+  const userId = sanitizeNumericId(req.query.userId);
+  const employeeId = sanitizeNumericId(req.query.employeeId);
+  const { month, year } = req.query;
   const targetId = userId || employeeId;
 
   console.log(`[GET /api/leave-stats] Accessed by user ${req.user.id} (Role: ${req.user.role}, isAdmin: ${isAdmin}), targetId: ${targetId}`);
