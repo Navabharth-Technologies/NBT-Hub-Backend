@@ -18,13 +18,13 @@ const EMAILJS_CONFIG = {
 
 // --- CRITICAL ERROR LOGGING --- //
 process.on('unhandledRejection', (reason, promise) => {
-    console.error('\n🚨 [FATAL] UNHANDLED REJECTION:', reason);
+  console.error('\n🚨 [FATAL] UNHANDLED REJECTION:', reason);
 });
 process.on('uncaughtException', (err) => {
-    console.error('\n🚨 [FATAL] UNCAUGHT EXCEPTION:', err.message);
-    console.error(err.stack);
-    // Give logs time to flush before exiting
-    setTimeout(() => process.exit(1), 1000);
+  console.error('\n🚨 [FATAL] UNCAUGHT EXCEPTION:', err.message);
+  console.error(err.stack);
+  // Give logs time to flush before exiting
+  setTimeout(() => process.exit(1), 1000);
 });
 
 const app = express();
@@ -223,6 +223,27 @@ const normalizeImage = (img) => {
 };
 
 /**
+ * Normalizes Drive/Video URLs for embedding.
+ * Converts Google Drive links to an absolute backend proxy URL.
+ */
+const normalizeVideoUrl = (url, req = null) => {
+  if (!url || typeof url !== 'string') return url;
+  let val = url.trim();
+
+  // Detect Google Drive links and convert to Backend Proxy for seamless loading
+  if (val.includes('drive.google.com')) {
+    const match = val.match(/\/d\/([^\/]+)/);
+    if (match) {
+      // Determine base URL dynamically if req is available, otherwise default to local
+      const baseUrl = req ? `${req.protocol}://${req.get('host')}` : 'http://localhost:5000';
+      return `${baseUrl}/api/drive/stream/${match[1]}`;
+    }
+  }
+
+  return val;
+};
+
+/**
  * Normalizes all photo fields within a profile object
  */
 const normalizeProfile = (profile) => {
@@ -236,7 +257,12 @@ const normalizeProfile = (profile) => {
 
   photoFields.forEach(field => {
     if (profile[field]) {
-      profile[field] = normalizeImage(profile[field]);
+      // Normalize both images and Drive documents for profiles
+      if (typeof profile[field] === 'string' && profile[field].includes('drive.google.com')) {
+        profile[field] = normalizeVideoUrl(profile[field]);
+      } else {
+        profile[field] = normalizeImage(profile[field]);
+      }
     }
   });
 
@@ -335,6 +361,33 @@ const REWARD_CATEGORIES = ['Performance', 'Peer Recognition', 'Service Anniversa
 // 2.5 Static Folder Serving (for uploaded images/videos)
 // app.use('/uploads', express.static(path.join(__dirname, 'uploads'))); // Retired local storage
 
+// 2.55 GOOGLE DRIVE PROXY SERVICE
+// Bypasses "You need access" and iframe connectivity issues by streaming files through the backend.
+// Note: We use /uploads/drive as a prefix because the frontend automatically prepends /uploads/ to relative paths.
+app.get(['/uploads/drive/:fileId', '/api/drive/stream/:fileId'], async (req, res) => {
+  const { fileId } = req.params;
+  if (!fileId || fileId === 'undefined') return res.status(400).send('Invalid File ID');
+
+  try {
+    const { stream, mimeType, name } = await driveService.getFileStream(fileId);
+
+    // Set headers for inline viewing (essential for PDFs and Videos)
+    res.setHeader('Content-Type', mimeType);
+    res.setHeader('Content-Disposition', `inline; filename="${name}"`);
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+
+    stream.on('error', (err) => {
+      console.error('[STREAM ERROR]', err.message);
+      if (!res.headersSent) res.status(500).send('Stream error');
+    });
+
+    stream.pipe(res);
+  } catch (err) {
+    console.error('[DRIVE PROXY ERROR]', err.message);
+    res.status(404).send('Resource not found or access denied by Google Drive');
+  }
+});
+
 // 2.6 NBT Career Portal Webhooks (Incoming Applications)
 app.use('/webhooks/nbt', incomingRouter);
 
@@ -361,46 +414,52 @@ app.get('/api/status', (req, res) => {
   res.json({ status: 'ok', message: 'API is functional' });
 });
 
+/**
+ * Central Security Utility: Verifies a JWT and checks for revocation (Global Logout).
+ * Returns the decoded payload if valid and active, null otherwise.
+ */
+const getVerifiedUser = async (token) => {
+  if (!token) return null;
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'fallback_secret_key');
+    if (!decoded || !decoded.id) return null;
+
+    const pool = await getPool();
+    let table = 'users';
+    if (decoded.userType === 'new_joinee') table = 'new_joinees';
+    if (decoded.userType === 'intern') table = 'interns';
+
+    const result = await pool.request()
+      .input('id', sql.Int, decoded.id)
+      .query(`SELECT token_version FROM ${table} WHERE id = @id`);
+
+    if (result.recordset.length > 0) {
+      const currentVersion = result.recordset[0].token_version || 0;
+      const tokenVersion = decoded.token_version || 0;
+      // REJECTION LOGIC: If DB has a newer version, the token is stale/revoked
+      if (tokenVersion < currentVersion) return null;
+    }
+    return decoded;
+  } catch (err) {
+    return null;
+  }
+};
+
 // --- AUTH & SECURITY MIDDLEWARE --- //
-const verifyToken = (req, res, next) => {
+const verifyToken = async (req, res, next) => {
   const token = req.headers['authorization']?.split(' ')[1];
   if (!token) {
-    Log.auth('Request blocked: Missing Authorization Header', 'Make sure your frontend sends "Bearer <token>"');
     return res.status(403).json({ error: 'No token provided' });
   }
 
-  jwt.verify(token, process.env.JWT_SECRET || 'fallback_secret_key', { clockTolerance: 300 }, async (err, decoded) => {
-    if (err) {
-      Log.auth('Invalid or Expired Token signature', 'Your session might have timed out. Try logging in again.');
-      return res.status(401).json({ error: 'Failed to authenticate token' });
-    }
+  const decoded = await getVerifiedUser(token);
+  if (!decoded) {
+    Log.auth('Invalid, Expired or Revoked Token signature', 'Your session might have been invalidated globally.');
+    return res.status(401).json({ error: 'Session expired. Please log in again.', globalLogout: true });
+  }
 
-    // --- Logout From All Devices Check ---
-    try {
-      const pool = await getPool();
-      let table = 'users';
-      if (decoded.userType === 'new_joinee') table = 'new_joinees';
-      if (decoded.userType === 'intern') table = 'interns';
-
-      const result = await pool.request()
-        .input('id', sql.Int, decoded.id)
-        .query(`SELECT token_version FROM ${table} WHERE id = @id`);
-
-      if (result.recordset.length > 0) {
-        const currentVersion = result.recordset[0].token_version || 0;
-        // If token has a version and it's older than current DB version, reject it
-        if (decoded.token_version !== undefined && decoded.token_version < currentVersion) {
-          Log.auth(`Session invalidated for ${decoded.email}: Outdated token version`, 'User likely performed a Global Logout.');
-          return res.status(401).json({ error: 'Session expired due to password change. Please log in again.', globalLogout: true });
-        }
-      }
-    } catch (dbErr) {
-      console.error('[VERIFY TOKEN DB SYNC ERROR]:', dbErr.message);
-    }
-
-    req.user = decoded;
-    next();
-  });
+  req.user = decoded;
+  next();
 };
 
 /**
@@ -1028,52 +1087,74 @@ app.post('/api/password/reset-with-otp', async (req, res) => {
  * 2.F Change Password with Old Password (Authenticated)
  */
 app.post(['/api/password/change-password', '/api/profile/update-password'], verifyToken, async (req, res) => {
-    const { oldPassword, newPassword, logoutAllDevices } = req.body;
-    const email = req.user.email;
-    const userType = req.user.userType;
+  const { oldPassword, newPassword, logoutAllDevices } = req.body;
+  const email = req.user.email;
+  const userType = req.user.userType;
 
-    if (!oldPassword || !newPassword) return res.status(400).json({ error: 'Old and new passwords required' });
+  if (!oldPassword || !newPassword) return res.status(400).json({ error: 'Old and new passwords required' });
 
-    try {
-        const pool = await getPool();
-        const table = userType === 'new_joinee' ? 'new_joinees' : 'users';
-        const emailCol = userType === 'new_joinee' ? 'email_id' : 'email';
+  try {
+    const pool = await getPool();
+    const table = userType === 'new_joinee' ? 'new_joinees' : 'users';
+    const emailCol = userType === 'new_joinee' ? 'email_id' : 'email';
 
-        const result = await pool.request()
-            .input('email', sql.NVarChar, email)
-            .query(`SELECT password, token_version FROM ${table} WHERE ${emailCol} = @email`);
+    const result = await pool.request()
+      .input('email', sql.NVarChar, email)
+      .query(`SELECT password, token_version FROM ${table} WHERE ${emailCol} = @email`);
 
-        if (result.recordset.length === 0) return res.status(404).json({ error: 'User not found' });
+    if (result.recordset.length === 0) return res.status(404).json({ error: 'User not found' });
 
-        const currentPass = result.recordset[0].password;
-        let isMatch = false;
+    const currentPass = result.recordset[0].password;
+    let isMatch = false;
 
-        if (userType === 'new_joinee') {
-            isMatch = (oldPassword === currentPass);
-        } else {
-            isMatch = await bcrypt.compare(oldPassword, currentPass);
-        }
+    if (userType === 'new_joinee') {
+      isMatch = (oldPassword === currentPass);
+    } else {
+      isMatch = await bcrypt.compare(oldPassword, currentPass);
+    }
 
-        if (!isMatch) return res.status(401).json({ error: 'Incorrect old password' });
+    if (!isMatch) return res.status(401).json({ error: 'Incorrect old password' });
 
-        const finalValue = userType === 'new_joinee' ? newPassword : await bcrypt.hash(newPassword, 10);
+    const finalValue = userType === 'new_joinee' ? newPassword : await bcrypt.hash(newPassword, 10);
 
-        let query = `UPDATE ${table} SET password = @pass`;
-        if (logoutAllDevices === true || logoutAllDevices === 'true') {
-            query += `, token_version = ISNULL(token_version, 0) + 1`;
-        }
-        query += ` WHERE ${emailCol} = @email`;
+    // SECURITY: Always trigger a Global Logout (increment token_version) on password change by default
+    let query = `UPDATE ${table} SET password = @pass, token_version = ISNULL(token_version, 0) + 1`;
+    query += ` WHERE ${emailCol} = @email`;
 
-        await pool.request()
-            .input('pass', sql.NVarChar, finalValue)
-            .input('email', sql.NVarChar, email)
-            .query(query);
+    await pool.request()
+      .input('pass', sql.NVarChar, finalValue)
+      .input('email', sql.NVarChar, email)
+      .query(query);
 
-        Log.success('Auth', `Password changed by user for ${email}${logoutAllDevices ? ' (Global Logout triggered)' : ''}`);
-        res.json({ success: true, message: 'Password changed successfully', logoutAll: logoutAllDevices });
+    Log.success('Auth', `Password changed by user for ${email} (Automatic Global Logout triggered)`);
+    res.json({ success: true, message: 'Password changed successfully. You have been logged out of all other devices.', logoutAll: true });
   } catch (err) {
     console.error('[CHANGE PASSWORD ERROR]:', err);
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * 2.G Global Logout - Invalidate all active sessions across all devices
+ */
+app.post('/api/logout/global', verifyToken, async (req, res) => {
+  const { id, userType, email } = req.user;
+  
+  try {
+    const pool = await getPool();
+    let table = 'users';
+    if (userType === 'new_joinee') table = 'new_joinees';
+    if (userType === 'intern') table = 'interns';
+
+    await pool.request()
+      .input('id', sql.Int, id)
+      .query(`UPDATE ${table} SET token_version = ISNULL(token_version, 0) + 1 WHERE id = @id`);
+
+    Log.auth(`Global Logout performed for ${email}`, 'All active sessions have been invalidated.');
+    res.json({ success: true, message: 'Logged out from all devices successfully.' });
+  } catch (err) {
+    console.error('[GLOBAL LOGOUT ERROR]:', err);
+    res.status(500).json({ error: 'Failed to perform global logout' });
   }
 });
 
@@ -1715,6 +1796,8 @@ app.get('/api/profile/picture/:email', async (req, res) => {
       res.setHeader('Content-Type', mime);
       res.setHeader('Content-Length', buffer.length);
       return res.send(buffer);
+    } else if (picData.startsWith('http')) {
+      return res.redirect(normalizeVideoUrl(picData));
     } else {
       // Fallback for raw base64 without prefix (assume PNG)
       const buffer = Buffer.from(picData, 'base64');
@@ -1761,6 +1844,8 @@ app.get('/api/users/:id/photo', async (req, res) => {
       res.setHeader('Content-Type', mime);
       res.setHeader('Cache-Control', 'no-cache, must-revalidate');
       return res.send(buffer);
+    } else if (picData.startsWith('http')) {
+      return res.redirect(normalizeVideoUrl(picData));
     } else {
       const buffer = Buffer.from(picData, 'base64');
       res.setHeader('Content-Type', 'image/png');
@@ -1796,6 +1881,8 @@ app.get('/api/threads/:id/media', async (req, res) => {
       res.setHeader('Content-Type', contentType);
       res.setHeader('Cache-Control', 'public, max-age=86400');
       return res.send(buffer);
+    } else if (picData.startsWith('http')) {
+      return res.redirect(normalizeVideoUrl(picData));
     } else {
       const buffer = Buffer.from(picData, 'base64');
       res.setHeader('Content-Type', contentType);
@@ -2511,21 +2598,21 @@ app.get(['/api/attendance', '/api/attendance ', '/api/attendance%20'], verifyTok
 
     // --- NEW: Name matching safety check ---
     if (apiLog && apiLog.Name) {
-        const clean = (s) => (s || '').toLowerCase().replace(/[^a-z]/g, '');
-        const apiName = clean(apiLog.Name);
-        const dbName = clean(userResult.recordset[0].name);
-        
-        if (apiName && dbName && !apiName.includes(dbName) && !dbName.includes(apiName)) {
-            if (apiName.length > 3 && dbName.length > 3) {
-                console.warn(`[ATTENDANCE COLLISION] API Name "${apiLog.Name}" does not match DB Name "${userResult.recordset[0].name}" for User ID ${userId}`);
-                // Skip processing if names are clearly different to avoid saving wrong data
-                return res.json({
-                    success: false,
-                    error: 'Biometric record name mismatch.',
-                    message: 'The attendance record found does not match your profile name.'
-                });
-            }
+      const clean = (s) => (s || '').toLowerCase().replace(/[^a-z]/g, '');
+      const apiName = clean(apiLog.Name);
+      const dbName = clean(userResult.recordset[0].name);
+
+      if (apiName && dbName && !apiName.includes(dbName) && !dbName.includes(apiName)) {
+        if (apiName.length > 3 && dbName.length > 3) {
+          console.warn(`[ATTENDANCE COLLISION] API Name "${apiLog.Name}" does not match DB Name "${userResult.recordset[0].name}" for User ID ${userId}`);
+          // Skip processing if names are clearly different to avoid saving wrong data
+          return res.json({
+            success: false,
+            error: 'Biometric record name mismatch.',
+            message: 'The attendance record found does not match your profile name.'
+          });
         }
+      }
     }
 
     // --- NEW: PERSISTENT CACHING (UPSERT) --- //
@@ -2547,34 +2634,34 @@ app.get(['/api/attendance', '/api/attendance ', '/api/attendance%20'], verifyTok
 
       // --- NEW RULE: Status calculation based on criteria ---
       let finalStatus = apiLog.Status;
-      
+
       const isMissing = (time) => !time || time === '--:--' || time === '00:00';
       const todayStr = new Date(new Date().getTime() + (330 * 60 * 1000)).toISOString().split('T')[0];
       const recordDateStr = istTime.toISOString().split('T')[0];
       const isToday = recordDateStr === todayStr;
 
       if (!isMissing(apiLog.INTime) && isMissing(apiLog.OUTTime)) {
-          if (isToday) {
-              finalStatus = 'In Office';
-          } else {
-              finalStatus = 'A';
-          }
-      } else if (!isMissing(apiLog.INTime) && !isMissing(apiLog.OUTTime)) {
-          if (manualWorkTime && manualWorkTime.includes(':')) {
-              try {
-                  const [h, m] = manualWorkTime.split(':').map(Number);
-                  const totalHours = h + (m / 60);
-                  if (totalHours >= 8) {
-                      finalStatus = 'P';
-                  } else if (totalHours >= 5 && totalHours < 8) {
-                      finalStatus = 'Half Day';
-                  } else {
-                      finalStatus = 'A';
-                  }
-              } catch { }
-          }
-      } else {
+        if (isToday) {
+          finalStatus = 'In Office';
+        } else {
           finalStatus = 'A';
+        }
+      } else if (!isMissing(apiLog.INTime) && !isMissing(apiLog.OUTTime)) {
+        if (manualWorkTime && manualWorkTime.includes(':')) {
+          try {
+            const [h, m] = manualWorkTime.split(':').map(Number);
+            const totalHours = h + (m / 60);
+            if (totalHours >= 8) {
+              finalStatus = 'P';
+            } else if (totalHours >= 5 && totalHours < 8) {
+              finalStatus = 'Half Day';
+            } else {
+              finalStatus = 'A';
+            }
+          } catch { }
+        }
+      } else {
+        finalStatus = 'A';
       }
 
       // --- Check for Holidays (Fetch from holidays table) ---
@@ -2613,19 +2700,19 @@ app.get(['/api/attendance', '/api/attendance ', '/api/attendance%20'], verifyTok
                 `);
     }
 
-      const cleanTime = (t) => (!t || t === '--:--' || t === '00:00' || String(t).trim() === '') ? null : t;
-      res.json({
-        success: true,
-        date: formattedDate,
-        empCode: empCode,
-        attendance: apiLog ? {
-          inTime: cleanTime(apiLog.INTime),
-          outTime: cleanTime(apiLog.OUTTime),
-          workTime: cleanTime(manualWorkTime),
-          status: finalStatus,
-          remark: finalRemark
-        } : null
-      });
+    const cleanTime = (t) => (!t || t === '--:--' || t === '00:00' || String(t).trim() === '') ? null : t;
+    res.json({
+      success: true,
+      date: formattedDate,
+      empCode: empCode,
+      attendance: apiLog ? {
+        inTime: cleanTime(apiLog.INTime),
+        outTime: cleanTime(apiLog.OUTTime),
+        workTime: cleanTime(manualWorkTime),
+        status: finalStatus,
+        remark: finalRemark
+      } : null
+    });
 
   } catch (err) {
     console.error('[ATTENDANCE ERROR]:', err);
@@ -2669,24 +2756,24 @@ let usersMapCache = new Map();
 let lastUsersCacheUpdate = 0;
 
 async function getUsersMap() {
-    const now = Date.now();
-    if (usersMapCache.size > 0 && (now - lastUsersCacheUpdate < 300000)) return usersMapCache;
-    try {
-        const pool = await getPool();
-        const result = await pool.request().query('SELECT id, name, team, joining_date FROM users WITH (NOLOCK)');
-        const newMap = new Map();
-        result.recordset.forEach(u => newMap.set(u.id, u));
-        usersMapCache = newMap;
-        lastUsersCacheUpdate = now;
-        return usersMapCache;
-    } catch (err) { return usersMapCache; }
+  const now = Date.now();
+  if (usersMapCache.size > 0 && (now - lastUsersCacheUpdate < 300000)) return usersMapCache;
+  try {
+    const pool = await getPool();
+    const result = await pool.request().query('SELECT id, name, team, joining_date FROM users WITH (NOLOCK)');
+    const newMap = new Map();
+    result.recordset.forEach(u => newMap.set(u.id, u));
+    usersMapCache = newMap;
+    lastUsersCacheUpdate = now;
+    return usersMapCache;
+  } catch (err) { return usersMapCache; }
 }
 
 // 1b. Get raw historical database backup logs for all synced attendance entries
 app.get(['/api/attendance_logs', '/api/attendance logs', '/api/attendance%20logs'], verifyToken, async (req, res) => {
   const { startDate, endDate, team, status, page = 1, limit = 50 } = req.query;
   const userId = sanitizeNumericId(req.query.userId);
-  const safeLimit = Math.min(parseInt(limit) || 50, 100); 
+  const safeLimit = Math.min(parseInt(limit) || 50, 100);
   const offset = (parseInt(page) - 1) * safeLimit;
 
   try {
@@ -2752,7 +2839,7 @@ app.get(['/api/attendance_logs', '/api/attendance logs', '/api/attendance%20logs
     const cleanTime = (t) => (!t || t === '--:--' || t === '00:00' || String(t).trim() === '') ? null : t;
     const mappedData = result.recordset.map(log => {
       const u = usersMap.get(log.user_id) || { name: 'Unknown', team: 'N/A' };
-      
+
       // Joining Date Filter (JS Level for speed)
       if (u.joining_date && new Date(log.punch_date) < new Date(u.joining_date)) return null;
 
@@ -2760,7 +2847,7 @@ app.get(['/api/attendance_logs', '/api/attendance logs', '/api/attendance%20logs
       const outT = cleanTime(log.out_time);
       const workT = cleanTime(log.work_time);
       const empCodeStr = log.user_id ? log.user_id.toString() : '';
-      
+
       return {
         id: log.id,
         user_id: log.user_id,
@@ -4023,8 +4110,13 @@ app.get('/api/master-task/:id', async (req, res) => {
 });
 
 // 14. Get Assigned Tasks for a specific user (Targeted Stream)
-app.get('/api/tasks/assigned/:userId', async (req, res) => {
+app.get('/api/tasks/assigned/:userId', verifyToken, async (req, res) => {
   const userId = sanitizeNumericId(req.params.userId);
+
+  // Authorization: Only the user themselves or an Admin can view these tasks
+  if (req.user.role !== 'Admin' && req.user.id !== userId) {
+    return res.status(403).json({ error: 'Access denied to these delegated objectives' });
+  }
 
   // Disable caching for stability
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
@@ -4320,12 +4412,10 @@ app.get('/api/threads', async (req, res) => {
   const authHeader = req.headers['authorization'];
   let tokenViewerId = null;
   if (authHeader && authHeader.startsWith('Bearer ')) {
-    try {
-      const token = authHeader.split(' ')[1];
-      const decoded = jwt.verify(token, process.env.JWT_SECRET || 'fallback_secret_key');
+    const token = authHeader.split(' ')[1];
+    const decoded = await getVerifiedUser(token);
+    if (decoded) {
       tokenViewerId = decoded.id;
-    } catch (e) {
-      // Token expired or invalid - proceed as guest
     }
   }
 
@@ -4469,11 +4559,11 @@ const handleReaction = async (req, res) => {
   const authHeader = req.headers['authorization'];
   let tokenUserId = null;
   if (authHeader && authHeader.startsWith('Bearer ')) {
-    try {
-      const token = authHeader.split(' ')[1];
-      const decoded = jwt.verify(token, process.env.JWT_SECRET || 'fallback_secret_key');
+    const token = authHeader.split(' ')[1];
+    const decoded = await getVerifiedUser(token);
+    if (decoded) {
       tokenUserId = decoded.id;
-    } catch (e) { }
+    }
   }
 
   const userId = payload.userId || payload.user_id || payload.employeeId || payload.employee_id || req.query.userId || tokenUserId;
@@ -4791,11 +4881,11 @@ app.get('/api/threads/:id', async (req, res) => {
   const authHeader = req.headers['authorization'];
   let tokenViewerId = null;
   if (authHeader && authHeader.startsWith('Bearer ')) {
-    try {
-      const token = authHeader.split(' ')[1];
-      const decoded = jwt.verify(token, process.env.JWT_SECRET || 'fallback_secret_key');
+    const token = authHeader.split(' ')[1];
+    const decoded = await getVerifiedUser(token);
+    if (decoded) {
       tokenViewerId = decoded.id;
-    } catch (e) { }
+    }
   }
   const viewerId = sanitizeNumericId(req.query.userId || req.query.user_id || req.query.viewerId || tokenViewerId);
 
@@ -5392,9 +5482,14 @@ const createComplianceNotification = async (joineeId, reason) => {
 };
 
 // GET: Fetch notifications for a user (Supports both path and query parameters)
-app.get(['/api/notifications', '/api/notifications/:userId'], async (req, res) => {
-  const userId = sanitizeNumericId(req.params.userId || req.query.userId || req.query.user_id);
+app.get(['/api/notifications', '/api/notifications/:userId'], verifyToken, async (req, res) => {
+  const userId = sanitizeNumericId(req.params.userId || req.query.userId || req.query.user_id || req.user.id);
   if (!userId) return res.status(400).json({ error: 'User ID required' });
+
+  // Authorization: Only the user themselves or an Admin can view these alerts
+  if (req.user.role !== 'Admin' && req.user.id !== userId) {
+    return res.status(403).json({ error: 'Access denied to these alerts' });
+  }
 
   try {
     const pool = await getPool();
@@ -6102,7 +6197,7 @@ app.get('/api/courses', async (req, res) => {
     `;
 
     if (assignedTo) {
-      query += ' AND c.assigned_to = @assignedTo';
+      query += ' AND (c.assigned_to = @assignedTo OR c.assigned_to IS NULL)';
       request.input('assignedTo', sql.Int, parseInt(assignedTo));
     }
     if (uploadedBy) {
@@ -6112,7 +6207,15 @@ app.get('/api/courses', async (req, res) => {
 
     query += ' ORDER BY c.created_at DESC OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY';
     const result = await request.query(query);
-    res.json(result.recordset);
+
+    // Normalize video URLs for embedding
+    const normalizedData = result.recordset.map(row => ({
+      ...row,
+      video_url: normalizeVideoUrl(row.video_url),
+      pdf_url: normalizeVideoUrl(row.pdf_url)
+    }));
+
+    res.json(normalizedData);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch academic catalog' });
   }
@@ -6124,7 +6227,7 @@ app.post('/api/courses', memoryUpload.fields([{ name: 'pdf', maxCount: 1 }, { na
     title, description, category, deadline,
     assignedTo, assigned_to,
     uploadedBy, uploaded_by,
-    pdf_data, pdf_name, video_url, video_data, pdf_url
+    pdf_data, pdf_name, video_url, videoUrl, video_data, pdf_url, pdfUrl
   } = req.body || {};
 
   if (!title) return res.status(400).json({ error: 'Course title is required' });
@@ -6137,12 +6240,12 @@ app.post('/api/courses', memoryUpload.fields([{ name: 'pdf', maxCount: 1 }, { na
   const finalUploadedBy = (rawUploadedBy && String(rawUploadedBy).trim() !== '') ? parseInt(rawUploadedBy) : null;
 
   // Handle uploaded files if any (Migrated to Google Drive)
-  let finalPdf = pdf_url;
+  let finalPdf = pdf_url || pdfUrl;
   if (req.files && req.files['pdf']) {
     finalPdf = await safeUploadToDrive(req.files['pdf'][0]);
   }
 
-  let finalVideo = video_url;
+  let finalVideo = video_url || videoUrl;
   if (req.files && req.files['video']) {
     finalVideo = await safeUploadToDrive(req.files['video'][0]);
   }
@@ -6258,6 +6361,21 @@ app.put('/api/courses/:id', memoryUpload.fields([{ name: 'pdf', maxCount: 1 }, {
   }
 });
 
+// DELETE: Remove a course from the academic catalog
+app.delete('/api/courses/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const pool = await getPool();
+    await pool.request()
+      .input('id', sql.Int, id)
+      .query('DELETE FROM courses WHERE id = @id');
+    res.json({ success: true, message: 'Course successfully deleted from catalog' });
+  } catch (err) {
+    console.error('Course deletion error:', err);
+    res.status(500).json({ error: 'Failed to delete course', details: err.message });
+  }
+});
+
 // 28. MASTER Project Sprint Status API (Aggregated view of all active sprints)
 app.get(['/api/project-sprints', '/api/sprints-status'], async (req, res) => {
   try {
@@ -6308,7 +6426,15 @@ app.get('/api/newjoinee-courses', async (req, res) => {
 
     query += ' ORDER BY c.created_at DESC';
     const result = await request.query(query);
-    res.json(result.recordset);
+
+    // Normalize video URLs for embedding
+    const normalizedData = result.recordset.map(row => ({
+      ...row,
+      video_url: normalizeVideoUrl(row.video_url),
+      pdf_url: normalizeVideoUrl(row.pdf_url)
+    }));
+
+    res.json(normalizedData);
   } catch (err) {
     console.error('Fetch error:', err);
     res.status(500).json({ error: 'Failed to fetch global onboarding curriculum' });
@@ -6325,7 +6451,12 @@ app.get('/api/newjoinee-courses/:id', async (req, res) => {
       .query('SELECT * FROM newjoinee_courses WITH (NOLOCK) WHERE id = @id');
 
     if (result.recordset.length === 0) return res.status(404).json({ error: 'Onboarding resource not found' });
-    res.json(result.recordset[0]);
+
+    const course = result.recordset[0];
+    course.video_url = normalizeVideoUrl(course.video_url, req);
+    course.pdf_url = normalizeVideoUrl(course.pdf_url, req);
+
+    res.json(course);
   } catch (err) {
     res.status(500).json({ error: 'Failed to extract organizational training data' });
   }
@@ -6338,7 +6469,7 @@ app.post('/api/newjoinee-courses', memoryUpload.fields([{ name: 'pdf', maxCount:
     title, description, category, deadline,
     assignedTo, assigned_to,
     uploadedBy, uploaded_by,
-    pdf_url, pdf_data, pdf_name, video_url, video_data
+    pdf_url, pdfUrl, pdf_data, pdf_name, video_url, videoUrl, video_data
   } = req.body || {};
 
   if (!title) return res.status(400).json({ error: 'Course title is required' });
@@ -6351,12 +6482,12 @@ app.post('/api/newjoinee-courses', memoryUpload.fields([{ name: 'pdf', maxCount:
   const finalUploadedBy = (rawUploadedBy && String(rawUploadedBy).trim() !== '') ? parseInt(rawUploadedBy) : null;
 
   // Handle uploaded files if any (Migrated to Google Drive)
-  let finalPdf = pdf_url;
+  let finalPdf = pdf_url || pdfUrl;
   if (req.files && req.files['pdf']) {
     finalPdf = await safeUploadToDrive(req.files['pdf'][0]);
   }
 
-  let finalVideo = video_url;
+  let finalVideo = video_url || videoUrl;
   if (req.files && req.files['video']) {
     finalVideo = await safeUploadToDrive(req.files['video'][0]);
   }
@@ -6809,7 +6940,7 @@ const masterLeaveListHandler = async (req, res) => {
     limit = 10
   } = req.query;
 
-  const safeLimit = Math.min(parseInt(limit) || 10, 50); 
+  const safeLimit = Math.min(parseInt(limit) || 10, 50);
   const offset = (Math.max(1, parseInt(page)) - 1) * safeLimit;
 
   try {
@@ -8448,9 +8579,11 @@ app.get(['/api/rewards', '/api/rewards/my'], verifyToken, async (req, res) => {
         WHERE r.employee_id = @userId 
         ORDER BY r.created_at DESC;
 
-        -- 2. Calculate global rank and summary
+        -- 2. Calculate global rank and summary (Combined Manual Awards + Automated Quizzes)
         WITH CombinedPoints AS (
-          SELECT employee_id, points, (CASE WHEN category = 'Quiz' THEN 0 ELSE 1 END) as is_endorsement FROM employee_rewards
+          SELECT employee_id, points, 1 as is_endorsement FROM employee_rewards
+          UNION ALL
+          SELECT employee_id, total_points as points, 0 as is_endorsement FROM quiz_completions
         ),
         Leaderboard AS (
           SELECT 
@@ -8488,6 +8621,54 @@ app.get(['/api/rewards', '/api/rewards/my'], verifyToken, async (req, res) => {
   } catch (err) {
     console.error('[MY REWARDS FETCH ERROR]:', err);
     res.status(500).json({ error: 'Failed to access personal reward profile' });
+  }
+});
+
+/**
+ * 45.B Global Leaderboard (Full Rankings)
+ * Calculates combined points from Awards and Quizzes for every user.
+ */
+app.get('/api/rewards/leaderboard', verifyToken, async (req, res) => {
+  try {
+    const pool = await getPool();
+    const result = await pool.request().query(`
+      WITH CombinedPoints AS (
+        -- 1. Points from Manual Awards/Endorsements
+        SELECT employee_id, points FROM employee_rewards
+        UNION ALL
+        -- 2. Points from Automated Quiz Completions
+        SELECT employee_id, total_points as points FROM quiz_completions
+      ),
+      AggregatedPoints AS (
+        SELECT 
+          employee_id, 
+          SUM(points) as totalPoints
+        FROM CombinedPoints
+        GROUP BY employee_id
+      )
+      SELECT 
+        u.id, 
+        u.name, 
+        u.profile_picture, 
+        u.role,
+        u.team,
+        ap.totalPoints,
+        DENSE_RANK() OVER (ORDER BY ap.totalPoints DESC) as ranking
+      FROM AggregatedPoints ap
+      JOIN users u ON ap.employee_id = u.id
+      ORDER BY ap.totalPoints DESC, u.name ASC;
+    `);
+
+    // Map the results to include the #1, #2 formatting requested
+    const leaderboard = result.recordset.map(row => ({
+      ...row,
+      rankDisplay: `#${row.ranking}`
+    }));
+
+    res.json(leaderboard);
+  } catch (err) {
+    console.error('[LEADERBOARD FETCH ERROR]:', err);
+    res.status(500).json({ error: 'Failed to generate global ranking leaderboard' });
   }
 });
 
@@ -9040,17 +9221,10 @@ app.post(['/api/quizzes/submit-session', '/api/quizzes/submit-total'], verifyTok
       throw err;
     }
 
-    // 5. Add to Employee Rewards (So it shows in Rewards History)
+    // 5. Quiz points are recorded in quiz_completions (Step 4)
+    // Redundant 'employee_rewards' insert removed to prevent double-counting.
     if (totalPoints > 0) {
-      await pool.request()
-        .input('userId', sql.Int, userId)
-        .input('pts', sql.Int, totalPoints)
-        .input('note', sql.NVarChar, `Quiz completed on ${today} with ${correctCount} correct answers.`)
-        .query(`
-          INSERT INTO employee_rewards (employee_id, reward_name, points, category, granted_by, note)
-          VALUES (@userId, 'Points Earned By Quiz', @pts, 'Quiz', 202515, @note)
-        `);
-      console.log(`[QUIZ REWARD] Granted ${totalPoints} points to user ${userId} for quiz completion.`);
+      console.log(`[QUIZ REWARD] User ${userId} earned ${totalPoints} points for quiz completion.`);
     }
 
     res.json({
@@ -10359,25 +10533,25 @@ app.get('/api/resignations', verifyToken, async (req, res) => {
 
     // --- Role-Based Security Filter ---
     if (!isAdmin) {
-        if (isManager) {
-            // Managers/Leads: See their direct team members OR their own resignation
-            query += ' AND (u.reporting_manager_id = @currentUserId OR r.employee_id = @currentUserId)';
-            request.input('currentUserId', sql.Int, req.user.id);
-        } else {
-            // Regular Employees: See only their own resignation
-            query += ' AND r.employee_id = @currentUserId';
-            request.input('currentUserId', sql.Int, req.user.id);
-        }
+      if (isManager) {
+        // Managers/Leads: See their direct team members OR their own resignation
+        query += ' AND (u.reporting_manager_id = @currentUserId OR r.employee_id = @currentUserId)';
+        request.input('currentUserId', sql.Int, req.user.id);
+      } else {
+        // Regular Employees: See only their own resignation
+        query += ' AND r.employee_id = @currentUserId';
+        request.input('currentUserId', sql.Int, req.user.id);
+      }
     } else {
-        // Admin/HR: Full access, but respect filters if provided by frontend
-        if (employeeId) {
-            query += ' AND r.employee_id = @employeeId';
-            request.input('employeeId', sql.Int, employeeId);
-        }
-        if (managerId) {
-            query += ' AND u.reporting_manager_id = @managerId';
-            request.input('managerId', sql.Int, managerId);
-        }
+      // Admin/HR: Full access, but respect filters if provided by frontend
+      if (employeeId) {
+        query += ' AND r.employee_id = @employeeId';
+        request.input('employeeId', sql.Int, employeeId);
+      }
+      if (managerId) {
+        query += ' AND u.reporting_manager_id = @managerId';
+        request.input('managerId', sql.Int, managerId);
+      }
     }
 
     if (status) {
@@ -10430,27 +10604,27 @@ app.put('/api/resignations/:id', verifyToken, async (req, res) => {
   try {
     const pool = await getPool();
     const request = pool.request().input('id', sql.Int, id);
-    
+
     let updates = ['updated_at = GETDATE()'];
-    if (status) { 
-      updates.push('status = @status'); 
-      request.input('status', sql.NVarChar, status); 
+    if (status) {
+      updates.push('status = @status');
+      request.input('status', sql.NVarChar, status);
     }
-    if (reporting_manager_remark) { 
-      updates.push('reporting_manager_remark = @rmRemark'); 
-      request.input('rmRemark', sql.NVarChar, reporting_manager_remark); 
+    if (reporting_manager_remark) {
+      updates.push('reporting_manager_remark = @rmRemark');
+      request.input('rmRemark', sql.NVarChar, reporting_manager_remark);
     }
-    if (project_manager_remark) { 
-      updates.push('project_manager_remark = @pmRemark'); 
-      request.input('pmRemark', sql.NVarChar, project_manager_remark); 
+    if (project_manager_remark) {
+      updates.push('project_manager_remark = @pmRemark');
+      request.input('pmRemark', sql.NVarChar, project_manager_remark);
     }
-    if (hr_remark) { 
-      updates.push('hr_remark = @hrRemark'); 
-      request.input('hrRemark', sql.NVarChar, hr_remark); 
+    if (hr_remark) {
+      updates.push('hr_remark = @hrRemark');
+      request.input('hrRemark', sql.NVarChar, hr_remark);
     }
-    if (last_working_day) { 
-      updates.push('last_working_day = @lwd'); 
-      request.input('lwd', sql.Date, last_working_day); 
+    if (last_working_day) {
+      updates.push('last_working_day = @lwd');
+      request.input('lwd', sql.Date, last_working_day);
     }
 
     if (updates.length === 1) return res.status(400).json({ error: 'No fields provided for update' });
@@ -10557,7 +10731,7 @@ app.put('/api/service-certificates/:id', verifyToken, async (req, res) => {
   try {
     const pool = await getPool();
     const request = pool.request().input('id', sql.Int, id);
-    
+
     let updates = ['updated_at = GETDATE()'];
     if (status) { updates.push('status = @status'); request.input('status', sql.NVarChar, status); }
     if (admin_remark) { updates.push('admin_remark = @remark'); request.input('remark', sql.NVarChar, admin_remark); }
