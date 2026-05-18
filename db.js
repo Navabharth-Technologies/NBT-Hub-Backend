@@ -5,7 +5,7 @@ const dbConfig = {
     password: process.env.DB_PASSWORD || 'sa#7744',
     server: process.env.DB_SERVER || 'localhost',
     database: process.env.DB_NAME || 'NBT Hub',
-    port: 1433,
+    port: process.env.DB_PORT ? parseInt(process.env.DB_PORT) : undefined,
     options: {
         encrypt: false,
         trustServerCertificate: true,
