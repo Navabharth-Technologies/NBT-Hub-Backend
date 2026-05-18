@@ -3,7 +3,7 @@ const sql = require('mssql');
 const dbConfig = {
     user: process.env.DB_USER || 'sa',
     password: process.env.DB_PASSWORD || 'sa#7744',
-    server: process.env.DB_SERVER || 'localhost',
+    server: process.env.DB_SERVER || 'Anup\\SQLEXPRESS01',
     database: process.env.DB_NAME || 'NBT Hub',
     port: 1433,
     options: {
