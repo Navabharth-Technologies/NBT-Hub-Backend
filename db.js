@@ -3,7 +3,7 @@ const sql = require('mssql');
 const dbConfig = {
     user: process.env.DB_USER || 'sa',
     password: process.env.DB_PASSWORD || 'sa#7744',
-    server: process.env.DB_SERVER || 'localhost',
+    server: process.env.DB_SERVER || '192.168.1.8\\SQLEXPRESS01',
     database: process.env.DB_NAME || 'NBT Hub',
     port: process.env.DB_PORT ? parseInt(process.env.DB_PORT) : undefined,
     options: {
