@@ -122,13 +122,23 @@ async function importRange(fromDateStr, toDateStr) {
                                 workTime = `${String(Math.floor(diff / 60)).padStart(2, '0')}:${String(diff % 60).padStart(2, '0')}`;
                                 
                                 const totalHours = Math.floor(diff / 60) + (diff % 60 / 60);
-                                if (totalHours >= 8) finalStatus = 'P';
-                                else if (totalHours >= 5) finalStatus = 'Half Day';
-                                else finalStatus = 'A';
+                                if (inTime > '10:15') {
+                                    // Late login locked to Half Day or Absent
+                                    if (totalHours >= 5) finalStatus = 'Half Day';
+                                    else finalStatus = 'A';
+                                } else {
+                                    if (totalHours >= 8) finalStatus = 'P';
+                                    else if (totalHours >= 5) finalStatus = 'Half Day';
+                                    else finalStatus = 'A';
+                                }
                             } catch (e) { finalStatus = apiLog.Status || 'A'; }
                         } else if (inTime) {
                             const isToday = dateKey === new Date().toISOString().split('T')[0];
-                            finalStatus = isToday ? 'In Office' : 'A';
+                            if (inTime > '10:15') {
+                                finalStatus = 'Half Day';
+                            } else {
+                                finalStatus = isToday ? 'In Office' : 'A';
+                            }
                         }
                     }
                 }

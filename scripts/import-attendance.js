@@ -122,23 +122,32 @@ async function importAttendance() {
                     if (!isMissing(log.INTime) && isMissing(log.OUTTime)) {
                         // User has punched in but not out
                         if (isToday) {
-                            finalStatus = 'In Office';
+                            finalStatus = log.INTime > '10:15' ? 'Half Day' : 'In Office';
                         } else {
                             // If it was a past day and they never punched out, it's Absent
                             finalStatus = 'A';
                         }
                     } else if (!isMissing(log.INTime) && !isMissing(log.OUTTime)) {
-                        // Both punches exist, calculate based on hours
+                        // Both punches exist, calculate based on hours & late login penalty
                         try {
                             const [h, m] = manualWorkTime.split(':').map(n => parseInt(n, 10));
                             const totalHours = h + (m / 60);
 
-                            if (totalHours >= 8) {
-                                finalStatus = 'P';
-                            } else if (totalHours >= 5 && totalHours < 8) {
-                                finalStatus = 'Half Day';
+                            if (log.INTime > '10:15') {
+                                // Late login locked to Half Day or Absent
+                                if (totalHours >= 5) {
+                                    finalStatus = 'Half Day';
+                                } else {
+                                    finalStatus = 'A';
+                                }
                             } else {
-                                finalStatus = 'A';
+                                if (totalHours >= 8) {
+                                    finalStatus = 'P';
+                                } else if (totalHours >= 5 && totalHours < 8) {
+                                    finalStatus = 'Half Day';
+                                } else {
+                                    finalStatus = 'A';
+                                }
                             }
                         } catch (e) {
                             console.warn(`   ⚠️ Failed to parse WorkTime for Empcode ${log.Empcode}: ${manualWorkTime}`);

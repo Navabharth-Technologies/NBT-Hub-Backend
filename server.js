@@ -7,13 +7,123 @@ const compression = require('compression');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const emailjs = require('@emailjs/nodejs');
-const EMAILJS_CONFIG = {
-  serviceId: process.env.EMAILJS_SERVICE_ID,
-  reminderTemplateId: process.env.EMAILJS_REMINDER_TEMPLATE_ID || process.env.EMAILJS_TEMPLATE_ID,
-  warningTemplateId: process.env.EMAILJS_WARNING_TEMPLATE_ID || process.env.EMAILJS_TEMPLATE_ID,
-  publicKey: process.env.EMAILJS_PUBLIC_KEY,
-  privateKey: process.env.EMAILJS_PRIVATE_KEY
+const nodemailer = require('nodemailer');
+const { getCertificateEmailHtml, generateCertificateHtml } = require('./templates/certificateEmailTemplate');
+const { getOtpEmailHtml } = require('./templates/otpEmailTemplate');
+const { getSaturdayReminderHtml, getSaturdayFinalWarningHtml } = require('./templates/saturdayReminderTemplate');
+const { getPromotionReminderHtml } = require('./templates/promotionReminderTemplate');
+
+// --- SMTP CONFIGURATION (Nodemailer) --- //
+const mailTransporter = nodemailer.createTransport({
+  service: 'gmail',
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS
+  }
+});
+
+/**
+ * Centralized Email Sender using SMTP
+ */
+const sendAppEmail = async ({ to, subject, html, text, attachments }) => {
+  try {
+    const finalAttachments = [...(attachments || [])];
+
+    // Automatically attach the company logo as a CID for use in templates
+    const logoPath = path.join(__dirname, 'assets', 'NBT logo.png');
+    if (fs.existsSync(logoPath)) {
+      console.log(`[MAILER] Attaching logo from: ${logoPath}`);
+      finalAttachments.push({
+        filename: 'NBT logo.png',
+        path: logoPath,
+        cid: 'NBTLogo' // Clean ID matching the user's naming preference
+      });
+    } else {
+      console.warn(`[MAILER WARNING] Logo file not found at: ${logoPath}`);
+    }
+
+
+    const info = await mailTransporter.sendMail({
+      from: `"NBT Hub Management" <${process.env.EMAIL_USER}>`,
+      to,
+      subject,
+      text: text || 'This email requires an HTML compatible mail client.',
+      html,
+      attachments: finalAttachments
+    });
+
+    Log.success('Email', `Sent: "${subject}" to ${to}`);
+    return info;
+  } catch (err) {
+    console.error('[SMTP ERROR]:', err.message);
+    throw err;
+  }
+};
+
+/**
+ * Sends a personalised course completion certificate email.
+ * Shows ONLY the certificate.png with name/course/date overlaid
+ * at the exact blank-box positions. No extra header or footer.
+ */
+const sendCertificateEmail = async (toEmail, userName, courseName) => {
+  const { createCanvas, loadImage } = require('canvas');
+  const certPath = path.join(__dirname, 'assets', 'certificate_final.png');
+
+  const currentDate = new Date().toLocaleDateString('en-IN', {
+    day: '2-digit', month: 'long', year: 'numeric'
+  });
+
+  let generatedCertBuffer = null;
+  try {
+    const image = await loadImage(certPath);
+    const canvas = createCanvas(image.width, image.height);
+    const ctx = canvas.getContext('2d');
+
+    // Draw the certificate background
+    ctx.drawImage(image, 0, 0, image.width, image.height);
+
+    // 1. Employee Name: Capitalized, Stylish Font, Custom Color
+    ctx.font = 'italic bold 115px "Georgia", "Times New Roman", serif';
+    ctx.fillStyle = '#000000ff'; // Royal Navy Blue to match certificate borders
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillText(userName.toUpperCase(), image.width / 2, 725);
+
+    // 2. Course Name: Clean, Professional Serif Font
+    ctx.font = 'bold 50px "Georgia", "Times New Roman", serif';
+    ctx.fillStyle = '#1e3a8a'; // Professional Navy Blue to match the rest of the text
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'alphabetic';
+    // Placed right below "Successfully Completed the"
+    ctx.fillText(`"${courseName}"`, image.width / 2, 882);
+
+    // 3. Date: Tighter alignment to the "DATE:" label
+    ctx.font = 'bold 37px Arial, sans-serif';
+    ctx.fillStyle = '#1e3a8a'; // Match the exact navy blue of the "DATE:" label
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    // Positioned closer to the "DATE:" label and nudged down for perfect baseline match
+    ctx.fillText(currentDate, 535, 1173);
+
+    generatedCertBuffer = canvas.toBuffer('image/png');
+  } catch (err) {
+    console.error('Error generating certificate image:', err);
+  }
+
+  const html = getCertificateEmailHtml(userName, courseName);
+
+  return sendAppEmail({
+    to: toEmail,
+    subject: `🎓 Certificate of Completion – ${courseName}`,
+    html,
+    text: `Congratulations ${userName}! You have successfully completed the "${courseName}" course. Please find your official certificate attached to this email.`,
+    attachments: generatedCertBuffer ? [
+      {
+        filename: `${courseName.replace(/\s+/g, '_')}_Certificate.png`,
+        content: generatedCertBuffer
+      }
+    ] : []
+  });
 };
 
 // --- CRITICAL ERROR LOGGING --- //
@@ -335,6 +445,16 @@ const emojiMap = {
   cake: '🎂'
 };
 
+/**
+ * Centralized HR/Admin role detection.
+ * Matches: 'Human Resource', 'HR', 'CEO', 'Admin', 'Superadmin', 'Founder & CEO', etc.
+ */
+const isHRRole = (role) => {
+  if (!role) return false;
+  const r = role.toLowerCase();
+  return r.includes('human resource') || r === 'hr' || r.includes('ceo') || r.includes('admin') || r.includes('super') || r.includes('founder');
+};
+
 // Middleware
 // 1. Corrected CORS (Origin: true allows credentials to sync with any incoming requester)
 app.use(cors({
@@ -416,32 +536,60 @@ app.get('/api/status', (req, res) => {
 
 /**
  * Central Security Utility: Verifies a JWT and checks for revocation (Global Logout).
- * Returns the decoded payload if valid and active, null otherwise.
+ * Returns { user, reason } — user is the decoded payload if valid, null otherwise.
+ * 'reason' provides a machine-readable rejection code for the frontend.
+ *   - 'password_changed'  → token_version mismatch (password was changed or global logout triggered)
+ *   - 'account_deleted'   → user no longer exists in the database
+ *   - 'token_expired'     → JWT expiry reached
+ *   - 'token_invalid'     → JWT signature mismatch or tampering
+ *   - 'server_error'      → database or internal error during verification
  */
 const getVerifiedUser = async (token) => {
-  if (!token) return null;
+  if (!token) return { user: null, reason: 'no_token' };
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET || 'fallback_secret_key');
-    if (!decoded || !decoded.id) return null;
+    if (!decoded || !decoded.id) return { user: null, reason: 'token_invalid' };
 
     const pool = await getPool();
+    if (!pool) {
+      Log.error('AUTH', 'Database pool not available during token verification');
+      return { user: null, reason: 'server_error' };
+    }
+
     let table = 'users';
     if (decoded.userType === 'new_joinee') table = 'new_joinees';
-    if (decoded.userType === 'intern') table = 'interns';
+    else if (decoded.userType === 'intern') table = 'interns';
 
     const result = await pool.request()
       .input('id', sql.Int, decoded.id)
       .query(`SELECT token_version FROM ${table} WHERE id = @id`);
 
-    if (result.recordset.length > 0) {
-      const currentVersion = result.recordset[0].token_version || 0;
-      const tokenVersion = decoded.token_version || 0;
-      // REJECTION LOGIC: If DB has a newer version, the token is stale/revoked
-      if (tokenVersion < currentVersion) return null;
+    if (result.recordset.length === 0) {
+      Log.auth(`Account Not Found: User ID ${decoded.id} in ${table}`, 'This account may have been deleted or the token is for a different environment.');
+      return { user: null, reason: 'account_deleted' };
     }
-    return decoded;
+
+    const currentVersion = result.recordset[0].token_version || 0;
+    const tokenVersion = decoded.token_version || 0;
+
+    // REJECTION LOGIC: If DB has a newer version, the token is stale/revoked
+    if (tokenVersion < currentVersion) {
+      Log.auth(`Revoked Token for ${decoded.email}`, `Session invalidated — token v${tokenVersion} < DB v${currentVersion} (password changed or global logout).`);
+      return { user: null, reason: 'password_changed' };
+    }
+
+    return { user: decoded, reason: null };
   } catch (err) {
-    return null;
+    if (err.name === 'TokenExpiredError') {
+      Log.auth('Session Expired', 'The provided token has expired. Please log in again.');
+      return { user: null, reason: 'token_expired' };
+    } else if (err.name === 'JsonWebTokenError') {
+      Log.auth('Invalid Token Signature', 'The token has been tampered with or the server secret has changed.');
+      return { user: null, reason: 'token_invalid' };
+    } else {
+      Log.error('AUTH', `Token verification failed: ${err.message}`);
+      return { user: null, reason: 'server_error' };
+    }
   }
 };
 
@@ -452,10 +600,28 @@ const verifyToken = async (req, res, next) => {
     return res.status(403).json({ error: 'No token provided' });
   }
 
-  const decoded = await getVerifiedUser(token);
+  const { user: decoded, reason } = await getVerifiedUser(token);
   if (!decoded) {
-    Log.auth('Invalid, Expired or Revoked Token signature', 'Your session might have been invalidated globally.');
-    return res.status(401).json({ error: 'Session expired. Please log in again.', globalLogout: true });
+    // Build a user-friendly message based on the specific rejection reason
+    let message = 'Session expired. Please log in again.';
+    let responseReason = reason || 'session_expired';
+
+    if (reason === 'password_changed') {
+      message = 'Your password was changed. Please log in again with your new password.';
+    } else if (reason === 'account_deleted') {
+      message = 'Your account could not be found. Please contact your administrator.';
+    } else if (reason === 'token_expired') {
+      message = 'Your session has expired. Please log in again.';
+    } else if (reason === 'token_invalid') {
+      message = 'Your session is invalid. Please log in again.';
+    }
+
+    Log.auth(`Token rejected [${responseReason}]`, message);
+    return res.status(401).json({
+      error: message,
+      reason: responseReason,
+      globalLogout: true
+    });
   }
 
   req.user = decoded;
@@ -995,15 +1161,15 @@ app.post('/api/new-joinee/login', async (req, res) => {
  * 2.D Request Password Reset OTP
  * Generates a 6-digit code and prints it to the terminal for administrative recovery.
  */
-app.post('/api/password/request-otp', async (req, res) => {
+app.post(['/api/password/request-otp', '/api/auth/request-otp'], async (req, res) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ error: 'Email is required' });
 
   try {
     const pool = await getPool();
     // Check both tables
-    const userResult = await pool.request().input('email', sql.NVarChar, email).query('SELECT id FROM users WHERE email = @email');
-    const joineeResult = await pool.request().input('email', sql.NVarChar, email).query('SELECT id FROM new_joinees WHERE email_id = @email');
+    const userResult = await pool.request().input('email', sql.NVarChar, email).query('SELECT id, name FROM users WHERE email = @email');
+    const joineeResult = await pool.request().input('email', sql.NVarChar, email).query('SELECT id, name FROM new_joinees WHERE email_id = @email');
 
     if (userResult.recordset.length === 0 && joineeResult.recordset.length === 0) {
       return res.status(404).json({ error: 'User not found in NBT system' });
@@ -1015,15 +1181,31 @@ app.post('/api/password/request-otp', async (req, res) => {
 
     otps.set(email, { otp, expires });
 
-    // Premium Terminal Output
-    console.log('\n' + Log.gold + Log.bold + 'â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—' + Log.reset);
-    console.log(Log.gold + Log.bold + 'â•‘  ðŸ”‘  PASSWORD RESET OTP GENERATED        â•‘' + Log.reset);
-    console.log(Log.gold + Log.bold + 'â• â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• ' + Log.reset);
-    console.log(Log.gold + Log.bold + `â•‘  User : ${email.padEnd(31)}  â•‘` + Log.reset);
-    console.log(Log.gold + Log.bold + `â•‘  Code : ${Log.emerald}${Log.bold}${otp}${Log.gold}${Log.bold}                           â•‘` + Log.reset);
-    console.log(Log.gold + Log.bold + 'â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• \n' + Log.reset);
+    // Send email with OTP
+    const userName = (userResult.recordset[0]?.name || joineeResult.recordset[0]?.name || 'User');
+    const htmlContent = getOtpEmailHtml(userName, otp);
 
-    res.json({ success: true, message: 'OTP generated and printed to server console.' });
+    try {
+      await sendAppEmail({
+        to: email,
+        subject: 'Your Password Reset OTP - Navabharath Technologies',
+        html: htmlContent
+      });
+      Log.success('Auth', `Password reset OTP sent to ${email}`);
+    } catch (emailErr) {
+      console.error('[OTP EMAIL ERROR]:', emailErr);
+      return res.status(500).json({ error: 'Failed to send OTP to email address. Please contact admin.' });
+    }
+
+    // Premium Terminal Output
+    console.log('\n' + Log.gold + Log.bold + '╔══════════════════════════════════════════════╗' + Log.reset);
+    console.log(Log.gold + Log.bold + '║  🔑  PASSWORD RESET OTP GENERATED        ║' + Log.reset);
+    console.log(Log.gold + Log.bold + '╠══════════════════════════════════════════════╣' + Log.reset);
+    console.log(Log.gold + Log.bold + `║  User : ${email.padEnd(31)}  ║` + Log.reset);
+    console.log(Log.gold + Log.bold + `║  Code : ${Log.emerald}${Log.bold}${otp}${Log.gold}${Log.bold}                           ║` + Log.reset);
+    console.log(Log.gold + Log.bold + '╚══════════════════════════════════════════════╝\n' + Log.reset);
+
+    res.json({ success: true, message: 'OTP sent to your email address successfully.' });
   } catch (err) {
     console.error('[OTP REQUEST ERROR]:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -1033,7 +1215,7 @@ app.post('/api/password/request-otp', async (req, res) => {
 /**
  * 2.D.1 Verify OTP (Frontend auxiliary check)
  */
-app.post('/api/password/verify-otp', async (req, res) => {
+app.post(['/api/password/verify-otp', '/api/auth/verify-otp'], async (req, res) => {
   const { email, otp } = req.body;
   if (!email || !otp) return res.status(400).json({ error: 'Email and OTP required' });
 
@@ -1048,7 +1230,7 @@ app.post('/api/password/verify-otp', async (req, res) => {
 /**
  * 2.E Reset Password with OTP
  */
-app.post('/api/password/reset-with-otp', async (req, res) => {
+app.post(['/api/password/reset-with-otp', '/api/auth/reset-with-otp'], async (req, res) => {
   const { email, otp, newPassword } = req.body;
   if (!email || !otp || !newPassword) return res.status(400).json({ error: 'All fields are required' });
 
@@ -1088,26 +1270,31 @@ app.post('/api/password/reset-with-otp', async (req, res) => {
  */
 app.post(['/api/password/change-password', '/api/profile/update-password'], verifyToken, async (req, res) => {
   const { oldPassword, newPassword, logoutAllDevices } = req.body;
+  const userId = req.user.id;
   const email = req.user.email;
   const userType = req.user.userType;
 
   if (!oldPassword || !newPassword) return res.status(400).json({ error: 'Old and new passwords required' });
+  if (newPassword.length < 4) return res.status(400).json({ error: 'New password must be at least 4 characters' });
 
   try {
     const pool = await getPool();
-    const table = userType === 'new_joinee' ? 'new_joinees' : 'users';
-    const emailCol = userType === 'new_joinee' ? 'email_id' : 'email';
+    let table = 'users';
+    let emailCol = 'email';
+    if (userType === 'new_joinee') { table = 'new_joinees'; emailCol = 'email_id'; }
+    else if (userType === 'intern') { table = 'interns'; emailCol = 'email'; }
 
     const result = await pool.request()
-      .input('email', sql.NVarChar, email)
-      .query(`SELECT password, token_version FROM ${table} WHERE ${emailCol} = @email`);
+      .input('id', sql.Int, userId)
+      .query(`SELECT password, token_version FROM ${table} WHERE id = @id`);
 
     if (result.recordset.length === 0) return res.status(404).json({ error: 'User not found' });
 
     const currentPass = result.recordset[0].password;
+    const currentTokenVersion = result.recordset[0].token_version || 0;
     let isMatch = false;
 
-    if (userType === 'new_joinee') {
+    if (userType === 'new_joinee' || userType === 'intern') {
       isMatch = (oldPassword === currentPass);
     } else {
       isMatch = await bcrypt.compare(oldPassword, currentPass);
@@ -1115,19 +1302,39 @@ app.post(['/api/password/change-password', '/api/profile/update-password'], veri
 
     if (!isMatch) return res.status(401).json({ error: 'Incorrect old password' });
 
-    const finalValue = userType === 'new_joinee' ? newPassword : await bcrypt.hash(newPassword, 10);
+    const finalValue = (userType === 'new_joinee' || userType === 'intern') ? newPassword : await bcrypt.hash(newPassword, 10);
+    const newTokenVersion = currentTokenVersion + 1;
 
-    // SECURITY: Always trigger a Global Logout (increment token_version) on password change by default
-    let query = `UPDATE ${table} SET password = @pass, token_version = ISNULL(token_version, 0) + 1`;
-    query += ` WHERE ${emailCol} = @email`;
-
+    // SECURITY: Always increment token_version on password change → invalidates ALL existing sessions
     await pool.request()
       .input('pass', sql.NVarChar, finalValue)
-      .input('email', sql.NVarChar, email)
-      .query(query);
+      .input('id', sql.Int, userId)
+      .input('newVersion', sql.Int, newTokenVersion)
+      .query(`UPDATE ${table} SET password = @pass, token_version = @newVersion WHERE id = @id`);
 
-    Log.success('Auth', `Password changed by user for ${email} (Automatic Global Logout triggered)`);
-    res.json({ success: true, message: 'Password changed successfully. You have been logged out of all other devices.', logoutAll: true });
+    // Generate a FRESH token for the current device with the new token_version
+    // This ensures the device that changed the password stays logged in
+    const freshToken = jwt.sign(
+      {
+        id: userId,
+        email: email,
+        role: req.user.role,
+        name: req.user.name,
+        employee_id: userId,
+        userType: userType,
+        token_version: newTokenVersion
+      },
+      process.env.JWT_SECRET || 'fallback_secret_key',
+      { expiresIn: '365d' }
+    );
+
+    Log.success('Auth', `Password changed for ${email} → token_version bumped to v${newTokenVersion} (all other sessions invalidated)`);
+    res.json({
+      success: true,
+      message: 'Password changed successfully. All other devices have been logged out.',
+      logoutAll: true,
+      token: freshToken  // Frontend MUST save this new token to stay authenticated
+    });
   } catch (err) {
     console.error('[CHANGE PASSWORD ERROR]:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -1139,19 +1346,28 @@ app.post(['/api/password/change-password', '/api/profile/update-password'], veri
  */
 app.post('/api/logout/global', verifyToken, async (req, res) => {
   const { id, userType, email } = req.user;
-  
+
   try {
     const pool = await getPool();
     let table = 'users';
     if (userType === 'new_joinee') table = 'new_joinees';
-    if (userType === 'intern') table = 'interns';
+    else if (userType === 'intern') table = 'interns';
+
+    // Get current version so we can set the new one precisely
+    const versionRes = await pool.request()
+      .input('id', sql.Int, id)
+      .query(`SELECT token_version FROM ${table} WHERE id = @id`);
+
+    const currentVersion = versionRes.recordset.length > 0 ? (versionRes.recordset[0].token_version || 0) : 0;
+    const newVersion = currentVersion + 1;
 
     await pool.request()
       .input('id', sql.Int, id)
-      .query(`UPDATE ${table} SET token_version = ISNULL(token_version, 0) + 1 WHERE id = @id`);
+      .input('newVersion', sql.Int, newVersion)
+      .query(`UPDATE ${table} SET token_version = @newVersion WHERE id = @id`);
 
-    Log.auth(`Global Logout performed for ${email}`, 'All active sessions have been invalidated.');
-    res.json({ success: true, message: 'Logged out from all devices successfully.' });
+    Log.auth(`Global Logout performed for ${email}`, `token_version bumped to v${newVersion}. All active sessions invalidated.`);
+    res.json({ success: true, message: 'Logged out from all devices successfully.', logoutAll: true });
   } catch (err) {
     console.error('[GLOBAL LOGOUT ERROR]:', err);
     res.status(500).json({ error: 'Failed to perform global logout' });
@@ -2100,8 +2316,9 @@ app.post('/api/managers/upload-image', verifyToken, memoryUpload.any(), async (r
 /**
  * 4E. Dedicated Document Upload (Handles Onboarding Docs)
  */
-app.post(['/api/profile/upload-doc', '/api/profile/upload-document'], verifyToken, memoryUpload.any(), async (req, res) => {
-  const { userId, docType } = req.body;
+app.post(['/api/profile/upload-doc', '/api/profile/upload-document', '/api/upload-document'], verifyToken, memoryUpload.any(), async (req, res) => {
+  const docType = req.body.docType || '';
+  const userId = sanitizeNumericId(req.body.userId) || req.user.id;
   let fileData = req.body.fileData || req.body.base64;
 
   const uploadedFile = req.files && req.files.length > 0 ? req.files[0] : req.file;
@@ -2117,20 +2334,22 @@ app.post(['/api/profile/upload-doc', '/api/profile/upload-document'], verifyToke
   // Map user-friendly names to DB columns
   const columnMap = {
     'pancard': 'pancard_photo',
-    'aadhar': 'adharcard_photo',
-    'experience': 'experience_letter_photo',
     'pan_card': 'pancard_photo',
+    'aadhar': 'adharcard_photo',
     'aadhar_card': 'adharcard_photo',
+    'experience': 'experience_letter_photo',
     'voterid': 'voter_id_photo',
+    'voter_id': 'voter_id_photo',
     'passport': 'passport_photo',
     'payslip': 'previous_company_payslip',
     'passbook': 'passbook_photo',
+    'bank_passbook': 'passbook_photo',
     'sslc_marks': 'sslc_markscard',
     'puc_marks': 'puc_markscard',
     'ug_pg_marks': 'ug_pg_markscard'
   };
 
-  const dbColumn = columnMap[docType.toLowerCase()] || docType;
+  const dbColumn = columnMap[docType.toLowerCase()] || docType.replace(/\s+/g, '_');
 
   try {
     const pool = await getPool();
@@ -2141,11 +2360,11 @@ app.post(['/api/profile/upload-doc', '/api/profile/upload-document'], verifyToke
     const result = await request.query(`
       IF EXISTS (SELECT 1 FROM employee_profiles WHERE employee_id = @empId)
       BEGIN
-        UPDATE employee_profiles SET ${dbColumn} = @data, updated_at = GETDATE() WHERE employee_id = @empId
+        UPDATE employee_profiles SET [${dbColumn}] = @data, updated_at = GETDATE() WHERE employee_id = @empId
       END
       ELSE
       BEGIN
-        INSERT INTO employee_profiles (employee_id, ${dbColumn}, updated_at) VALUES (@empId, @data, GETDATE())
+        INSERT INTO employee_profiles (employee_id, [${dbColumn}], updated_at) VALUES (@empId, @data, GETDATE())
       END
     `);
 
@@ -2373,6 +2592,24 @@ app.post(['/api/leaves', '/api/leave'], verifyToken, async (req, res) => {
     return res.status(400).json({ error: 'Leave type, start date, and end date are required', received: { leave_type, start_date, end_date } });
   }
 
+  // --- NEW: DATE RESTRICTIONS (Backdate & Same-Day Half-Day Enforce) ---
+  const istNow = new Date(new Date().getTime() + (330 * 60 * 1000));
+  const istTodayStr = istNow.toISOString().split('T')[0];
+  const reqStartDateStr = new Date(start_date).toISOString().split('T')[0];
+
+  if (reqStartDateStr < istTodayStr) {
+    return res.status(400).json({
+      error: 'Backdated leave requests are restricted. Please apply for future dates or contact HR for past adjustments.'
+    });
+  }
+
+  if (reqStartDateStr === istTodayStr && !is_half_day) {
+    return res.status(400).json({
+      error: 'Same-day leave requests are restricted to Half Day only. Full day leaves must be requested at least one day in advance.'
+    });
+  }
+  // ----------------------------------------------------------------------
+
   try {
     const pool = await getPool();
 
@@ -2395,6 +2632,30 @@ app.post(['/api/leaves', '/api/leave'], verifyToken, async (req, res) => {
     }
 
     const { name, role, leave_balance, reporting_manager_id, joining_date, hierarchy_pm_id } = userResult.recordset[0];
+
+    // --- NEW: EARNED LEAVE RESTRICTION (1 Year Minimum Service) ---
+    const normalizedLeaveType = (leave_type || '').toString().trim().toLowerCase().replace(/[\s_]/g, '');
+    const isEarnedLeave = normalizedLeaveType.includes('earnedleave');
+
+    if (isEarnedLeave) {
+      if (!joining_date) {
+        return res.status(400).json({
+          error: 'Earned Leave Restricted',
+          message: 'Earned Leaves are only available after completing 1 year of service. Your joining date is not configured on your profile.'
+        });
+      }
+      const employeeJoiningDate = new Date(joining_date);
+      const oneYearAnniversary = new Date(employeeJoiningDate);
+      oneYearAnniversary.setFullYear(oneYearAnniversary.getFullYear() + 1);
+
+      if (istNow < oneYearAnniversary) {
+        return res.status(400).json({
+          error: 'Earned Leave Restricted',
+          message: `Earned Leaves are only available after completing 1 year of service. You will be eligible on ${oneYearAnniversary.toDateString()}.`
+        });
+      }
+    }
+    // --------------------------------------------------------------
 
     // DUPLICATE CHECK: Prevent multiple active requests for the same user on the same date
     const duplicateCheck = await pool.request()
@@ -2964,11 +3225,17 @@ app.post('/api/attendance_logs/punch', verifyToken, async (req, res) => {
 
     if (checkRes.recordset.length === 0) {
       // NO RECORD FOUND: THIS IS A PUNCH IN
+      let determinedStatus = status;
+      if (currentTimeString > '10:15') {
+        determinedStatus = 'Half Day';
+        console.log(`[PUNCH IN] User ${userId} checked in late at ${currentTimeString}. Status marked as Half Day.`);
+      }
+
       await pool.request()
         .input('userId', require('mssql').Int, userId)
         .input('punchDate', require('mssql').Date, punchDateString)
         .input('inTime', require('mssql').NVarChar, currentTimeString)
-        .input('status', require('mssql').NVarChar, status)
+        .input('status', require('mssql').NVarChar, determinedStatus)
         .input('remark', require('mssql').NVarChar, remark)
         .input('location', require('mssql').NVarChar, location)
         .query(`
@@ -2976,7 +3243,7 @@ app.post('/api/attendance_logs/punch', verifyToken, async (req, res) => {
           VALUES (@userId, @punchDate, @inTime, @status, @remark, GETDATE(), @location)
         `);
 
-      return res.json({ success: true, action: 'PUNCH_IN', time: currentTimeString, message: 'Punched In successfully via Web Application.' });
+      return res.json({ success: true, action: 'PUNCH_IN', time: currentTimeString, status: determinedStatus, message: 'Punched In successfully via Web Application.' });
     } else {
       // RECORD FOUND: THIS IS A PUNCH OUT (or an overwrite punch out)
       const existing = checkRes.recordset[0];
@@ -2994,14 +3261,23 @@ app.post('/api/attendance_logs/punch', verifyToken, async (req, res) => {
         const workM = diffMins % 60;
         workTimeStr = `${String(workH).padStart(2, '0')}:${String(workM).padStart(2, '0')}`;
 
-        // --- NEW: Calculate Status based on Work Time ---
+        // --- NEW: Calculate Status based on Work Time & Late Login Penalty ---
         const totalHours = workH + (workM / 60);
-        if (totalHours >= 8) {
-          status = 'P';
-        } else if (totalHours >= 5) {
-          status = 'Half Day';
+        if (inTimeStr > '10:15') {
+          // Locked to Half Day or Absent if late
+          if (totalHours >= 5) {
+            status = 'Half Day';
+          } else {
+            status = 'A';
+          }
         } else {
-          status = 'A';
+          if (totalHours >= 8) {
+            status = 'P';
+          } else if (totalHours >= 5) {
+            status = 'Half Day';
+          } else {
+            status = 'A';
+          }
         }
       }
 
@@ -3043,10 +3319,10 @@ app.get('/api/manager/attendance', verifyToken, async (req, res) => {
     const istTime = new Date(now.getTime() + (330 * 60 * 1000));
     const istDateOnly = istTime.toISOString().split('T')[0];
 
+    const { date, startDate, endDate } = req.query;
+
     // --- STEP 1: INSTANT DATABASE RETRIEVAL ---
-    const result = await pool.request()
-      .input('punchDate', sql.Date, istDateOnly)
-      .query(`
+    let queryStr = `
         SELECT 
           a.user_id as Empcode, 
           u.name as Name, 
@@ -3058,27 +3334,56 @@ app.get('/api/manager/attendance', verifyToken, async (req, res) => {
           a.remark as Remark
         FROM attendance_logs a
         JOIN users u ON a.user_id = u.id
-        WHERE a.punch_date = @punchDate
-      `);
+        WHERE 1=1
+    `;
+    const request = pool.request();
+
+    if (date) {
+      queryStr += ` AND a.punch_date = @punchDate`;
+      request.input('punchDate', sql.Date, date);
+    } else if (startDate && endDate) {
+      queryStr += ` AND a.punch_date >= @startDate AND a.punch_date <= @endDate`;
+      request.input('startDate', sql.Date, startDate);
+      request.input('endDate', sql.Date, endDate);
+    } else {
+      // Default to today if no date params provided
+      queryStr += ` AND a.punch_date = @punchDate`;
+      request.input('punchDate', sql.Date, istDateOnly);
+    }
+
+    queryStr += ` ORDER BY a.punch_date DESC, u.name ASC`;
+
+    const result = await request.query(queryStr);
 
     // --- STEP 2: FIRE-AND-FORGET BACKGROUND SYNC ---
     // This allows the response to be sent IMMEDIATELY while the sync runs in the background.
     // We use the existing importAttendance if available, or a local version.
-    if (typeof importAttendance === 'function') {
-      importAttendance().catch(err => console.error('[BG SYNC ERROR]:', err.message));
+    // Only run background sync if we are querying today's date
+    if ((!startDate && !endDate && !date) || date === istDateOnly) {
+      if (typeof importAttendance === 'function') {
+        importAttendance().catch(err => console.error('[BG SYNC ERROR]:', err.message));
+      }
     }
 
     const cleanTime = (t) => (!t || t === '--:--' || t === '00:00' || String(t).trim() === '') ? null : t;
     res.json({
       success: true,
       cached: true,
-      date: istDateOnly,
+      date: date || istDateOnly,
       count: result.recordset.length,
       data: result.recordset.map(log => ({
         ...log,
+        empCode: log.Empcode,
+        name: log.Name,
+        punchDate: log.PunchDate,
+        inTime: cleanTime(log.INTime),
+        outTime: cleanTime(log.OUTTime),
+        workTime: cleanTime(log.WorkTime),
         INTime: cleanTime(log.INTime),
         OUTTime: cleanTime(log.OUTTime),
-        WorkTime: cleanTime(log.WorkTime)
+        WorkTime: cleanTime(log.WorkTime),
+        status: log.Status,
+        remark: log.Remark
       }))
     });
 
@@ -3609,14 +3914,11 @@ app.delete('/api/admin/holidays/:id', verifyToken, async (req, res) => {
 app.get('/api/roster/:type', async (req, res) => {
   const table = req.params.type.toLowerCase();
 
-  // Security Sanitization: Forcefully validate against our known structural sub-tables
-  const validTables = [
-    'projectmanager', 'hr', 'teamleader', 'employee', 'superadmin',
-    'team_navabharatha', 'team_jkdmart_tokensboy', 'team_mlm',
-    'team_digital_field_marketing', 'team_testing', 'team_technical_support'
-  ];
+  // Security Sanitization: Allow core structural tables or any table starting with 'team_'
+  const baseTables = ['projectmanager', 'hr', 'teamleader', 'employee', 'superadmin'];
+  const isTeamTable = table.startsWith('team_');
 
-  if (!validTables.includes(table)) {
+  if (!baseTables.includes(table) && !isTeamTable) {
     return res.status(400).json({ error: 'Invalid roster type or restricted structural table' });
   }
 
@@ -3626,7 +3928,16 @@ app.get('/api/roster/:type', async (req, res) => {
       return res.status(503).json({ error: 'Database is currently offline' });
     }
 
-    const result = await pool.request().query(`SELECT emp_name, designation, emp_id, team_name FROM ${table} WITH (NOLOCK)`);
+    // Dynamic existence check to support newly created teams
+    const tableExists = await pool.request()
+      .input('t', sql.NVarChar, table)
+      .query("SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = @t");
+
+    if (tableExists.recordset.length === 0) {
+      return res.status(404).json({ error: `The team or roster table '${table}' does not exist in the database.` });
+    }
+
+    const result = await pool.request().query(`SELECT emp_name, designation, emp_id, team_name FROM [${table}] WITH (NOLOCK)`);
 
     // Camelcase specific field strings natively for the React frontend
     const formatted = result.recordset.map(r => ({
@@ -3640,6 +3951,77 @@ app.get('/api/roster/:type', async (req, res) => {
   } catch (err) {
     console.error(`Roster fetch failed for ${table}:`, err);
     res.status(500).json({ error: 'Failed to extract specialized roster array' });
+  }
+});
+
+/**
+ * 8.1 Create New Team Table (Admin/Manager)
+ */
+app.post('/api/admin/teams/create', verifyToken, async (req, res) => {
+  const role = (req.user.role || '').toLowerCase();
+  if (!role.includes('admin') && !role.includes('hr') && !role.includes('manager') && !role.includes('ceo')) {
+    return res.status(403).json({ error: 'Unauthorized: Only Admin/Manager can create teams.' });
+  }
+
+  const teamName = req.body.teamName || req.body.team_name;
+  console.log(`[TEAM CREATE] Attempt for Name: "${teamName}" | Body:`, req.body);
+
+  if (!teamName) return res.status(400).json({ error: 'teamName is required' });
+
+  // Sanitize table name: "Web Dev & Design" -> "team_web_dev_design"
+  const sanitizedName = teamName.toLowerCase().trim()
+    .replace(/\s+/g, '_')           // Replace spaces with underscores
+    .replace(/[^a-z0-9_]/g, '');    // Remove any non-alphanumeric characters except underscores
+
+  if (!sanitizedName) return res.status(400).json({ error: 'Invalid team name: Name must contain alphanumeric characters' });
+
+  const tableName = sanitizedName.startsWith('team_') ? sanitizedName : `team_${sanitizedName}`;
+
+  try {
+    const pool = await getPool();
+
+    // 1. Check if table already exists
+    const check = await pool.request()
+      .input('t', sql.NVarChar, tableName)
+      .query("SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = @t");
+
+    if (check.recordset.length > 0) {
+      return res.status(400).json({ error: `Team '${teamName}' already exists (Table: ${tableName})` });
+    }
+
+    // 2. Create the table with standard schema
+    await pool.request().query(`
+      CREATE TABLE [${tableName}] (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        user_id INT NOT NULL,
+        emp_name NVARCHAR(255) NOT NULL,
+        designation NVARCHAR(255),
+        emp_id INT,
+        team_name NVARCHAR(255),
+        reporting_manager NVARCHAR(255),
+        created_at DATETIME DEFAULT GETDATE()
+      )
+    `);
+
+    // 3. Assign members to the new team in the Users directory
+    const lead_id = sanitizeNumericId(req.body.lead_id || req.body.leadId);
+    const member_ids = Array.isArray(req.body.member_ids || req.body.memberIds) ? (req.body.member_ids || req.body.memberIds) : [];
+    const allIds = [lead_id, ...member_ids].filter(id => id !== null && id !== undefined);
+
+    if (allIds.length > 0) {
+      console.log(`[TEAM CREATE] Assigning ${allIds.length} members to new team: ${teamName}`);
+      const updateReq = pool.request();
+      updateReq.input('team', sql.NVarChar, teamName);
+      await updateReq.query(`UPDATE users SET team = @team WHERE id IN (${allIds.join(',')})`);
+
+      // Sync the specialized table immediately
+      await syncSpecificTeamTable(pool, null, teamName);
+    }
+
+    res.json({ success: true, message: `Team '${teamName}' created and members assigned successfully.`, tableName });
+  } catch (err) {
+    console.error('[CREATE TEAM ERROR]:', err);
+    res.status(500).json({ error: 'Failed to create team table', details: err.message });
   }
 });
 
@@ -3819,21 +4201,34 @@ app.get('/api/teams', async (req, res) => {
       return res.status(503).json({ error: 'Database is currently offline' });
     }
 
-    // OPTIMIZED: 2 queries total instead of 2N queries (N+1 eliminated)
-    // Query 1: Fetch ALL team members in one shot
+    // 1. Fetch all dynamic team tables from the database schema (using literal underscore escaping)
+    const tablesResult = await pool.request().query(`
+      SELECT TABLE_NAME 
+      FROM INFORMATION_SCHEMA.TABLES 
+      WHERE TABLE_TYPE = 'BASE TABLE' AND TABLE_NAME LIKE 'team[_]%'
+    `);
+
+    // 2. Fetch ALL users assigned to any team in a single request
     const allUsersResult = await pool.request().query(
       "SELECT name, role, email, team FROM users WITH (NOLOCK) WHERE team IS NOT NULL AND team <> ''"
     );
 
-    // Group by team in JS (avoids N separate DB round-trips)
+    // Group active users by team key (case-insensitive and normalized)
     const teamMap = {};
     for (const user of allUsersResult.recordset) {
-      const t = user.team;
-      if (!teamMap[t]) teamMap[t] = [];
-      teamMap[t].push({ name: user.name, role: user.role, email: user.email });
+      const t = (user.team || '').trim();
+      if (!t) continue;
+      const key = t.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+      if (!teamMap[key]) {
+        teamMap[key] = {
+          rawName: t,
+          members: []
+        };
+      }
+      teamMap[key].members.push({ name: user.name, role: user.role, email: user.email });
     }
 
-    // Query 2: Fetch the best lead per team (single query with ROW_NUMBER)
+    // 3. Fetch the best lead per team dynamically using ROW_NUMBER
     const leadResult = await pool.request().query(`
       SELECT team, name, role FROM (
         SELECT team, name, role,
@@ -3855,14 +4250,37 @@ app.get('/api/teams', async (req, res) => {
 
     const leadMap = {};
     for (const lead of leadResult.recordset) {
-      leadMap[lead.team] = { name: lead.name, role: lead.role };
+      const key = (lead.team || '').trim().toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+      leadMap[key] = { name: lead.name, role: lead.role };
     }
 
-    const teams = Object.keys(teamMap).map(teamName => {
-      const membersList = teamMap[teamName];
-      const lead = leadMap[teamName];
+    // 4. Map each unique team key (from both dynamic tables and active users) to a team object
+    const tableKeys = new Set(tablesResult.recordset.map(row => 
+      row.TABLE_NAME.toLowerCase().replace(/^team_/, '')
+    ));
+    const userKeys = Object.keys(teamMap);
+    const allKeys = [...new Set([...tableKeys, ...userKeys])];
+
+    const teams = allKeys.map(key => {
+      // Resolve human-readable name: use casing from users if matched, otherwise convert key
+      let teamName = '';
+      let membersList = [];
+      if (teamMap[key]) {
+        teamName = teamMap[key].rawName;
+        membersList = teamMap[key].members;
+      } else {
+        // Convert e.g., 'apj_warriors' -> 'Apj Warriors' / 'APJ Warriors'
+        let clean = key.replace(/_/g, ' ');
+        teamName = clean.replace(/\b\w/g, c => c.toUpperCase());
+        if (teamName.startsWith('Apj ')) {
+          teamName = 'APJ ' + teamName.substring(4);
+        }
+      }
+
+      const lead = leadMap[key];
+
       return {
-        id: teamName.toLowerCase().replace(/\s+/g, '_'),
+        id: key,
         name: teamName,
         description: `Active operations team for ${teamName}.`,
         lead: lead ? lead.name : 'Manager',
@@ -3902,6 +4320,17 @@ app.put('/api/admin/teams/rename', verifyToken, async (req, res) => {
 
   try {
     const pool = await getPool();
+
+    const sanitizedOld = oldName.toLowerCase().trim()
+      .replace(/\s+/g, '_')
+      .replace(/[^a-z0-9_]/g, '');
+    const oldTableName = sanitizedOld.startsWith('team_') ? sanitizedOld : `team_${sanitizedOld}`;
+
+    const sanitizedNew = newName.toLowerCase().trim()
+      .replace(/\s+/g, '_')
+      .replace(/[^a-z0-9_]/g, '');
+    const newTableName = sanitizedNew.startsWith('team_') ? sanitizedNew : `team_${sanitizedNew}`;
+
     const transaction = new sql.Transaction(pool);
     await transaction.begin();
 
@@ -3924,16 +4353,44 @@ app.put('/api/admin/teams/rename', verifyToken, async (req, res) => {
       taskReq.input('newName', sql.NVarChar, newName);
       await taskReq.query('UPDATE task_updates SET team = @newName WHERE team = @oldName');
 
+      // 4. Safely rename the specialized team table in the database if it exists
+      if (oldTableName !== newTableName) {
+        // Ensure table names contain only safe alphanumeric/underscore characters to prevent SQL injection
+        if (/^[a-zA-Z0-9_]+$/.test(oldTableName) && /^[a-zA-Z0-9_]+$/.test(newTableName)) {
+          // Check if old table exists
+          const checkOldReq = new sql.Request(transaction);
+          checkOldReq.input('oldTable', sql.NVarChar, oldTableName);
+          const checkOldRes = await checkOldReq.query("SELECT OBJECT_ID(@oldTable, N'U') AS id");
+
+          if (checkOldRes.recordset[0].id) {
+            // Check if new table already exists
+            const checkNewReq = new sql.Request(transaction);
+            checkNewReq.input('newTable', sql.NVarChar, newTableName);
+            const checkNewRes = await checkNewReq.query("SELECT OBJECT_ID(@newTable, N'U') AS id");
+
+            if (!checkNewRes.recordset[0].id) {
+              const renameReq = new sql.Request(transaction);
+              await renameReq.query(`EXEC sp_rename '${oldTableName}', '${newTableName}'`);
+              console.log(`[TEAM RENAME] Safely renamed table [${oldTableName}] to [${newTableName}] in database`);
+            } else {
+              console.warn(`[TEAM RENAME] Target table [${newTableName}] already exists. Skipping table rename.`);
+            }
+          } else {
+            console.warn(`[TEAM RENAME] Source table [${oldTableName}] does not exist. Skipping table rename.`);
+          }
+        }
+      }
+
       await transaction.commit();
 
-      // 4. Refresh Cache & Team-Specific Tables
+      // 5. Refresh Cache & Team-Specific Tables
       await syncSpecificTeamTable(pool, null, newName);
 
       Log.success('Team Management', `Team "${oldName}" successfully renamed to "${newName}" by ${req.user.name}`);
       res.json({
         success: true,
         message: `Team successfully renamed from "${oldName}" to "${newName}".`,
-        details: 'Changes applied to Users, Leaves, and Task records.'
+        details: 'Changes applied to Users, Leaves, Task records, and Database tables.'
       });
     } catch (err) {
       if (transaction) await transaction.rollback();
@@ -3944,6 +4401,138 @@ app.put('/api/admin/teams/rename', verifyToken, async (req, res) => {
     res.status(500).json({ error: 'Failed to rename team', message: err.message });
   }
 });
+
+/**
+ * 11.2 Delete Team
+ * Allows Managers, HR, and Admins to delete a team ONLY when no active employees are assigned.
+ */
+const deleteTeamHandler = async (req, res) => {
+  const role = (req.user.role || '').toLowerCase();
+  const isAuthorized = role.includes('manager') || role.includes('ceo') || role.includes('hr') || role.includes('human resource') || role.includes('admin');
+
+  if (!isAuthorized) {
+    return res.status(403).json({ error: 'Unauthorized: Only Managers/HR/Admin can delete teams.' });
+  }
+
+  // 1. Extract team name from all possible input locations (params, body, or query)
+  const rawTeamName = (
+    req.params.teamName ||
+    req.body.teamName ||
+    req.body.team_name ||
+    req.body.oldName ||
+    req.body.name ||
+    req.body.id ||
+    req.query.teamName ||
+    req.query.team_name ||
+    req.query.oldName ||
+    req.query.name ||
+    req.query.id ||
+    ''
+  ).trim();
+
+  // 2. Decode URL encoding (e.g. "APJ%20Warriors" -> "APJ Warriors")
+  let teamName = '';
+  try {
+    teamName = decodeURIComponent(rawTeamName).trim();
+  } catch (e) {
+    teamName = rawTeamName;
+  }
+
+  if (!teamName) {
+    return res.status(400).json({ error: 'teamName is required' });
+  }
+
+  // 3. Generate sanitized names for dynamic table dropping and comparison
+  const sanitizedInput = teamName.toLowerCase().trim()
+    .replace(/\s+/g, '_')
+    .replace(/[^a-z0-9_]/g, '');
+
+  try {
+    const pool = await getPool();
+
+    // 4. Check if any active employees are assigned to this team (matching raw name or snake_case conversion)
+    const checkUsersReq = pool.request();
+    checkUsersReq.input('teamName', sql.NVarChar, teamName);
+    checkUsersReq.input('sanitizedInput', sql.NVarChar, sanitizedInput);
+    const usersResult = await checkUsersReq.query(
+      "SELECT id, name, role, email FROM users WHERE team = @teamName OR LOWER(REPLACE(team, ' ', '_')) = @sanitizedInput"
+    );
+
+    if (usersResult.recordset.length > 0) {
+      const count = usersResult.recordset.length;
+      return res.status(400).json({
+        error: `Cannot delete team '${teamName}' because it has ${count} existing employees.`,
+        employees: usersResult.recordset
+      });
+    }
+
+    const standardTableName = sanitizedInput.startsWith('team_') ? sanitizedInput : `team_${sanitizedInput}`;
+
+    const variations = [
+      standardTableName,
+      `team_${teamName.toLowerCase().replace(/\s+/g, '_').replace(/&/g, 'and')}`,
+      `team_${teamName.toLowerCase().replace(/[\s_&]+/g, '')}`,
+      `team_${teamName.toLowerCase().replace(/\s+/g, '_').replace(/&/g, '')}`
+    ];
+
+    const uniqueTables = [...new Set(variations)];
+    const droppedTables = [];
+
+    const transaction = new sql.Transaction(pool);
+    await transaction.begin();
+
+    try {
+      for (const tableName of uniqueTables) {
+        // Ensure table name contains only safe alphanumeric/underscore characters to prevent SQL injection
+        if (!/^[a-zA-Z0-9_]+$/.test(tableName)) {
+          console.warn(`[TEAM DELETE] Skipping invalid table name variation: ${tableName}`);
+          continue;
+        }
+
+        const checkTableReq = new sql.Request(transaction);
+        checkTableReq.input('tableName', sql.NVarChar, tableName);
+        const checkResult = await checkTableReq.query(`SELECT OBJECT_ID(@tableName, N'U') AS id`);
+
+        if (checkResult.recordset[0].id) {
+          const dropReq = new sql.Request(transaction);
+          await dropReq.query(`DROP TABLE [${tableName}]`);
+          droppedTables.push(tableName);
+        }
+      }
+
+      // 5. Cleanup team assignment for any legacy/dangling records just in case
+      const cleanupUsersReq = new sql.Request(transaction);
+      cleanupUsersReq.input('teamName', sql.NVarChar, teamName);
+      cleanupUsersReq.input('sanitizedInput', sql.NVarChar, sanitizedInput);
+      await cleanupUsersReq.query("UPDATE users SET team = NULL WHERE team = @teamName OR LOWER(REPLACE(team, ' ', '_')) = @sanitizedInput");
+
+      await transaction.commit();
+
+      // 6. Invalidate User cache to sync changes
+      allUsersCache = null;
+      lastAllUsersCacheUpdate = 0;
+
+      Log.success('Team Management', `Team "${teamName}" successfully deleted by ${req.user.name}. Dropped tables: ${droppedTables.join(', ')}`);
+
+      res.json({
+        success: true,
+        message: `Team "${teamName}" successfully deleted.`,
+        droppedTables
+      });
+
+    } catch (err) {
+      if (transaction) await transaction.rollback();
+      throw err;
+    }
+
+  } catch (err) {
+    console.error('[TEAM DELETE ERROR]:', err);
+    res.status(500).json({ error: 'Failed to delete team', details: err.message });
+  }
+};
+
+app.delete(['/api/admin/teams/delete', '/api/admin/teams/:teamName'], verifyToken, deleteTeamHandler);
+app.post('/api/admin/teams/delete', verifyToken, deleteTeamHandler);
 
 // --- DYNAMIC TASK DELEGATION SYSTEM --- //
 
@@ -4379,15 +4968,33 @@ app.post('/api/threads', async (req, res) => {
     const pool = await getPool();
 
     // FETCH THE POSTER'S METADATA from the users table automatically
-    const userResult = await pool.request()
+    let userResult = await pool.request()
       .input('uId', sql.Int, userId)
       .query('SELECT name, role FROM users WHERE id = @uId');
 
-    const employeeName = userResult.recordset.length > 0 ? userResult.recordset[0].name : 'Unknown User';
-    const postRole = userResult.recordset.length > 0 ? userResult.recordset[0].role : 'employee';
+    let finalUserId = userId;
+    let employeeName = 'Unknown User';
+    let postRole = 'employee';
+
+    if (userResult.recordset.length > 0) {
+      employeeName = userResult.recordset[0].name;
+      postRole = userResult.recordset[0].role;
+    } else {
+      // Defensive fallback to prevent Foreign Key constraint conflict on dummy/unregistered user IDs
+      console.warn(`[THREAD POST] Warning: userId ${userId} does not exist in users table. Fetching fallback active user...`);
+      const fallbackUserRes = await pool.request().query('SELECT TOP 1 id, name, role FROM users ORDER BY id ASC');
+      if (fallbackUserRes.recordset.length > 0) {
+        finalUserId = fallbackUserRes.recordset[0].id;
+        employeeName = fallbackUserRes.recordset[0].name;
+        postRole = fallbackUserRes.recordset[0].role;
+        console.log(`[THREAD POST] Defensive mapping: Dummy userId ${userId} successfully mapped to valid fallback userId ${finalUserId} (${employeeName})`);
+      } else {
+        return res.status(400).json({ error: 'No active users found in the database to publish a thread.' });
+      }
+    }
 
     await pool.request()
-      .input('userId', sql.Int, userId)
+      .input('userId', sql.Int, finalUserId)
       .input('name', sql.NVarChar, employeeName)
       .input('role', sql.NVarChar, postRole)
       .input('content', sql.NVarChar(sql.MAX), content || null)
@@ -4413,7 +5020,7 @@ app.get('/api/threads', async (req, res) => {
   let tokenViewerId = null;
   if (authHeader && authHeader.startsWith('Bearer ')) {
     const token = authHeader.split(' ')[1];
-    const decoded = await getVerifiedUser(token);
+    const { user: decoded } = await getVerifiedUser(token);
     if (decoded) {
       tokenViewerId = decoded.id;
     }
@@ -4560,7 +5167,7 @@ const handleReaction = async (req, res) => {
   let tokenUserId = null;
   if (authHeader && authHeader.startsWith('Bearer ')) {
     const token = authHeader.split(' ')[1];
-    const decoded = await getVerifiedUser(token);
+    const { user: decoded } = await getVerifiedUser(token);
     if (decoded) {
       tokenUserId = decoded.id;
     }
@@ -4730,6 +5337,7 @@ app.post('/api/threads/:id/comment', async (req, res) => {
     const pool = await getPool();
 
     // FETCH THE COMMENTER'S METADATA automatically (checking both tables)
+    let finalUserId = userId;
     let employeeName = 'Unknown User';
     let userRole = 'employee';
 
@@ -4748,12 +5356,24 @@ app.post('/api/threads/:id/comment', async (req, res) => {
       if (joineeResult.recordset.length > 0) {
         employeeName = joineeResult.recordset[0].name;
         userRole = joineeResult.recordset[0].role;
+      } else {
+        // Unregistered user - Defensive fallback to prevent Foreign Key constraint conflict on dummy/unregistered user IDs
+        console.warn(`[THREAD COMMENT] Warning: userId ${userId} does not exist in users or new_joinees table. Fetching fallback active user...`);
+        const fallbackUserRes = await pool.request().query('SELECT TOP 1 id, name, role FROM users ORDER BY id ASC');
+        if (fallbackUserRes.recordset.length > 0) {
+          finalUserId = fallbackUserRes.recordset[0].id;
+          employeeName = fallbackUserRes.recordset[0].name;
+          userRole = fallbackUserRes.recordset[0].role;
+          console.log(`[THREAD COMMENT] Defensive mapping: Dummy userId ${userId} successfully mapped to valid fallback userId ${finalUserId} (${employeeName})`);
+        } else {
+          return res.status(400).json({ error: 'No active users found to post comment.' });
+        }
       }
     }
 
     await pool.request()
       .input('threadId', sql.Int, id)
-      .input('userId', sql.Int, userId)
+      .input('userId', sql.Int, finalUserId)
       .input('name', sql.NVarChar, employeeName)
       .input('role', sql.NVarChar, userRole)
       .input('comment', sql.NVarChar(sql.MAX), commentText)
@@ -4882,7 +5502,7 @@ app.get('/api/threads/:id', async (req, res) => {
   let tokenViewerId = null;
   if (authHeader && authHeader.startsWith('Bearer ')) {
     const token = authHeader.split(' ')[1];
-    const decoded = await getVerifiedUser(token);
+    const { user: decoded } = await getVerifiedUser(token);
     if (decoded) {
       tokenViewerId = decoded.id;
     }
@@ -5273,7 +5893,7 @@ app.get('/api/new-joinees', async (req, res) => {
       .input('offset', sql.Int, offset)
       .input('limit', sql.Int, limit)
       .query(`
-        SELECT id, name, role, email_id, hired_by, password, joining_date, course_completion, is_blocked, block_reason, created_at 
+        SELECT id, name, role, email_id, hired_by, password, joining_date, course_completion, is_blocked, block_reason, created_at, duration, phone_number 
         FROM new_joinees WITH (NOLOCK) 
         ORDER BY joining_date DESC
         OFFSET @offset ROWS
@@ -5287,10 +5907,11 @@ app.get('/api/new-joinees', async (req, res) => {
 });
 
 app.post('/api/new-joinees', async (req, res) => {
-  const { name, role, email, emailId, email_id, joiningDate, courseCompletion, hiredBy, hired_by, password } = req.body;
+  const { name, role, email, emailId, email_id, joiningDate, courseCompletion, hiredBy, hired_by, password, duration, phone_number, phone } = req.body;
   const finalEmail = email || emailId || email_id || req.body.Email || null;
   const finalHiredBy = hiredBy || hired_by || null;
   const finalPassword = password || 'Nbt@123';
+  const finalPhone = phone_number || phone || null;
   try {
     const pool = await getPool();
     await pool.request()
@@ -5301,10 +5922,68 @@ app.post('/api/new-joinees', async (req, res) => {
       .input('courseCompletion', sql.Int, courseCompletion)
       .input('hiredBy', sql.NVarChar, finalHiredBy)
       .input('password', sql.NVarChar, finalPassword)
-      .query('INSERT INTO new_joinees (name, role, email_id, joining_date, course_completion, hired_by, password) VALUES (@name, @role, @emailId, @joiningDate, @courseCompletion, @hiredBy, @password)');
+      .input('duration', sql.NVarChar, duration || null)
+      .input('phoneNumber', sql.NVarChar, finalPhone)
+      .query('INSERT INTO new_joinees (name, role, email_id, joining_date, course_completion, hired_by, password, duration, phone_number) VALUES (@name, @role, @emailId, @joiningDate, @courseCompletion, @hiredBy, @password, @duration, @phoneNumber)');
     res.json({ message: 'New joinee recorded successfully' });
   } catch (err) {
     res.status(500).json({ error: 'Failed to add new joinee' });
+  }
+});
+
+// PUT: Allow HR and Managers to edit new joinee details
+app.put('/api/new-joinees/:id', verifyToken, async (req, res) => {
+  const { id } = req.params;
+  const role = (req.user.role || '').toLowerCase();
+  const isAuthorized = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('manager') || role.includes('lead') || role.includes('ceo');
+
+  if (!isAuthorized) {
+    return res.status(403).json({ error: 'Access denied. Only HR or Managers can edit joinee details.' });
+  }
+
+  // Handle various frontend key formats
+  const finalName = req.body.name || req.body.Name;
+  const finalRole = req.body.role || req.body.Role || req.body.joineeRole;
+  const finalEmail = req.body.email_id || req.body.emailId || req.body.email || req.body.Email;
+  const finalJoiningDate = req.body.joining_date || req.body.joiningDate || req.body.JoiningDate;
+  const finalCourseCompletion = req.body.course_completion !== undefined ? req.body.course_completion : req.body.courseCompletion;
+  const finalHiredBy = req.body.hired_by || req.body.hiredBy || req.body.HiredBy;
+  const finalDuration = req.body.duration || req.body.Duration;
+  const finalPhoneNumber = req.body.phone_number || req.body.phone || req.body.phoneNumber || req.body.Phone;
+  const { is_blocked, block_reason } = req.body;
+
+  try {
+    const pool = await getPool();
+    await pool.request()
+      .input('id', sql.Int, id)
+      .input('name', sql.NVarChar, finalName)
+      .input('role', sql.NVarChar, finalRole)
+      .input('emailId', sql.NVarChar, finalEmail)
+      .input('joiningDate', sql.Date, finalJoiningDate)
+      .input('courseCompletion', sql.Int, finalCourseCompletion)
+      .input('hiredBy', sql.NVarChar, finalHiredBy)
+      .input('isBlocked', sql.Bit, is_blocked !== undefined ? is_blocked : 0)
+      .input('blockReason', sql.NVarChar, block_reason || null)
+      .input('duration', sql.NVarChar, finalDuration || null)
+      .input('phoneNumber', sql.NVarChar, finalPhoneNumber)
+      .query(`
+        UPDATE new_joinees 
+        SET name = @name, 
+            role = @role, 
+            email_id = @emailId, 
+            joining_date = @joiningDate, 
+            course_completion = @courseCompletion, 
+            hired_by = @hiredBy,
+            is_blocked = @isBlocked,
+            block_reason = @blockReason,
+            duration = @duration,
+            phone_number = @phoneNumber
+        WHERE id = @id
+      `);
+    res.json({ success: true, message: 'New joinee details updated successfully' });
+  } catch (err) {
+    console.error('New joinee update error:', err);
+    res.status(500).json({ error: 'Failed to update new joinee details' });
   }
 });
 
@@ -5722,43 +6401,6 @@ app.put(['/api/new-joinees/:id/unblock', '/api/admin/new-joinees/:id/unblock'], 
   }
 });
 
-app.put('/api/new-joinees/:id', async (req, res) => {
-  const { id } = req.params;
-  const { role, email, emailId, email_id, courseCompletion, hiredBy, hired_by, password } = req.body;
-  const finalEmail = email || emailId || email_id || req.body.Email;
-  const finalHiredBy = hiredBy || hired_by;
-  try {
-    const pool = await getPool();
-    const request = pool.request()
-      .input('id', sql.Int, id)
-      .input('role', sql.NVarChar, role)
-      .input('courseCompletion', sql.Int, courseCompletion);
-
-    let query = 'UPDATE new_joinees SET role = ISNULL(@role, role), course_completion = ISNULL(@courseCompletion, course_completion)';
-
-    if (finalEmail !== undefined) {
-      query += ', email_id = @emailId';
-      request.input('emailId', sql.NVarChar, finalEmail);
-    }
-
-    if (finalHiredBy !== undefined) {
-      query += ', hired_by = @hiredBy';
-      request.input('hiredBy', sql.NVarChar, finalHiredBy);
-    }
-
-    if (password !== undefined) {
-      query += ', password = @password';
-      request.input('password', sql.NVarChar, password);
-    }
-
-    query += ' WHERE id = @id';
-    await request.query(query);
-    res.json({ message: 'Onboarding record updated' });
-  } catch (err) {
-    res.status(500).json({ error: 'Update failed' });
-  }
-});
-
 app.delete('/api/new-joinees/:id', async (req, res) => {
   const { id } = req.params;
   try {
@@ -5866,39 +6508,76 @@ app.post('/api/interns', async (req, res) => {
   }
 });
 
-// POST: Promote Intern to Full Employee
-app.post('/api/interns/promote/:id', verifyToken, async (req, res) => {
-  const { id } = req.params;
-  const { emp_id, team_name } = req.body; // Explicitly passed during promotion
+/**
+ * 25.5 Get Promotion Reminders
+ * Fetches New Joinees (>10 days) and Interns (>duration_months) eligible for full-time promotion.
+ */
+app.get('/api/admin/onboarding/reminders', verifyToken, async (req, res) => {
+  const role = (req.user.role || '').toLowerCase();
+  const isAuthorized = role.includes('hr') || role.includes('admin') || role.includes('ceo') || role.includes('manager');
+
+  if (!isAuthorized) return res.status(403).json({ error: 'Unauthorized' });
 
   try {
     const pool = await getPool();
 
-    // 1. Fetch Intern Details
-    const internRes = await pool.request()
-      .input('id', sql.Int, id)
-      .query('SELECT * FROM interns WHERE id = @id');
+    // 1. Fetch Eligible New Joinees (>10 days)
+    const joinees = await pool.request().query(`
+      SELECT id, name, email_id as email, joining_date, duration, 'New Joinee' as type
+      FROM new_joinees WITH (NOLOCK)
+      WHERE DATEDIFF(DAY, joining_date, GETDATE()) >= 10
+    `);
 
-    if (internRes.recordset.length === 0) {
-      return res.status(404).json({ error: 'Intern not found' });
-    }
+    // 2. Fetch Eligible Interns (>duration_months)
+    const interns = await pool.request().query(`
+      SELECT id, name, email, joining_date, duration_months as duration, 'Intern' as type
+      FROM interns WITH (NOLOCK)
+      WHERE DATEDIFF(MONTH, joining_date, GETDATE()) >= duration_months
+    `);
 
-    const intern = internRes.recordset[0];
+    res.json({
+      reminders: [...joinees.recordset, ...interns.recordset],
+      count: joinees.recordset.length + interns.recordset.length
+    });
+  } catch (err) {
+    console.error('[REMINDER ERROR]', err);
+    res.status(500).json({ error: 'Failed to fetch promotion reminders' });
+  }
+});
 
-    // 2. Start Transactional Move
+/**
+ * 25.6 Unified Promotion API
+ * Converts an Intern or New Joinee to a Full-time User
+ */
+app.post('/api/admin/onboarding/promote', verifyToken, async (req, res) => {
+  const { id, type, emp_id, team_name, role: newRole } = req.body;
+  const adminRole = (req.user.role || '').toLowerCase();
+  const isAuthorized = adminRole.includes('hr') || adminRole.includes('admin') || adminRole.includes('ceo') || adminRole.includes('manager');
+
+  if (!isAuthorized) return res.status(403).json({ error: 'Unauthorized promotion attempt.' });
+
+  try {
+    const pool = await getPool();
+    const table = type === 'Intern' ? 'interns' : 'new_joinees';
+
+    // 1. Fetch Source Record
+    const sourceRes = await pool.request().input('id', sql.Int, id).query(`SELECT * FROM ${table} WHERE id = @id`);
+    if (sourceRes.recordset.length === 0) return res.status(404).json({ error: `${type} not found.` });
+
+    const person = sourceRes.recordset[0];
     const transaction = new sql.Transaction(pool);
     await transaction.begin();
 
     try {
-      // 3. Create User record
+      // 2. Create User Record
       const userResult = await transaction.request()
-        .input('name', sql.NVarChar, intern.name)
-        .input('email', sql.NVarChar, intern.email)
-        .input('password', sql.NVarChar, intern.password)
-        .input('role', sql.NVarChar, 'Employee')
-        .input('joiningDate', sql.Date, intern.joining_date)
-        .input('managerId', sql.Int, intern.reporting_manager_id)
-        .input('phone', sql.NVarChar, intern.phone_number)
+        .input('name', sql.NVarChar, person.name)
+        .input('email', sql.NVarChar, person.email || person.email_id)
+        .input('password', sql.NVarChar, person.password)
+        .input('role', sql.NVarChar, newRole || person.role || 'Employee')
+        .input('joiningDate', sql.Date, person.joining_date)
+        .input('managerId', sql.Int, person.reporting_manager_id || null)
+        .input('phone', sql.NVarChar, person.phone_number)
         .query(`
           INSERT INTO users (name, email, password, role, joining_date, reporting_manager_id, phone_number)
           OUTPUT INSERTED.id
@@ -5907,40 +6586,38 @@ app.post('/api/interns/promote/:id', verifyToken, async (req, res) => {
 
       const newUserId = userResult.recordset[0].id;
 
-      // 4. Create Employee record
+      // 3. Create Employee Record
       await transaction.request()
         .input('userId', sql.Int, newUserId)
-        .input('empName', sql.NVarChar, intern.name)
-        .input('designation', sql.NVarChar, intern.role)
+        .input('empName', sql.NVarChar, person.name)
+        .input('designation', sql.NVarChar, newRole || person.role)
         .input('empId', sql.Int, emp_id || Math.floor(10000 + Math.random() * 90000))
-        .input('team', sql.NVarChar, team_name || 'Development')
+        .input('team', sql.NVarChar, team_name || person.team || 'General')
         .query(`
           INSERT INTO employee (user_id, emp_name, designation, emp_id, team_name)
           VALUES (@userId, @empName, @designation, @empId, @team)
         `);
 
-      // 5. Create Initial Profile
+      // 4. Create Profile
       await transaction.request()
         .input('userId', sql.Int, newUserId)
-        .input('personalEmail', sql.NVarChar, intern.personal_email)
-        .input('contactNo', sql.NVarChar, intern.phone_number)
-        .query('INSERT INTO employee_profiles (employee_id, personal_email_id, contact_no) VALUES (@userId, @personalEmail, @contactNo)');
+        .input('personalEmail', sql.NVarChar, person.personal_email || person.email_id)
+        .input('contactNo', sql.NVarChar, person.phone_number)
+        .query('INSERT INTO employee_profiles (employee_id, personal_email_id, contact_no, doj) VALUES (@userId, @personalEmail, @contactNo, GETDATE())');
 
-      // 6. Delete from Interns
-      await transaction.request()
-        .input('id', sql.Int, id)
-        .query('DELETE FROM interns WHERE id = @id');
+      // 5. Cleanup Source Table
+      await transaction.request().input('id', sql.Int, id).query(`DELETE FROM ${table} WHERE id = @id`);
 
       await transaction.commit();
-      res.json({ success: true, message: 'Intern promoted successfully', newUserId });
+      Log.success('HR', `Successfully promoted ${person.name} (${type}) to Full-time Employee.`);
+      res.json({ success: true, message: `${person.name} is now a Full-time Employee!`, userId: newUserId });
 
-    } catch (err) {
+    } catch (transErr) {
       await transaction.rollback();
-      throw err;
+      throw transErr;
     }
-
   } catch (err) {
-    console.error('Promotion error:', err);
+    console.error('[PROMOTION ERROR]', err);
     res.status(500).json({ error: 'Promotion failed', details: err.message });
   }
 });
@@ -6170,10 +6847,9 @@ app.put('/api/support-tickets/:id', async (req, res) => {
   }
 });
 
-// 27. Course Delivery System (Migrated to Infinite Load)
-// GET: Fetch all courses (optionally filtered by assignee or uploader)
+// GET: Fetch all courses (Shows personalized completion for the current user)
 app.get('/api/courses', async (req, res) => {
-  const { assignedTo, uploadedBy, page, limit } = req.query;
+  const { page, limit } = req.query;
   const p = parseInt(page) || 1;
   const l = parseInt(limit) || 10;
   const offset = (p - 1) * l;
@@ -6184,39 +6860,38 @@ app.get('/api/courses', async (req, res) => {
     request.input('offset', sql.Int, offset);
     request.input('limit', sql.Int, l);
 
-    let query = `
-      SELECT c.id, c.title, c.description, c.category, c.pdf_data, c.pdf_name, c.video_url, c.video_data,
-             c.pdf_url,
-             c.deadline, c.assigned_to, c.uploaded_by, c.completed, 
-             c.created_at as created_at, 
-             u1.name as assigneeName, u2.name as uploaderName 
+    // OPTIONAL AUTH: Extract user if token is present
+    let currentUserId = null;
+    const authHeader = req.headers['authorization'];
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      const token = authHeader.split(' ')[1];
+      const { user } = await getVerifiedUser(token);
+      if (user) currentUserId = user.id;
+    }
+    request.input('currentUserId', sql.Int, currentUserId);
+
+    const query = `
+      SELECT c.id, c.title, c.description, c.category, c.pdf_url, c.video_url, 
+             c.created_at, c.updated_at, c.deadline,
+             ISNULL(uc.completed, 0) as completed, 
+             uc.completed_at
       FROM courses c WITH (NOLOCK)
-      LEFT JOIN users u1 WITH (NOLOCK) ON c.assigned_to = u1.id
-      LEFT JOIN users u2 WITH (NOLOCK) ON c.uploaded_by = u2.id
-      WHERE 1=1
+      LEFT JOIN user_courses uc WITH (NOLOCK) ON c.id = uc.course_id AND uc.user_id = @currentUserId
+      ORDER BY c.created_at DESC
+      OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY
     `;
-
-    if (assignedTo) {
-      query += ' AND (c.assigned_to = @assignedTo OR c.assigned_to IS NULL)';
-      request.input('assignedTo', sql.Int, parseInt(assignedTo));
-    }
-    if (uploadedBy) {
-      query += ' AND c.uploaded_by = @uploadedBy';
-      request.input('uploadedBy', sql.Int, parseInt(uploadedBy));
-    }
-
-    query += ' ORDER BY c.created_at DESC OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY';
     const result = await request.query(query);
 
-    // Normalize video URLs for embedding
+    // Normalize video/pdf URLs for embedding (Converts Drive links to Proxy links)
     const normalizedData = result.recordset.map(row => ({
       ...row,
-      video_url: normalizeVideoUrl(row.video_url),
-      pdf_url: normalizeVideoUrl(row.pdf_url)
+      video_url: normalizeVideoUrl(row.video_url, req),
+      pdf_url: normalizeVideoUrl(row.pdf_url, req)
     }));
 
     res.json(normalizedData);
   } catch (err) {
+    console.error('Fetch courses error:', err);
     res.status(500).json({ error: 'Failed to fetch academic catalog' });
   }
 });
@@ -6225,19 +6900,13 @@ app.get('/api/courses', async (req, res) => {
 app.post('/api/courses', memoryUpload.fields([{ name: 'pdf', maxCount: 1 }, { name: 'video', maxCount: 1 }]), async (req, res) => {
   const {
     title, description, category, deadline,
-    assignedTo, assigned_to,
-    uploadedBy, uploaded_by,
-    pdf_data, pdf_name, video_url, videoUrl, video_data, pdf_url, pdfUrl
+    pdf_url, pdfUrl, video_url, videoUrl
   } = req.body || {};
 
   if (!title) return res.status(400).json({ error: 'Course title is required' });
 
   // Normalize inputs
   const finalDeadline = (deadline && String(deadline).trim() !== '') ? deadline : null;
-  const rawAssignedTo = assignedTo !== undefined ? assignedTo : assigned_to;
-  const finalAssignedTo = (rawAssignedTo && String(rawAssignedTo).trim() !== '') ? parseInt(rawAssignedTo) : null;
-  const rawUploadedBy = uploadedBy !== undefined ? uploadedBy : uploaded_by;
-  const finalUploadedBy = (rawUploadedBy && String(rawUploadedBy).trim() !== '') ? parseInt(rawUploadedBy) : null;
 
   // Handle uploaded files if any (Migrated to Google Drive)
   let finalPdf = pdf_url || pdfUrl;
@@ -6257,20 +6926,15 @@ app.post('/api/courses', memoryUpload.fields([{ name: 'pdf', maxCount: 1 }, { na
       .input('description', sql.NVarChar(sql.MAX), description || '')
       .input('category', sql.NVarChar, category || 'General')
       .input('pdf_url', sql.NVarChar(sql.MAX), finalPdf || null)
-      .input('pdf_data', sql.NVarChar(sql.MAX), pdf_data || null)
-      .input('pdf_name', sql.NVarChar(255), pdf_name || null)
       .input('video_url', sql.NVarChar(sql.MAX), finalVideo || null)
-      .input('video_data', sql.NVarChar(sql.MAX), video_data || null)
       .input('deadline', sql.Date, finalDeadline)
-      .input('assignedTo', sql.Int, finalAssignedTo)
-      .input('uploadedBy', sql.Int, finalUploadedBy)
       .query(`
         INSERT INTO courses (
-          title, description, category, pdf_url, pdf_data, pdf_name, video_url, video_data, 
-          deadline, assigned_to, uploaded_by, created_at, updated_at
+          title, description, category, pdf_url, video_url, 
+          deadline, created_at, updated_at
         ) VALUES (
-          @title, @description, @category, @pdf_url, @pdf_data, @pdf_name, @video_url, @video_data, 
-          @deadline, @assignedTo, @uploadedBy, DATEADD(MINUTE, 330, GETUTCDATE()), DATEADD(MINUTE, 330, GETUTCDATE())
+          @title, @description, @category, @pdf_url, @video_url, 
+          @deadline, DATEADD(MINUTE, 330, GETUTCDATE()), DATEADD(MINUTE, 330, GETUTCDATE())
         )
       `);
     res.status(201).json({ message: 'Course successfully published to academic catalog' });
@@ -6286,12 +6950,8 @@ app.put('/api/courses/:id', memoryUpload.fields([{ name: 'pdf', maxCount: 1 }, {
   const {
     title,
     description,
-    category,
-    pdf_url, pdfUrl,
-    video_url, videoUrl,
-    completed,
     deadline,
-    assignedTo, assigned_to
+    completed
   } = req.body || {};
 
   try {
@@ -6312,12 +6972,11 @@ app.put('/api/courses/:id', memoryUpload.fields([{ name: 'pdf', maxCount: 1 }, {
       request.input('category', sql.NVarChar, category);
     }
 
-    // Handle file uploads (Migrated to Google Drive Cloud Storage)
+    // Handle file uploads
     let finalPdf = pdf_url !== undefined ? pdf_url : pdfUrl;
     if (req.files && req.files['pdf']) {
       finalPdf = await safeUploadToDrive(req.files['pdf'][0]);
     }
-
     if (finalPdf !== undefined) {
       query += ', pdf_url = @pdf_url';
       request.input('pdf_url', sql.NVarChar(sql.MAX), finalPdf);
@@ -6327,15 +6986,9 @@ app.put('/api/courses/:id', memoryUpload.fields([{ name: 'pdf', maxCount: 1 }, {
     if (req.files && req.files['video']) {
       finalVideo = await safeUploadToDrive(req.files['video'][0]);
     }
-
     if (finalVideo !== undefined) {
       query += ', video_url = @video_url';
       request.input('video_url', sql.NVarChar(sql.MAX), finalVideo);
-    }
-
-    if (completed !== undefined) {
-      query += ', completed = @completed';
-      request.input('completed', sql.Bit, completed ? 1 : 0);
     }
 
     if (deadline !== undefined) {
@@ -6344,20 +6997,356 @@ app.put('/api/courses/:id', memoryUpload.fields([{ name: 'pdf', maxCount: 1 }, {
       request.input('deadline', sql.Date, d);
     }
 
-    // Support both camelCase and snake_case for assigned ID (INT field)
-    const rawAssignedToValue = assignedTo !== undefined ? assignedTo : assigned_to;
-    if (rawAssignedToValue !== undefined) {
-      query += ', assigned_to = @assignedTo';
-      const a = (rawAssignedToValue && String(rawAssignedToValue).trim() !== '') ? parseInt(rawAssignedToValue) : null;
-      request.input('assignedTo', sql.Int, a);
-    }
-
+    // Update metadata in courses table
     query += ' WHERE id = @id';
     await request.query(query);
-    res.json({ message: 'Course metadata and tracking successfully updated' });
+
+    // --- PER-USER COMPLETION HANDLING ---
+    // If 'completed' flag is passed, update the user_courses junction table
+    if (completed !== undefined && req.user) {
+      const isComp = (completed === true || completed === 1 || completed === 'true');
+      const userId = req.user.id;
+
+      // Fetch metadata for sync
+      const metaRes = await pool.request()
+        .input('cid', sql.Int, id)
+        .input('uid', sql.Int, userId)
+        .query(`
+          SELECT c.title as courseTitle, u.email as userEmail, u.name as userName
+          FROM courses c WITH (NOLOCK)
+          CROSS JOIN (
+            SELECT email, name FROM users WHERE id = @uid 
+            UNION 
+            SELECT email, name FROM interns WHERE id = @uid
+          ) u
+          WHERE c.id = @cid
+        `);
+
+      if (metaRes.recordset.length > 0) {
+        const { courseTitle, userEmail, userName } = metaRes.recordset[0];
+
+        await pool.request()
+          .input('uid', sql.Int, userId)
+          .input('email', sql.NVarChar, userEmail)
+          .input('cid', sql.Int, id)
+          .input('title', sql.NVarChar, courseTitle)
+          .input('comp', sql.Bit, isComp ? 1 : 0)
+          .query(`
+            IF EXISTS (SELECT 1 FROM user_courses WHERE user_id = @uid AND course_id = @cid)
+              UPDATE user_courses SET 
+                completed = @comp, 
+                user_email = @email,
+                course_title = @title,
+                completed_at = CASE WHEN @comp = 1 THEN DATEADD(MINUTE, 330, GETUTCDATE()) ELSE NULL END,
+                updated_at = DATEADD(MINUTE, 330, GETUTCDATE())
+              WHERE user_id = @uid AND course_id = @cid
+            ELSE
+              INSERT INTO user_courses (user_id, user_email, course_id, course_title, completed, completed_at, updated_at) 
+              VALUES (@uid, @email, @cid, @title, @comp, CASE WHEN @comp = 1 THEN DATEADD(MINUTE, 330, GETUTCDATE()) ELSE NULL END, DATEADD(MINUTE, 330, GETUTCDATE()))
+          `);
+
+        // Trigger certificate if newly completed
+        if (isComp) {
+          try {
+            // Check if email already sent to prevent spam
+            const mailCheck = await pool.request().input('uid', sql.Int, userId).input('cid', sql.Int, id).query('SELECT email_sent FROM user_courses WHERE user_id = @uid AND course_id = @cid');
+            if (mailCheck.recordset.length > 0 && !mailCheck.recordset[0].email_sent) {
+              await sendCertificateEmail(userEmail, userName, courseTitle);
+              await pool.request().input('uid', sql.Int, userId).input('cid', sql.Int, id).query('UPDATE user_courses SET email_sent = 1, email_sent_at = DATEADD(MINUTE, 330, GETUTCDATE()) WHERE user_id = @uid AND course_id = @cid');
+            }
+          } catch (e) { console.error('PUT completion email fail:', e); }
+        }
+      }
+    }
+
+    res.json({ message: 'Course updated successfully' });
   } catch (err) {
     console.error('Course update error:', err);
-    res.status(500).json({ error: 'Failed to update course tracking data', details: err.message });
+    res.status(500).json({ error: 'Failed to update course data' });
+  }
+});
+
+/**
+ * 27.1 Complete Course (New Per-User Logic)
+ * POST /api/courses/:courseId/complete
+ */
+app.post('/api/courses/:courseId/complete', verifyToken, async (req, res) => {
+  const { courseId } = req.params;
+  const userId = req.user.id;
+
+  try {
+    const pool = await getPool();
+
+    // 1. Fetch metadata needed for progress tracking
+    const metaRes = await pool.request()
+      .input('cid', sql.Int, courseId)
+      .input('uid', sql.Int, userId)
+      .query(`
+        SELECT c.title as courseTitle, u.email as userEmail, u.name as userName
+        FROM courses c WITH (NOLOCK)
+        CROSS JOIN (
+          SELECT email, name FROM users WHERE id = @uid 
+          UNION 
+          SELECT email, name FROM interns WHERE id = @uid
+        ) u
+        WHERE c.id = @cid
+      `);
+
+    if (metaRes.recordset.length === 0) return res.status(404).json({ error: 'Course or User not found' });
+    const { courseTitle, userEmail, userName } = metaRes.recordset[0];
+
+    // 2. Mark as complete in junction table
+    const checkResult = await pool.request()
+      .input('uid', sql.Int, userId)
+      .input('cid', sql.Int, courseId)
+      .query('SELECT completed, email_sent FROM user_courses WITH (NOLOCK) WHERE user_id = @uid AND course_id = @cid');
+
+    const record = checkResult.recordset[0];
+    const wasCompleted = record ? record.completed : false;
+    const emailSent = record ? record.email_sent : false;
+
+    await pool.request()
+      .input('uid', sql.Int, userId)
+      .input('email', sql.NVarChar, userEmail)
+      .input('cid', sql.Int, courseId)
+      .input('title', sql.NVarChar, courseTitle)
+      .query(`
+        IF EXISTS (SELECT 1 FROM user_courses WHERE user_id = @uid AND course_id = @cid)
+          UPDATE user_courses SET 
+            completed = 1, 
+            user_email = @email,
+            course_title = @title,
+            completed_at = DATEADD(MINUTE, 330, GETUTCDATE()), 
+            updated_at = DATEADD(MINUTE, 330, GETUTCDATE()) 
+          WHERE user_id = @uid AND course_id = @cid
+        ELSE
+          INSERT INTO user_courses (user_id, user_email, course_id, course_title, completed, completed_at, updated_at) 
+          VALUES (@uid, @email, @cid, @title, 1, DATEADD(MINUTE, 330, GETUTCDATE()), DATEADD(MINUTE, 330, GETUTCDATE()))
+      `);
+
+    // 3. Send Email if not already sent
+    if (!wasCompleted && !emailSent && userEmail) {
+      try {
+        await sendCertificateEmail(userEmail, userName, courseTitle);
+
+        await pool.request()
+          .input('uid', sql.Int, userId)
+          .input('cid', sql.Int, courseId)
+          .query('UPDATE user_courses SET email_sent = 1, email_sent_at = DATEADD(MINUTE, 330, GETUTCDATE()) WHERE user_id = @uid AND course_id = @cid');
+      } catch (e) { console.error('Email fail:', e); }
+    }
+
+    res.json({ success: true, message: 'Course marked as completed.' });
+  } catch (err) {
+    console.error('Course completion error:', err);
+    res.status(500).json({ error: 'Internal server error during completion' });
+  }
+});
+
+// POST: Sync/Update Course Progress (Used by frontend to mark completion or update state)
+app.post('/api/courses/progress', verifyToken, async (req, res) => {
+  const { courseId, completed } = req.body;
+  const userId = req.user.id;
+
+  if (!courseId) return res.status(400).json({ error: 'courseId is required' });
+
+  try {
+    const pool = await getPool();
+
+    // 1. Fetch metadata needed for progress tracking
+    const metaRes = await pool.request()
+      .input('cid', sql.Int, courseId)
+      .input('uid', sql.Int, userId)
+      .query(`
+        SELECT c.title as courseTitle, u.email as userEmail, u.name as userName
+        FROM courses c WITH (NOLOCK)
+        CROSS JOIN (
+          SELECT email, name FROM users WHERE id = @uid 
+          UNION 
+          SELECT email, name FROM interns WHERE id = @uid
+        ) u
+        WHERE c.id = @cid
+      `);
+
+    if (metaRes.recordset.length === 0) return res.status(404).json({ error: 'Course or User not found' });
+    const { courseTitle, userEmail, userName } = metaRes.recordset[0];
+
+    const isComp = (completed === true || completed === 1 || completed === 'true');
+
+    // 2. Mark as complete in junction table
+    const checkResult = await pool.request()
+      .input('uid', sql.Int, userId)
+      .input('cid', sql.Int, courseId)
+      .query('SELECT completed, email_sent FROM user_courses WITH (NOLOCK) WHERE user_id = @uid AND course_id = @cid');
+
+    const record = checkResult.recordset[0];
+    const wasCompleted = record ? record.completed : false;
+    const emailSent = record ? record.email_sent : false;
+
+    await pool.request()
+      .input('uid', sql.Int, userId)
+      .input('email', sql.NVarChar, userEmail)
+      .input('cid', sql.Int, courseId)
+      .input('title', sql.NVarChar, courseTitle)
+      .input('comp', sql.Bit, isComp ? 1 : 0)
+      .query(`
+        IF EXISTS (SELECT 1 FROM user_courses WHERE user_id = @uid AND course_id = @cid)
+          UPDATE user_courses SET 
+            completed = @comp, 
+            user_email = @email,
+            course_title = @title,
+            completed_at = CASE WHEN @comp = 1 THEN DATEADD(MINUTE, 330, GETUTCDATE()) ELSE completed_at END, 
+            updated_at = DATEADD(MINUTE, 330, GETUTCDATE()) 
+          WHERE user_id = @uid AND course_id = @cid
+        ELSE
+          INSERT INTO user_courses (user_id, user_email, course_id, course_title, completed, completed_at, updated_at) 
+          VALUES (@uid, @email, @cid, @title, @comp, CASE WHEN @comp = 1 THEN DATEADD(MINUTE, 330, GETUTCDATE()) ELSE NULL END, DATEADD(MINUTE, 330, GETUTCDATE()))
+      `);
+
+    // 3. Send Email if newly completed and not already sent
+    if (isComp && !emailSent && userEmail) {
+      try {
+        await sendCertificateEmail(userEmail, userName, courseTitle);
+
+        await pool.request()
+          .input('uid', sql.Int, userId)
+          .input('cid', sql.Int, courseId)
+          .query('UPDATE user_courses SET email_sent = 1, email_sent_at = DATEADD(MINUTE, 330, GETUTCDATE()) WHERE user_id = @uid AND course_id = @cid');
+      } catch (e) { console.error('Progress email fail:', e); }
+    }
+
+    res.json({ success: true, message: 'Progress synchronized successfully.', completed: isComp });
+  } catch (err) {
+    console.error('Progress sync error:', err);
+    res.status(500).json({ error: 'Failed to synchronize course progress' });
+  }
+});
+
+// GET: Fetch course progress for a user (Universal)
+app.get('/api/courses/progress', verifyToken, async (req, res) => {
+  const userId = sanitizeNumericId(req.query.userId) || req.user.id;
+  try {
+    const pool = await getPool();
+
+    // 1. Get General Course Progress (from user_courses junction table)
+    const generalProgress = await pool.request()
+      .input('uid', sql.Int, userId)
+      .query('SELECT course_id as courseId, completed, updated_at FROM user_courses WITH (NOLOCK) WHERE user_id = @uid');
+
+    // 2. Get Joinee Course Progress (from joinee_course_progress table)
+    const joineeProgress = await pool.request()
+      .input('uid', sql.Int, userId)
+      .query('SELECT course_id as courseId, is_completed as completed, status, updated_at FROM joinee_course_progress WITH (NOLOCK) WHERE joinee_id = @uid');
+
+    const combined = [
+      ...generalProgress.recordset.map(r => ({ ...r, source: 'general' })),
+      ...joineeProgress.recordset.map(r => ({ ...r, source: 'joinee' }))
+    ];
+
+    res.json(combined);
+  } catch (err) {
+    console.error('Fetch progress error:', err);
+    res.status(500).json({ error: 'Failed to fetch course progress' });
+  }
+});
+
+// POST: Update course progress (Redirects to new complete endpoint for General, or handles Joinee)
+app.post('/api/courses/progress', verifyToken, async (req, res) => {
+  const userId = req.user.id;
+  const { id, courseId, completed, status } = req.body;
+  const finalCourseId = id || courseId;
+
+  if (!finalCourseId) return res.status(400).json({ error: 'Course ID is required' });
+
+  try {
+    const pool = await getPool();
+    const isCompleted = (completed === true || completed === 1 || completed === 'true' || status === 'Completed');
+
+    // Check if it's a general course first
+    const generalCheck = await pool.request()
+      .input('cid', sql.Int, finalCourseId)
+      .query('SELECT 1 FROM courses WITH (NOLOCK) WHERE id = @cid');
+
+    if (generalCheck.recordset.length > 0) {
+      if (isCompleted) {
+        // Mark as complete and trigger certificate
+        const courseResult = await pool.request()
+          .input('cid', sql.Int, finalCourseId)
+          .query('SELECT title, completed, assigned_to, email_sent FROM courses WITH (NOLOCK) WHERE id = @cid');
+
+        const course = courseResult.recordset[0];
+        await pool.request()
+          .input('cid', sql.Int, finalCourseId)
+          .query('UPDATE courses SET completed = 1, updated_at = DATEADD(MINUTE, 330, GETUTCDATE()) WHERE id = @cid');
+
+        if (!course.completed && !course.email_sent && course.assigned_to) {
+          try {
+            const userResult = await pool.request()
+              .input('uid', sql.Int, course.assigned_to)
+              .query('SELECT name, email FROM users WITH (NOLOCK) WHERE id = @uid UNION SELECT name, email FROM interns WITH (NOLOCK) WHERE id = @uid');
+
+            if (userResult.recordset.length > 0) {
+              const user = userResult.recordset[0];
+              await sendAppEmail({
+                to: user.email,
+                subject: `🎓 Certificate of Completion: ${course.title}`,
+                html: generateCertificateHtml(user.name, course.title),
+                text: `Congratulations ${user.name}! You have officially completed "${course.title}".`
+              });
+
+              await pool.request()
+                .input('cid', sql.Int, finalCourseId)
+                .query('UPDATE courses SET email_sent = 1, email_sent_at = DATEADD(MINUTE, 330, GETUTCDATE()) WHERE id = @cid');
+            }
+          } catch (e) { console.error('Email fail in progress route:', e); }
+        }
+        return res.json({ success: true, message: 'Course marked as completed via progress sync.' });
+      } else {
+        await pool.request()
+          .input('cid', sql.Int, finalCourseId)
+          .query('UPDATE courses SET completed = 0, updated_at = DATEADD(MINUTE, 330, GETUTCDATE()) WHERE id = @cid');
+        return res.json({ success: true, message: 'Progress updated (General)' });
+      }
+    }
+
+    // Handle Joinee logic
+    const joineeCourse = await pool.request()
+      .input('cid', sql.Int, finalCourseId)
+      .query('SELECT id, title FROM newjoinee_courses WITH (NOLOCK) WHERE id = @cid');
+
+    if (joineeCourse.recordset.length > 0) {
+      const course = joineeCourse.recordset[0];
+      await pool.request()
+        .input('jid', sql.Int, userId)
+        .input('cid', sql.Int, finalCourseId)
+        .input('comp', sql.Bit, isCompleted ? 1 : 0)
+        .input('status', sql.NVarChar, isCompleted ? 'Completed' : 'In Progress')
+        .query(`
+          IF EXISTS (SELECT 1 FROM joinee_course_progress WHERE joinee_id = @jid AND course_id = @cid)
+            UPDATE joinee_course_progress SET is_completed = @comp, status = @status, updated_at = DATEADD(MINUTE, 330, GETUTCDATE()) WHERE joinee_id = @jid AND course_id = @cid
+          ELSE
+            INSERT INTO joinee_course_progress (joinee_id, course_id, is_completed, status) VALUES (@jid, @cid, @comp, @status)
+        `);
+
+      if (isCompleted) {
+        const joineeResult = await pool.request().input('jid', sql.Int, userId).query('SELECT name, email_id FROM new_joinees WITH (NOLOCK) WHERE id = @jid');
+        if (joineeResult.recordset.length > 0) {
+          const user = joineeResult.recordset[0];
+          await sendAppEmail({
+            to: user.email_id,
+            subject: `🎓 Certificate of Completion: ${course.title}`,
+            html: generateCertificateHtml(user.name, course.title),
+            text: `Congratulations ${user.name}! You have officially completed "${course.title}".`
+          });
+        }
+      }
+      return res.json({ success: true, message: 'Joinee progress updated' });
+    }
+
+    res.status(404).json({ error: 'Course not found' });
+  } catch (err) {
+    console.error('Progress sync error:', err);
+    res.status(500).json({ error: 'Internal server error during progress sync' });
   }
 });
 
@@ -6366,10 +7355,26 @@ app.delete('/api/courses/:id', async (req, res) => {
   const { id } = req.params;
   try {
     const pool = await getPool();
-    await pool.request()
-      .input('id', sql.Int, id)
-      .query('DELETE FROM courses WHERE id = @id');
-    res.json({ success: true, message: 'Course successfully deleted from catalog' });
+    const transaction = new sql.Transaction(pool);
+    await transaction.begin();
+
+    try {
+      // 1. Delete associated enrollments first to satisfy FK constraints
+      await transaction.request()
+        .input('id', sql.Int, id)
+        .query('DELETE FROM user_courses WHERE course_id = @id');
+
+      // 2. Delete the actual course
+      await transaction.request()
+        .input('id', sql.Int, id)
+        .query('DELETE FROM courses WHERE id = @id');
+
+      await transaction.commit();
+      res.json({ success: true, message: 'Course and all associated enrollments successfully deleted' });
+    } catch (transErr) {
+      await transaction.rollback();
+      throw transErr;
+    }
   } catch (err) {
     console.error('Course deletion error:', err);
     res.status(500).json({ error: 'Failed to delete course', details: err.message });
@@ -6575,6 +7580,17 @@ app.put('/api/newjoinee-courses/:id', memoryUpload.fields([{ name: 'pdf', maxCou
 
       const finalStatus = status || (isCompleted ? 'Completed' : 'In Progress');
 
+      // Check if it was already completed to avoid duplicate emails
+      let wasCompleted = false;
+      try {
+        const prevStatusResult = await pool.request()
+          .input('jid', sql.Int, joineeId)
+          .input('cid', sql.Int, id)
+          .query('SELECT is_completed FROM joinee_course_progress WITH (NOLOCK) WHERE joinee_id = @jid AND course_id = @cid');
+        wasCompleted = prevStatusResult.recordset.length > 0 && prevStatusResult.recordset[0].is_completed === true;
+      } catch (e) { console.error('Prev status check error:', e); }
+
+      // 1. Perform the database update
       await pool.request()
         .input('jid', sql.Int, joineeId)
         .input('cid', sql.Int, id)
@@ -6586,6 +7602,38 @@ app.put('/api/newjoinee-courses/:id', memoryUpload.fields([{ name: 'pdf', maxCou
           ELSE
             INSERT INTO joinee_course_progress (joinee_id, course_id, is_completed, status) VALUES (@jid, @cid, @comp, @status)
         `);
+
+      // 2. --- EMAIL NOTIFICATION FOR COURSE COMPLETION ---
+      if (isCompleted === 1 && !wasCompleted) {
+        try {
+          // Fetch Course Title and Joinee Details
+          const infoResult = await pool.request()
+            .input('jid', sql.Int, joineeId)
+            .input('cid', sql.Int, id)
+            .query(`
+              SELECT c.title as course_name, u.name as user_name, u.email_id as user_email
+              FROM newjoinee_courses c WITH (NOLOCK)
+              JOIN new_joinees u WITH (NOLOCK) ON u.id = @jid
+              WHERE c.id = @cid
+            `);
+
+          if (infoResult.recordset.length > 0) {
+            const { course_name, user_name, user_email } = infoResult.recordset[0];
+
+            if (user_email) {
+              await sendAppEmail({
+                to: user_email,
+                subject: `🎓 Certificate of Completion: ${course_name}`,
+                html: generateCertificateHtml(user_name, course_name),
+                text: `Congratulations ${user_name}! You have officially completed "${course_name}" on NBT Hub.`
+              });
+              console.log(`[SMTP] Joinee course completion email sent to ${user_email} for "${course_name}"`);
+            }
+          }
+        } catch (emailErr) {
+          console.error('[EMAIL ERROR] Failed to send course completion email:', emailErr.message);
+        }
+      }
 
       await syncJoineeOnboardingProgress(joineeId);
       await auditJoineeCompliance(joineeId);
@@ -6623,7 +7671,7 @@ app.delete('/api/newjoinee-courses/:id', async (req, res) => {
  * 30.5 Get Leave Request (GET Alias)
  * Some frontend versions might call this to fetch leave status for a user
  */
-app.get('/api/leaves/request', verifyToken, async (req, res) => {
+app.get(['/api/leaves/request', '/api/leave-requests'], verifyToken, async (req, res) => {
   const { userId, user_id, employee_id } = req.query;
   const targetId = userId || user_id || employee_id || req.user.id;
 
@@ -6662,6 +7710,24 @@ app.post('/api/leaves/request', verifyToken, async (req, res) => {
     return res.status(400).json({ error: 'Incomplete leave request parameters', received: { leaveType, startDate, endDate } });
   }
 
+  // --- NEW: DATE RESTRICTIONS (Backdate & Same-Day Half-Day Enforce) ---
+  const istNow = new Date(new Date().getTime() + (330 * 60 * 1000));
+  const istTodayStr = istNow.toISOString().split('T')[0];
+  const reqStartDateStr = new Date(startDate).toISOString().split('T')[0];
+
+  if (reqStartDateStr < istTodayStr) {
+    return res.status(400).json({
+      error: 'Backdated leave requests are restricted. Please apply for future dates or contact HR for past adjustments.'
+    });
+  }
+
+  if (reqStartDateStr === istTodayStr && !isHalfDay) {
+    return res.status(400).json({
+      error: 'Same-day leave requests are restricted to Half Day only. Full day leaves must be requested at least one day in advance.'
+    });
+  }
+  // ----------------------------------------------------------------------
+
   try {
     const pool = await getPool();
 
@@ -6682,6 +7748,30 @@ app.post('/api/leaves/request', verifyToken, async (req, res) => {
     if (userResult.recordset.length === 0) return res.status(404).json({ error: 'Employee not found' });
 
     const employee = userResult.recordset[0];
+
+    // --- NEW: EARNED LEAVE RESTRICTION (1 Year Minimum Service) ---
+    const normalizedLeaveType = (leaveType || '').toString().trim().toLowerCase().replace(/[\s_]/g, '');
+    const isEarnedLeave = normalizedLeaveType.includes('earnedleave');
+
+    if (isEarnedLeave) {
+      if (!employee.joining_date) {
+        return res.status(400).json({
+          error: 'Earned Leave Restricted',
+          message: 'Earned Leaves are only available after completing 1 year of service. Your joining date is not configured on your profile.'
+        });
+      }
+      const employeeJoiningDate = new Date(employee.joining_date);
+      const oneYearAnniversary = new Date(employeeJoiningDate);
+      oneYearAnniversary.setFullYear(oneYearAnniversary.getFullYear() + 1);
+
+      if (istNow < oneYearAnniversary) {
+        return res.status(400).json({
+          error: 'Earned Leave Restricted',
+          message: `Earned Leaves are only available after completing 1 year of service. You will be eligible on ${oneYearAnniversary.toDateString()}.`
+        });
+      }
+    }
+    // --------------------------------------------------------------
 
     // 1.5 Calculate requested days (handling half-day logic)
     const requestedDays = isHalfDay ? 0.5 : (Math.ceil(Math.abs(new Date(endDate) - new Date(startDate)) / (1000 * 60 * 60 * 24)) + 1);
@@ -6728,7 +7818,7 @@ app.post('/api/leaves/request', verifyToken, async (req, res) => {
     const normalizedRole = (employee.role || '').toLowerCase();
     const isTL = normalizedRole.includes('lead') || normalizedRole.includes('tl');
     const isManager = normalizedRole.includes('manager');
-    const isHR = normalizedRole.includes('hr');
+    const isHR = isHRRole(normalizedRole);
 
     // HIERARCHY LOGIC:
     // If Manager or HR: Reports directly to CEO (20250)
@@ -6850,7 +7940,7 @@ app.get('/api/leaves/my', verifyToken, async (req, res) => {
 app.get('/api/leaves/pending', verifyToken, async (req, res) => {
   const approverId = req.user.id;
   const userRole = (req.user.role || '').toLowerCase();
-  const isHR = userRole.includes('hr') || userRole.includes('ceo') || userRole.includes('admin');
+  const isHR = isHRRole(userRole);
 
   try {
     const pool = await getPool();
@@ -6926,7 +8016,7 @@ const masterLeaveListHandler = async (req, res) => {
   const currentUserId = overrideId || req.user.id;
 
   const userRole = (req.user.role || '').toLowerCase();
-  const isHR = userRole.includes('hr') || userRole.includes('ceo') || userRole.includes('admin');
+  const isHR = isHRRole(userRole);
 
   // Extract Query Parameters
   const {
@@ -7044,7 +8134,7 @@ const masterLeaveListHandler = async (req, res) => {
 
 app.get('/api/leaves/all', verifyToken, masterLeaveListHandler);
 app.get('/api/admin/leaves', verifyToken, masterLeaveListHandler);
-app.get('/api/admin/leaves/all', verifyToken, masterLeaveListHandler);
+app.get(['/api/admin/leaves/all', '/api/leaves/admin/all'], verifyToken, masterLeaveListHandler);
 app.get(['/api/leaves/team', '/api/leave/team'], verifyToken, masterLeaveListHandler);
 app.get('/api/leaves/comprehensive', verifyToken, masterLeaveListHandler);
 
@@ -7052,15 +8142,21 @@ app.get('/api/leaves/comprehensive', verifyToken, masterLeaveListHandler);
  * 32.5 Get Monthly Leave Stats
  * Allows filtering by employee, month, and year.
  */
-app.get('/api/admin/leaves/stats', verifyToken, async (req, res) => {
+app.get(['/api/admin/leaves/stats', '/api/admin/leave_stats'], verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead') || role.includes('tl');
+  const isAdmin = role.includes('hr') ||
+    role.includes('human resource') ||
+    role.includes('admin') ||
+    role.includes('ceo') ||
+    role.includes('manager') ||
+    role.includes('lead') ||
+    role.includes('tl');
 
   console.log(`[GET /api/admin/leaves/stats] Accessed by user ${req.user.id} (Role: ${req.user.role}, isAdmin: ${isAdmin})`);
 
   if (!isAdmin) {
     console.log(`[GET /api/admin/leaves/stats] 403 Forbidden for user ${req.user.id}`);
-    return res.status(403).json({ error: 'Unauthorized: Management access required.' });
+    return res.status(403).json({ error: 'Unauthorized: Management or HR access required to view complete stats.' });
   }
 
   const employeeId = sanitizeNumericId(req.query.employeeId);
@@ -7123,7 +8219,7 @@ app.get('/api/admin/leaves/stats', verifyToken, async (req, res) => {
  * 32.5a Update Leave Stats
  * Allows HR/Admin to manually adjust leave balances.
  */
-app.put('/api/admin/leaves/stats', verifyToken, async (req, res) => {
+app.put(['/api/admin/leaves/stats', '/api/admin/leave_stats'], verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
   const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead') || role.includes('tl');
 
@@ -7192,7 +8288,7 @@ app.put('/api/admin/leaves/stats', verifyToken, async (req, res) => {
  * 32.5b Get Leave Stats (Universal Endpoint)
  * Supports: /api/leave-stats?userId=...
  */
-app.get('/api/leave-stats', verifyToken, async (req, res) => {
+app.get(['/api/leave-stats', '/api/leave_stats'], verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
   const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead') || role.includes('tl');
 
@@ -7201,12 +8297,13 @@ app.get('/api/leave-stats', verifyToken, async (req, res) => {
   const { month, year } = req.query;
   const targetId = userId || employeeId;
 
-  console.log(`[GET /api/leave-stats] Accessed by user ${req.user.id} (Role: ${req.user.role}, isAdmin: ${isAdmin}), targetId: ${targetId}`);
-
-  // Authorization: Admins can see any, users can only see their own
-  if (!isAdmin && targetId && targetId != req.user.id) {
-    console.log(`[GET /api/leave-stats] 403 Forbidden for user ${req.user.id}`);
-    return res.status(403).json({ error: 'Unauthorized: Access denied.' });
+  // Authorization: Management/Admin can see any or ALL, users can only see their own
+  if (!isAdmin) {
+    // If a normal user tries to access someone else's ID OR tries to fetch the whole table (targetId is null)
+    if (!targetId || targetId != req.user.id) {
+      console.log(`[GET /api/leave-stats] 403 Forbidden for user ${req.user.id} - Attempted access to restricted stats.`);
+      return res.status(403).json({ error: 'Unauthorized: You only have access to your own leave statistics.' });
+    }
   }
 
   try {
@@ -7331,7 +8428,7 @@ app.put(['/api/leaves/:id/status', '/api/ceo/leaves/:id/status'], verifyToken, a
     // Identify Approver Slot (Use loose equality for ID matching to handle string/number mismatches)
     const isRM = approverId == leave.manager_id;
     const isPM = approverId == leave.pm_id;
-    const isHR = userRole.includes('hr') || userRole.includes('ceo') || userRole.includes('admin');
+    const isHR = isHRRole(userRole);
 
     // Capture normalized statuses for easier logic
     const curRMStatus = (leave.rm_status || 'Pending').trim();
@@ -7637,7 +8734,7 @@ app.post('/api/admin/attendance/full-audit', verifyToken, async (req, res) => {
 app.post(['/api/leaves/balance/update', '/api/leaves/stats/update'], verifyToken, async (req, res) => {
   const { userId, newBalance, leavesAvailable, leavesTaken, lop, halfDays, reason, month, year } = req.body;
   const userRole = (req.user.role || '').toLowerCase();
-  const isAdmin = userRole.includes('hr') || userRole.includes('admin') || userRole.includes('ceo');
+  const isAdmin = isHRRole(userRole);
 
   if (!isAdmin) return res.status(403).json({ error: 'Unauthorized: Admin access required.' });
 
@@ -7816,21 +8913,9 @@ cron.schedule('1 0 1 * *', async () => {
   console.log('[SCHEDULED TASK] Executing Monthly Casual Leave Accrual...');
   try {
     const pool = await getPool();
-    // 1. Accrue leaves in leave_stats for the current month
-    const result = await pool.request().query(`
-      UPDATE leave_stats 
-      SET leaves_available = leaves_available + 1, updated_at = GETDATE()
-      WHERE month = MONTH(DATEADD(MINUTE, 330, GETUTCDATE())) 
-      AND year = YEAR(DATEADD(MINUTE, 330, GETUTCDATE()))
-      AND employee_id IN (
-        SELECT id FROM users 
-        WHERE joining_date IS NOT NULL 
-        AND DATEADD(day, 90, joining_date) <= DATEADD(MINUTE, 330, GETUTCDATE())
-      )
-    `);
-    console.log(`[SCHEDULED TASK] Successfully credited ${result.rowsAffected[0]} users with monthly leave in leave_stats.`);
 
-    // 2. Capture Snapshot / Carry Forward for the new month if missing
+    // 1. First, capture Snapshot / Carry Forward for the new month if missing
+    // This ensures that the record for the new month exists before we try to increment it.
     await pool.request().query(`
       INSERT INTO leave_stats (employee_id, month, year, leaves_taken, leaves_available, LOP, updated_at)
       SELECT employee_id, 
@@ -7851,6 +8936,21 @@ cron.schedule('1 0 1 * *', async () => {
       )
     `);
     console.log('[SCHEDULED TASK] Monthly leave stats snapshots updated with carry-forward.');
+
+    // 2. Now, accrue leaves (+1) in leave_stats for the current month
+    // This will now apply to both existing records and the newly carried-forward records.
+    const result = await pool.request().query(`
+      UPDATE leave_stats 
+      SET leaves_available = leaves_available + 1, updated_at = GETDATE()
+      WHERE month = MONTH(DATEADD(MINUTE, 330, GETUTCDATE())) 
+      AND year = YEAR(DATEADD(MINUTE, 330, GETUTCDATE()))
+      AND employee_id IN (
+        SELECT id FROM users 
+        WHERE joining_date IS NOT NULL 
+        AND DATEADD(day, 90, joining_date) <= DATEADD(MINUTE, 330, GETUTCDATE())
+      )
+    `);
+    console.log(`[SCHEDULED TASK] Successfully credited ${result.rowsAffected[0]} users with monthly leave (+1) in leave_stats.`);
   } catch (err) {
     console.error('[SCHEDULED ERROR] Monthly Accrual Failed:', err.message);
   }
@@ -7899,6 +8999,58 @@ cron.schedule('5 0 * * *', async () => {
     console.error('[SCHEDULED ERROR] Compliance Audit Failed:', err.message);
   }
 });
+
+/**
+ * 41. Daily Promotion Reminder Email (HR & Managers)
+ * Runs every day at 10:00 AM IST
+ */
+cron.schedule('0 10 * * *', async () => {
+  console.log('[SCHEDULED TASK] Checking for pending onboarding promotions...');
+  try {
+    const pool = await getPool();
+
+    // 1. Fetch eligible candidates
+    const joinees = await pool.request().query(`
+      SELECT name, email_id as email, joining_date, duration, 'New Joinee' as type
+      FROM new_joinees WITH (NOLOCK)
+      WHERE DATEDIFF(DAY, joining_date, GETDATE()) >= 10
+    `);
+
+    const interns = await pool.request().query(`
+      SELECT name, email, joining_date, duration_months as duration, 'Intern' as type
+      FROM interns WITH (NOLOCK)
+      WHERE DATEDIFF(MONTH, joining_date, GETDATE()) >= duration_months
+    `);
+
+    const candidates = [...joinees.recordset, ...interns.recordset];
+
+    if (candidates.length === 0) {
+      console.log('[SCHEDULED TASK] No pending promotions found today.');
+      return;
+    }
+
+    // 2. Fetch HR and Admin emails
+    const admins = await pool.request().query(`
+      SELECT email FROM users WITH (NOLOCK) 
+      WHERE LOWER(role) LIKE '%hr%' OR LOWER(role) LIKE '%admin%' OR LOWER(role) LIKE '%ceo%'
+    `);
+
+    const adminEmails = admins.recordset.map(r => r.email).filter(Boolean);
+
+    if (adminEmails.length > 0) {
+      await sendAppEmail({
+        to: adminEmails.join(','),
+        subject: `?? Onboarding Alert: ${candidates.length} Promotions Pending`,
+        html: getPromotionReminderHtml(candidates),
+        text: `Daily Alert: There are ${candidates.length} team members eligible for promotion to full-time status.`
+      });
+      Log.success('SMTP', `Sent daily promotion reminder for ${candidates.length} candidates to ${adminEmails.length} admins.`);
+    }
+
+  } catch (err) {
+    console.error('[SCHEDULED ERROR] Promotion Reminder Failed:', err.message);
+  }
+}, { timezone: "Asia/Kolkata" });
 
 
 async function executeAccrual(req, res) {
@@ -7974,7 +9126,7 @@ app.post(['/api/admin/pay-slips', '/api/pay_slip'], verifyToken, async (req, res
     total_work_ot, total_ot_hours, basic_salary, bonus_ref_amt,
     pf_deduction, esi_deduction, pt_deduction,
     hra, conveyance, special_allowance, lwf, income_tax,
-    performance_incentive, yearly_incentive
+    performance_incentive, yearly_incentive, lop_deduction
   } = req.body;
 
   const employee_id = sanitizeNumericId(req.body.employee_id);
@@ -7986,11 +9138,45 @@ app.post(['/api/admin/pay-slips', '/api/pay_slip'], verifyToken, async (req, res
   try {
     const pool = await getPool();
 
-    // Calculate totals automatically to ensure data integrity
+    // Dynamic high-precision LOP calculation in the save endpoint.
+    // LOP is a mandatory policy rule, so we ALWAYS compute the correct LOP deduction server-side 
+    // using the basic_salary and LOP days (preferring the HR's submitted total_absent, otherwise leave_stats or biometrics).
+    let absentDays = parseFloat(total_absent);
+    if (isNaN(absentDays)) {
+      try {
+        const leaveStatsRes = await pool.request()
+          .input('lsEmpId', sql.Int, employee_id)
+          .input('lsMonth', sql.Int, parseInt(month))
+          .input('lsYear', sql.Int, parseInt(year))
+          .query('SELECT ISNULL(LOP, 0) as LOP FROM leave_stats WHERE employee_id = @lsEmpId AND month = @lsMonth AND year = @lsYear');
+
+        if (leaveStatsRes.recordset.length > 0) {
+          absentDays = parseFloat(leaveStatsRes.recordset[0].LOP) || 0;
+          console.log(`[PAYSLIP SAVE] Found LOP count in leave_stats: ${absentDays} days for employee ${employee_id}`);
+        } else {
+          const stats = await calculateUserMonthlyStats(employee_id, month, year);
+          absentDays = parseFloat(stats.total_absent) || 0;
+          console.log(`[PAYSLIP SAVE] No leave_stats record found. Fell back to biometric absent days: ${absentDays}`);
+        }
+      } catch (e) {
+        console.error(`[PAYSLIP SAVE] Failed to retrieve fallback LOP count:`, e.message);
+        absentDays = 0;
+      }
+    }
+
+    const getDaysInMonth = (year, month) => new Date(year, month, 0).getDate();
+    const totalDays = getDaysInMonth(year, month);
+    const perDaySalary = totalDays > 0 ? (parseFloat(basic_salary || 0) / totalDays) : 0;
+    const calculatedLop = Math.round(perDaySalary * absentDays);
+    console.log(`[PAYSLIP SAVE] Policy-enforced LOP deduction: ${calculatedLop} based on ${absentDays} LOP days.`);
+
+    // Calculate totals automatically to ensure data integrity based on user input
     const totalIncentive = parseFloat(performance_incentive || 0) + parseFloat(yearly_incentive || 0);
-    const earnings = parseFloat(basic_salary || 0) + parseFloat(bonus_ref_amt || 0) + parseFloat(hra || 0) + parseFloat(conveyance || 0) + parseFloat(special_allowance || 0) + totalIncentive;
-    const deductions = parseFloat(pf_deduction || 0) + parseFloat(esi_deduction || 0) + parseFloat(pt_deduction || 0) + parseFloat(lwf || 0) + parseFloat(income_tax || 0);
-    const netPayable = earnings - deductions;
+    const earnings = parseFloat(basic_salary || 0) + parseFloat(hra || 0) + parseFloat(conveyance || 0) + parseFloat(special_allowance || 0);
+    const deductions = parseFloat(pf_deduction || 0) + parseFloat(esi_deduction || 0) + parseFloat(pt_deduction || 0) + parseFloat(lwf || 0) + parseFloat(income_tax || 0) + calculatedLop;
+    
+    // Enforce comprehensive dynamic netPayable calculation: Net Payable = Total Earnings + Total Incentives - Total Deductions
+    const netPayable = Math.max(0, Math.round(earnings + totalIncentive - deductions));
 
     await pool.request()
       .input('employee_id', sql.Int, employee_id)
@@ -8020,6 +9206,7 @@ app.post(['/api/admin/pay-slips', '/api/pay_slip'], verifyToken, async (req, res
       .input('pt_deduction', sql.Decimal(18, 2), pt_deduction || 0)
       .input('lwf', sql.Decimal(18, 2), lwf || 0)
       .input('income_tax', sql.Decimal(18, 2), income_tax || 0)
+      .input('lop_deduction', sql.Decimal(18, 2), calculatedLop)
       .input('total_deductions', sql.Decimal(18, 2), deductions)
       .input('net_payable', sql.Decimal(18, 2), netPayable)
       .query(`
@@ -8032,7 +9219,7 @@ app.post(['/api/admin/pay-slips', '/api/pay_slip'], verifyToken, async (req, res
             hra = @hra, conveyance = @conveyance, special_allowance = @special_allowance,
             performance_incentive = @performance_incentive, yearly_incentive = @yearly_incentive, total_incentive = @total_incentive,
             total_earnings = @total_earnings, pf_deduction = @pf_deduction, esi_deduction = @esi_deduction,
-            pt_deduction = @pt_deduction, lwf = @lwf, income_tax = @income_tax,
+            pt_deduction = @pt_deduction, lwf = @lwf, income_tax = @income_tax, lop_deduction = @lop_deduction,
             total_deductions = @total_deductions, net_payable = @net_payable,
             updated_at = DATEADD(MINUTE, 330, GETUTCDATE())
           WHERE employee_id = @employee_id AND month = @month AND year = @year
@@ -8043,14 +9230,14 @@ app.post(['/api/admin/pay-slips', '/api/pay_slip'], verifyToken, async (req, res
             total_work_ot, total_ot_hours, basic_salary, bonus_ref_amt,
             hra, conveyance, special_allowance, performance_incentive, yearly_incentive, total_incentive,
             total_earnings,
-            pf_deduction, esi_deduction, pt_deduction, lwf, income_tax, total_deductions, net_payable
+            pf_deduction, esi_deduction, pt_deduction, lwf, income_tax, lop_deduction, total_deductions, net_payable
           ) VALUES (
             @employee_id, @month, @year, @emp_name, @department, @designation,
             @total_present, @total_weekly_off, @total_holidays, @total_leaves, @total_absent,
             @total_work_ot, @total_ot_hours, @basic_salary, @bonus_ref_amt,
             @hra, @conveyance, @special_allowance, @performance_incentive, @yearly_incentive, @total_incentive,
             @total_earnings,
-            @pf_deduction, @esi_deduction, @pt_deduction, @lwf, @income_tax, @total_deductions, @net_payable
+            @pf_deduction, @esi_deduction, @pt_deduction, @lwf, @income_tax, @lop_deduction, @total_deductions, @net_payable
           )
       `);
 
@@ -8073,14 +9260,111 @@ app.get('/api/admin/pay-slips/calculate-summary', verifyToken, async (req, res) 
   }
 
   const { month, year } = req.query;
-  const employee_id = sanitizeNumericId(req.query.employee_id);
+  const employeeIdRaw = req.query.employee_id || req.query.employeeId || req.query.userId || req.query.empId;
+  const employee_id = sanitizeNumericId(employeeIdRaw);
   if (!employee_id || !month || !year) return res.status(400).json({ error: 'employee_id, month, and year are required' });
 
   try {
+    const pool = await getPool();
+    const targetMonth = parseInt(month);
+    const targetYear = parseInt(year);
+    const monthName = monthNames[targetMonth] || 'Unknown';
+
+    // 1. Check if a saved pay slip already exists for this employee, month, and year
+    const existingSlipRes = await pool.request()
+      .input('empId', sql.Int, employee_id)
+      .input('month', sql.Int, targetMonth)
+      .input('year', sql.Int, targetYear)
+      .query('SELECT * FROM pay_slips WHERE employee_id = @empId AND month = @month AND year = @year');
+
+    if (existingSlipRes.recordset.length > 0) {
+      const paySlip = existingSlipRes.recordset[0];
+      console.log(`[API] Returning EXISTING saved payslip for ${employee_id} - ${monthName} ${targetYear}`);
+      return res.json({ 
+        ...paySlip, 
+        exists: true, 
+        monthName,
+        available_leaves: paySlip.available_leaves !== undefined ? paySlip.available_leaves : paySlip.total_leaves,
+        available_leave_balance: paySlip.available_leave_balance !== undefined ? paySlip.available_leave_balance : paySlip.total_leaves
+      });
+    }
+
+    // 2. If no saved payslip exists, dynamically calculate high-precision attendance stats
     const stats = await calculateUserMonthlyStats(employee_id, month, year);
-    const monthName = monthNames[parseInt(month)] || 'Unknown';
-    console.log(`[API] Calculated attendance summary for ${employee_id} - ${monthName} ${year}`);
-    res.json({ ...stats, monthName });
+
+    // 3. Fetch default employee details (name, role, department, salary profiles)
+    const userResult = await pool.request()
+      .input('empId', sql.Int, employee_id)
+      .query(`
+        SELECT u.name, u.role, ep.department, ep.gross_salary_a, ep.salary, ep.pt
+        FROM users u WITH (NOLOCK)
+        LEFT JOIN employee_profiles ep WITH (NOLOCK) ON u.id = ep.employee_id
+        WHERE u.id = @empId
+      `);
+
+    let empName = '';
+    let designation = '';
+    let department = '';
+    let basicSalary = 0;
+    let ptDeduction = 0;
+
+    if (userResult.recordset.length > 0) {
+      const u = userResult.recordset[0];
+      empName = u.name || '';
+      designation = u.role || '';
+      department = u.department || '';
+      basicSalary = u.salary || 0;
+      ptDeduction = u.pt || 0;
+    }
+
+    // Fetch LOP count from leave_stats table for the employee in this targeted month and year
+    const leaveStatsRes = await pool.request()
+      .input('lsEmpId', sql.Int, employee_id)
+      .input('lsMonth', sql.Int, targetMonth)
+      .input('lsYear', sql.Int, targetYear)
+      .query('SELECT ISNULL(LOP, 0) as LOP FROM leave_stats WHERE employee_id = @lsEmpId AND month = @lsMonth AND year = @lsYear');
+    
+    let absentDays = 0;
+    if (leaveStatsRes.recordset.length > 0) {
+      absentDays = parseFloat(leaveStatsRes.recordset[0].LOP) || 0;
+      console.log(`[API] Found LOP count in leave_stats: ${absentDays} days for employee ${employee_id}`);
+    } else {
+      absentDays = parseFloat(stats.total_absent) || 0;
+      console.log(`[API] No entry in leave_stats, fell back to biometric absences: ${absentDays} days`);
+    }
+
+    // Dynamic high-precision LOP calculation
+    const getDaysInMonth = (year, month) => new Date(year, month, 0).getDate();
+    const totalDays = getDaysInMonth(targetYear, targetMonth);
+    const perDaySalary = totalDays > 0 ? (basicSalary / totalDays) : 0;
+    const lopDeduction = Math.round(perDaySalary * absentDays);
+    const netPayable = Math.max(0, Math.round(basicSalary - lopDeduction));
+
+    console.log(`[API] Calculated DEFAULT pre-fill stats for new payslip: ${employee_id} - ${monthName} ${targetYear}`);
+    res.json({
+      exists: false,
+      monthName,
+      ...stats,
+      total_absent: absentDays, // Override with count from leave_stats
+      emp_name: empName,
+      designation: designation,
+      department: department,
+      basic_salary: basicSalary,
+      pt_deduction: ptDeduction,
+      lop_deduction: lopDeduction,
+      net_payable: netPayable,
+      hra: 0,
+      conveyance: 0,
+      special_allowance: 0,
+      performance_incentive: 0,
+      yearly_incentive: 0,
+      bonus_ref_amt: 0,
+      pf_deduction: 0,
+      esi_deduction: 0,
+      lwf: 0,
+      income_tax: 0
+    });
+
   } catch (err) {
     console.error('[CALC SUMMARY ERROR]:', err);
     res.status(500).json({ error: 'Failed to calculate attendance summary' });
@@ -8132,23 +9416,35 @@ app.post('/api/admin/mandatory-suggestions/request', verifyToken, async (req, re
     }
 
     try {
-      await emailjs.send(
-        EMAILJS_CONFIG.serviceId,
-        EMAILJS_CONFIG.templateId,
-        {
-          user_name: emp.name,
-          user_email: emp.email,
-          to_email: emp.email,
-          email: emp.email,
-          audit_type: 'Targeted Action Required',
-          subject_title: 'Mandatory Suggestion Submission',
-          suggestion_link: 'https://hub.navabharathtechnologies.com/suggestions/new'
-        },
-        {
-          publicKey: EMAILJS_CONFIG.publicKey,
-          privateKey: EMAILJS_CONFIG.privateKey
-        }
-      );
+      await sendAppEmail({
+        to: emp.email,
+        subject: 'Mandatory Suggestion Submission Required',
+        html: `<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:20px;background:#f8fafc;font-family:Arial,sans-serif;color:#333;">
+  <div style="max-width: 600px; margin: 0 auto; background: #ffffff; padding: 40px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); border: 1px solid #e2e8f0;">
+    <div style="text-align: center; margin-bottom: 25px; border-bottom: 1px solid #f1f5f9; padding-bottom: 20px;">
+      <img src="cid:NBTLogo" alt="NBT Logo" style="width: 120px; display: block; margin: 0 auto;">
+    </div>
+    <h2 style="color: #1e3a8a; margin-top: 0;">Action Required: Suggestion Submission</h2>
+    <p style="font-size: 16px;">Hello <strong>${emp.name}</strong>,</p>
+    <p style="font-size: 16px; line-height: 1.6;">This is a targeted reminder regarding your mandatory Saturday Suggestion submission.</p>
+    <p style="font-size: 16px; line-height: 1.6;">Please use the link below to submit your suggestions for this week:</p>
+    <div style="margin: 30px 0; text-align: center;">
+      <a href="https://hub.navabharathtechnologies.com/suggestions/new" style="display: inline-block; background-color: #3498db; color: white; padding: 14px 30px; text-decoration: none; border-radius: 5px; font-weight: bold; font-size: 15px;">Submit Suggestion</a>
+    </div>
+    <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 30px 0;" />
+    <p style="font-size: 14px; color: #64748b; line-height: 1.5;">
+      Best regards,<br>
+      <strong>Navabharath Technologies Team</strong>
+    </p>
+  </div>
+</body>
+</html>
+        `,
+        text: `Hello ${emp.name}, please submit your mandatory suggestion at https://hub.navabharathtechnologies.com/suggestions/new`
+      });
       results.sent.push({ email: emp.email });
       console.log(`✅ Suggestion request sent to ${emp.email}`);
     } catch (err) {
@@ -8176,7 +9472,7 @@ app.post('/api/admin/mandatory-suggestions/request', verifyToken, async (req, re
 app.get(['/api/admin/suggestions', '/api/suggestions', '/api/suggestions/admin'], verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
   const userId = req.user.id;
-  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('ceo') || role.includes('admin');
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('ceo') || role.includes('admin') || role.includes('project manager') || role.includes('manager');
 
   try {
     const pool = await getPool();
@@ -8252,28 +9548,21 @@ const runSaturdayAudit = async (type = 'Reminder') => {
 
       try {
         const isWarning = type.toLowerCase().includes('warning');
-        const templateId = isWarning ? EMAILJS_CONFIG.warningTemplateId : EMAILJS_CONFIG.reminderTemplateId;
+        const subject = isWarning ? '🚨 Compliance Deadline Approaching' : '📝 Saturday Suggestion Reminder';
 
-        await emailjs.send(
-          EMAILJS_CONFIG.serviceId,
-          templateId,
-          {
-            user_name: emp.name,
-            user_email: emp.email,
-            to_email: emp.email,
-            email: emp.email,
-            audit_type: type,
-            subject_title: isWarning ? 'Compliance Deadline Approaching' : 'Saturday Suggestion Required',
-            suggestion_link: 'https://hub.navabharathtechnologies.com/suggestions/new'
-          },
-          {
-            publicKey: EMAILJS_CONFIG.publicKey,
-            privateKey: EMAILJS_CONFIG.privateKey
-          }
-        );
+        const html = isWarning
+          ? getSaturdayFinalWarningHtml(emp.name)
+          : getSaturdayReminderHtml(emp.name);
+
+        await sendAppEmail({
+          to: emp.email,
+          subject: subject,
+          html: html,
+          text: `Hello ${emp.name}, this is a ${type} regarding your Saturday Suggestion submission. Please visit https://hub.navabharathtechnologies.com/suggestions/new`
+        });
         Log.success(type, `Sent to ${emp.email}`);
       } catch (emailErr) {
-        Log.error(type, `Failed to send to ${emp.email}`, emailErr.text || emailErr.message || 'Unknown EmailJS Error');
+        Log.error(type, `Failed to send to ${emp.email}`, emailErr.message || 'Unknown SMTP Error');
       }
     }
     return { success: true, count: missingEmployees.length };
@@ -8332,9 +9621,123 @@ app.get('/api/admin/pay-slips', verifyToken, async (req, res) => {
   }
 
   const { month, year, team } = req.query;
+  const empIdParam = req.query.employee_id || req.query.employeeId || req.query.userId || req.query.empId;
 
   try {
     const pool = await getPool();
+
+    // If an employee_id is specifically requested along with month and year, check and return default pre-fill if not found
+    if (empIdParam && month && year) {
+      const targetEmpId = sanitizeNumericId(empIdParam);
+      const monthNames = [
+        "", "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December"
+      ];
+      let targetMonth = 0;
+      if (/^\d+$/.test(String(month).trim())) {
+        targetMonth = parseInt(month);
+      } else {
+        const mStr = String(month).trim().toLowerCase();
+        const idx = monthNames.findIndex(m => m.toLowerCase() === mStr);
+        if (idx > 0) targetMonth = idx;
+      }
+      const targetYear = parseInt(year);
+
+      // Check if saved pay slip exists
+      const existingSlipRes = await pool.request()
+        .input('empId', sql.Int, targetEmpId)
+        .input('month', sql.Int, targetMonth)
+        .input('year', sql.Int, targetYear)
+        .query('SELECT * FROM pay_slips WHERE employee_id = @empId AND month = @month AND year = @year');
+
+      if (existingSlipRes.recordset.length > 0) {
+        const paySlip = existingSlipRes.recordset[0];
+        console.log(`[LIST API] Returning EXISTING saved payslip for ${targetEmpId} - ${monthNames[targetMonth]} ${targetYear}`);
+        return res.json([{ 
+          ...paySlip, 
+          exists: true, 
+          monthName: monthNames[targetMonth] || 'Unknown',
+          available_leaves: paySlip.available_leaves !== undefined ? paySlip.available_leaves : paySlip.total_leaves,
+          available_leave_balance: paySlip.available_leave_balance !== undefined ? paySlip.available_leave_balance : paySlip.total_leaves
+        }]);
+      }
+
+      // Prefill dynamically if not found
+      const stats = await calculateUserMonthlyStats(targetEmpId, targetMonth, targetYear);
+      const userResult = await pool.request()
+        .input('empId', sql.Int, targetEmpId)
+        .query(`
+          SELECT u.name, u.role, ep.department, ep.gross_salary_a, ep.salary, ep.pt
+          FROM users u WITH (NOLOCK)
+          LEFT JOIN employee_profiles ep WITH (NOLOCK) ON u.id = ep.employee_id
+          WHERE u.id = @empId
+        `);
+
+      let empName = '';
+      let designation = '';
+      let department = '';
+      let basicSalary = 0;
+      let ptDeduction = 0;
+
+      if (userResult.recordset.length > 0) {
+        const u = userResult.recordset[0];
+        empName = u.name || '';
+        designation = u.role || '';
+        department = u.department || '';
+        basicSalary = u.salary || 0;
+        ptDeduction = u.pt || 0;
+      }
+
+      // Fetch LOP count from leave_stats table for the employee in this targeted month and year
+      const leaveStatsRes = await pool.request()
+        .input('lsEmpId', sql.Int, targetEmpId)
+        .input('lsMonth', sql.Int, targetMonth)
+        .input('lsYear', sql.Int, targetYear)
+        .query('SELECT ISNULL(LOP, 0) as LOP FROM leave_stats WHERE employee_id = @lsEmpId AND month = @lsMonth AND year = @lsYear');
+      
+      let absentDays = 0;
+      if (leaveStatsRes.recordset.length > 0) {
+        absentDays = parseFloat(leaveStatsRes.recordset[0].LOP) || 0;
+        console.log(`[LIST API] Found LOP count in leave_stats: ${absentDays} days for employee ${targetEmpId}`);
+      } else {
+        absentDays = parseFloat(stats.total_absent) || 0;
+        console.log(`[LIST API] No entry in leave_stats, fell back to biometric absences: ${absentDays} days`);
+      }
+
+      // Dynamic high-precision LOP calculation
+      const getDaysInMonth = (year, month) => new Date(year, month, 0).getDate();
+      const totalDays = getDaysInMonth(targetYear, targetMonth);
+      const perDaySalary = totalDays > 0 ? (basicSalary / totalDays) : 0;
+      const lopDeduction = Math.round(perDaySalary * absentDays);
+      const netPayable = Math.max(0, Math.round(basicSalary - lopDeduction));
+
+      console.log(`[LIST API] Returning dynamic DEFAULT prefill array for ${targetEmpId} - ${monthNames[targetMonth]} ${targetYear}`);
+      return res.json([{
+        exists: false,
+        monthName: monthNames[targetMonth] || 'Unknown',
+        ...stats,
+        total_absent: absentDays, // Override with count from leave_stats
+        emp_name: empName,
+        designation: designation,
+        department: department,
+        basic_salary: basicSalary,
+        pt_deduction: ptDeduction,
+        lop_deduction: lopDeduction,
+        net_payable: netPayable,
+        hra: 0,
+        conveyance: 0,
+        special_allowance: 0,
+        performance_incentive: 0,
+        yearly_incentive: 0,
+        bonus_ref_amt: 0,
+        pf_deduction: 0,
+        esi_deduction: 0,
+        lwf: 0,
+        income_tax: 0
+      }]);
+    }
+
+    // Default general query list
     const request = pool.request();
     let query = `
       SELECT ps.*, u.team as userTeam 
@@ -8343,9 +9746,22 @@ app.get('/api/admin/pay-slips', verifyToken, async (req, res) => {
       WHERE 1=1
     `;
 
-    if (month) { query += ' AND ps.month = @month'; request.input('month', sql.Int, month); }
+    if (month) { 
+      let targetMonth = 0;
+      const monthNames = ["", "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+      if (/^\d+$/.test(String(month).trim())) {
+        targetMonth = parseInt(month);
+      } else {
+        const mStr = String(month).trim().toLowerCase();
+        const idx = monthNames.findIndex(m => m.toLowerCase() === mStr);
+        if (idx > 0) targetMonth = idx;
+      }
+      query += ' AND ps.month = @month'; 
+      request.input('month', sql.Int, targetMonth); 
+    }
     if (year) { query += ' AND ps.year = @year'; request.input('year', sql.Int, year); }
     if (team) { query += ' AND u.team = @team'; request.input('team', sql.NVarChar, team); }
+    if (empIdParam) { query += ' AND ps.employee_id = @empId'; request.input('empId', sql.Int, sanitizeNumericId(empIdParam)); }
 
     query += ' ORDER BY ps.year DESC, ps.month DESC, ps.emp_name ASC';
     const result = await request.query(query);
@@ -8568,30 +9984,47 @@ app.get(['/api/rewards', '/api/rewards/my'], verifyToken, async (req, res) => {
     const result = await pool.request()
       .input('userId', sql.Int, userId)
       .query(`
-        -- 1. Get all rewards for this user with Names
+        -- 1. Get all rewards for this user with Names (Cross-table compatible)
+        WITH AllParticipants AS (
+          SELECT id, name FROM users WITH (NOLOCK)
+          UNION ALL
+          SELECT id, name FROM new_joinees WITH (NOLOCK)
+          UNION ALL
+          SELECT id, name FROM interns WITH (NOLOCK)
+        )
         SELECT 
           r.*,
           u_rec.name as employee_name,
           u_giv.name as given_by
         FROM employee_rewards r
-        JOIN users u_rec ON r.employee_id = u_rec.id
-        JOIN users u_giv ON r.granted_by = u_giv.id
+        LEFT JOIN AllParticipants u_rec ON r.employee_id = u_rec.id
+        LEFT JOIN AllParticipants u_giv ON r.granted_by = u_giv.id
         WHERE r.employee_id = @userId 
         ORDER BY r.created_at DESC;
 
         -- 2. Calculate global rank and summary (Combined Manual Awards + Automated Quizzes)
         WITH CombinedPoints AS (
-          SELECT employee_id, points, 1 as is_endorsement FROM employee_rewards
+          SELECT employee_id, points, 1 as is_award FROM employee_rewards WITH (NOLOCK)
           UNION ALL
-          SELECT employee_id, total_points as points, 0 as is_endorsement FROM quiz_completions
+          SELECT employee_id, total_points as points, 0 as is_award FROM quiz_completions WITH (NOLOCK)
+        ),
+        AllUsers AS (
+          SELECT id FROM users WITH (NOLOCK)
+          UNION ALL
+          SELECT id FROM new_joinees WITH (NOLOCK)
+          UNION ALL
+          SELECT id FROM interns WITH (NOLOCK)
         ),
         Leaderboard AS (
           SELECT 
-            employee_id, 
-            SUM(points) as total_rep, 
-            SUM(is_endorsement) as endorsements
-          FROM CombinedPoints
-          GROUP BY employee_id
+            u.id as employee_id, 
+            SUM(CASE WHEN cp.is_award = 1 THEN cp.points ELSE 0 END) as total_reward_points,
+            SUM(CASE WHEN cp.is_award = 0 THEN cp.points ELSE 0 END) as total_quiz_points,
+            ISNULL(SUM(cp.points), 0) as total_rep, 
+            ISNULL(SUM(cp.is_award), 0) as endorsements
+          FROM AllUsers u
+          LEFT JOIN CombinedPoints cp ON u.id = cp.employee_id
+          GROUP BY u.id
         ),
         Ranked AS (
           SELECT *, DENSE_RANK() OVER (ORDER BY total_rep DESC) as rank
@@ -8601,7 +10034,13 @@ app.get(['/api/rewards', '/api/rewards/my'], verifyToken, async (req, res) => {
       `);
 
     const awards = result.recordsets[0];
-    const stats = result.recordsets[1][0] || { total_rep: 0, endorsements: 0, rank: 'Unranked' };
+    const stats = result.recordsets[1][0] || {
+      total_rep: 0,
+      endorsements: 0,
+      rank: 'Unranked',
+      total_reward_points: 0,
+      total_quiz_points: 0
+    };
 
     // Calculate Leadership Grade
     let score = 'Normal';
@@ -8613,6 +10052,8 @@ app.get(['/api/rewards', '/api/rewards/my'], verifyToken, async (req, res) => {
       summary: {
         totalRep: stats.total_rep,
         globalRank: stats.rank === 'Unranked' ? 'Unranked' : `#${stats.rank}`,
+        rewardPoints: stats.total_reward_points || 0,
+        quizPoints: stats.total_quiz_points || 0,
         endorsements: stats.endorsements,
         leadershipScore: score
       }
@@ -8624,53 +10065,7 @@ app.get(['/api/rewards', '/api/rewards/my'], verifyToken, async (req, res) => {
   }
 });
 
-/**
- * 45.B Global Leaderboard (Full Rankings)
- * Calculates combined points from Awards and Quizzes for every user.
- */
-app.get('/api/rewards/leaderboard', verifyToken, async (req, res) => {
-  try {
-    const pool = await getPool();
-    const result = await pool.request().query(`
-      WITH CombinedPoints AS (
-        -- 1. Points from Manual Awards/Endorsements
-        SELECT employee_id, points FROM employee_rewards
-        UNION ALL
-        -- 2. Points from Automated Quiz Completions
-        SELECT employee_id, total_points as points FROM quiz_completions
-      ),
-      AggregatedPoints AS (
-        SELECT 
-          employee_id, 
-          SUM(points) as totalPoints
-        FROM CombinedPoints
-        GROUP BY employee_id
-      )
-      SELECT 
-        u.id, 
-        u.name, 
-        u.profile_picture, 
-        u.role,
-        u.team,
-        ap.totalPoints,
-        DENSE_RANK() OVER (ORDER BY ap.totalPoints DESC) as ranking
-      FROM AggregatedPoints ap
-      JOIN users u ON ap.employee_id = u.id
-      ORDER BY ap.totalPoints DESC, u.name ASC;
-    `);
-
-    // Map the results to include the #1, #2 formatting requested
-    const leaderboard = result.recordset.map(row => ({
-      ...row,
-      rankDisplay: `#${row.ranking}`
-    }));
-
-    res.json(leaderboard);
-  } catch (err) {
-    console.error('[LEADERBOARD FETCH ERROR]:', err);
-    res.status(500).json({ error: 'Failed to generate global ranking leaderboard' });
-  }
-});
+// --- END OF REWARD SYSTEM --- //
 
 
 /**
@@ -8749,24 +10144,46 @@ app.get('/api/admin/rewards/history', verifyToken, async (req, res) => {
 app.get(['/api/rewards/leaderboard', '/api/quizzes/leaderboard'], verifyToken, async (req, res) => {
   try {
     const pool = await getPool();
-    // OPTIMIZED: INNER JOIN excludes users with 0 rewards, avoids scanning profile_picture for non-participants
     const result = await pool.request().query(`
       WITH CombinedPoints AS (
-        SELECT employee_id, points, 1 as is_award FROM employee_rewards
+        SELECT employee_id, points, 1 as is_award FROM employee_rewards WITH (NOLOCK)
         UNION ALL
-        SELECT employee_id, total_points as points, 0 as is_award FROM quiz_completions
+        SELECT employee_id, total_points as points, 0 as is_award FROM quiz_completions WITH (NOLOCK)
+      ),
+      AllParticipants AS (
+        SELECT id, name, role, team, profile_picture FROM users WITH (NOLOCK)
+        UNION ALL
+        SELECT id, name, role, 'New Joinee' as team, profile_picture FROM new_joinees WITH (NOLOCK)
+        UNION ALL
+        SELECT id, name, role, 'Intern' as team, profile_picture FROM interns WITH (NOLOCK)
       )
       SELECT 
-        u.id, u.name, u.role, u.team, u.profile_picture,
-        SUM(cp.points) as total_rep,
-        SUM(cp.is_award) as total_awards,
-        DENSE_RANK() OVER (ORDER BY SUM(cp.points) DESC) as rank
-      FROM CombinedPoints cp WITH (NOLOCK)
-      INNER JOIN users u WITH (NOLOCK) ON u.id = cp.employee_id
-      GROUP BY u.id, u.name, u.role, u.team, u.profile_picture
+        ap.id, ap.name, ap.role, ap.team, ap.profile_picture,
+        SUM(CASE WHEN cp.is_award = 1 THEN cp.points ELSE 0 END) as total_reward_points,
+        SUM(CASE WHEN cp.is_award = 0 THEN cp.points ELSE 0 END) as total_quiz_points,
+        ISNULL(SUM(cp.points), 0) as total_rep,
+        ISNULL(SUM(cp.is_award), 0) as total_awards,
+        DENSE_RANK() OVER (ORDER BY ISNULL(SUM(cp.points), 0) DESC) as rank
+      FROM AllParticipants ap
+      LEFT JOIN CombinedPoints cp ON ap.id = cp.employee_id
+      GROUP BY ap.id, ap.name, ap.role, ap.team, ap.profile_picture
       ORDER BY total_rep DESC
     `);
-    res.json(result.recordset);
+
+    const formattedLeaderboard = result.recordset.map(row => ({
+      ...row,
+      rankDisplay: `#${row.rank}`,
+      // Comprehensive keys for frontend compatibility
+      rewardPoints: row.total_reward_points || 0,
+      quizPoints: row.total_quiz_points || 0,
+      reward_points: row.total_reward_points || 0,
+      quiz_points: row.total_quiz_points || 0,
+      reward: row.total_reward_points || 0,
+      quiz: row.total_quiz_points || 0,
+      totalPoints: row.total_rep || 0
+    }));
+
+    res.json(formattedLeaderboard);
   } catch (err) {
     console.error('[LEADERBOARD ERROR]:', err);
     res.status(500).json({ error: 'Failed to extract global rankings' });
@@ -8880,6 +10297,42 @@ app.get('/api/employees/leaderboard/all', verifyToken, async (req, res) => {
 });
 
 // --- FUN QUIZ SYSTEM --- //
+
+/**
+ * 46.0.5 Get Total Quiz Points for All Users
+ */
+app.get('/api/quizzes/user-points', verifyToken, async (req, res) => {
+  try {
+    const pool = await getPool();
+    const result = await pool.request().query(`
+      WITH AllParticipants AS (
+        SELECT id, name, role, team, profile_picture FROM users WITH (NOLOCK)
+        UNION ALL
+        SELECT id, name, role, 'New Joinee' as team, profile_picture FROM new_joinees WITH (NOLOCK)
+        UNION ALL
+        SELECT id, name, role, 'Intern' as team, profile_picture FROM interns WITH (NOLOCK)
+      )
+      SELECT 
+        ap.id as employee_id, 
+        ap.name, 
+        ap.role, 
+        ap.team, 
+        ap.profile_picture,
+        ISNULL(SUM(qc.total_points), 0) as total_quiz_points,
+        ISNULL(SUM(qc.total_points), 0) as quizPoints,
+        ISNULL(SUM(qc.total_points), 0) as quiz,
+        COUNT(qc.id) as quizzes_completed
+      FROM AllParticipants ap
+      LEFT JOIN quiz_completions qc WITH (NOLOCK) ON ap.id = qc.employee_id
+      GROUP BY ap.id, ap.name, ap.role, ap.team, ap.profile_picture
+      ORDER BY total_quiz_points DESC
+    `);
+    res.json(result.recordset);
+  } catch (err) {
+    console.error('[QUIZ USER POINTS ERROR]:', err);
+    res.status(500).json({ error: 'Failed to extract quiz points' });
+  }
+});
 
 /**
  * 46.1 Submit a New Quiz (Leadership Only)
@@ -10770,6 +12223,23 @@ app.use('/api', (req, res) => {
     },
     suggestion: 'Double-check your API route spelling and method in the frontend application.'
   });
+});
+
+// --- GLOBAL ERROR HANDLER --- //
+app.use((err, req, res, next) => {
+  if (err instanceof URIError) {
+    const clientIP = req.headers['x-forwarded-for']?.split(',')[0].trim() || req.ip;
+    console.error(`[URI ERROR] Malformed URL from ${clientIP}: ${req.url}`);
+    return res.status(400).json({
+      error: 'Malformed URL sequence',
+      details: 'The request URL contains invalid characters or sequences.'
+    });
+  }
+
+  console.error('[GLOBAL ERROR]:', err.message);
+  if (!res.headersSent) {
+    res.status(500).json({ error: 'Internal server error', details: err.message });
+  }
 });
 
 // DB Initialization for Employee Profiles table (ensure new photo columns exist)

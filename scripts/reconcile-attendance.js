@@ -55,7 +55,18 @@ async function reconcileAttendance(userId = null, lookbackDays = null) {
 async function calculateUserMonthlyStats(userId, month, year) {
     try {
         const pool = await getPool();
-        const targetMonth = parseInt(month);
+        const monthNames = [
+            "", "January", "February", "March", "April", "May", "June",
+            "July", "August", "September", "October", "November", "December"
+        ];
+        let targetMonth = 0;
+        if (/^\d+$/.test(String(month).trim())) {
+            targetMonth = parseInt(month);
+        } else {
+            const mStr = String(month).trim().toLowerCase();
+            const idx = monthNames.findIndex(m => m.toLowerCase() === mStr);
+            if (idx > 0) targetMonth = idx;
+        }
         const targetYear = parseInt(year);
 
         const userRes = await pool.request()
@@ -65,15 +76,34 @@ async function calculateUserMonthlyStats(userId, month, year) {
         if (userRes.recordset.length === 0) throw new Error('User not found');
         const user = userRes.recordset[0];
         if (!user.joining_date) {
-            return { total_present: 0, total_leaves: 0, total_absent: 0, available_leave_balance: 0 };
+            return {
+                total_present: 0,
+                total_weekly_off: 0,
+                total_holidays: 0,
+                total_leaves: 0,
+                total_absent: 0,
+                total_work_ot: '0',
+                total_ot_hours: '0:00',
+                available_leave_balance: 0
+            };
         }
 
-        const holidays = (await pool.request().query('SELECT holiday_date FROM holidays')).recordset.map(h => h.holiday_date.toISOString().split('T')[0]);
+        const holidays = (await pool.request().query('SELECT holiday_date FROM holidays')).recordset
+            .filter(h => h.holiday_date)
+            .map(h => h.holiday_date.toISOString().split('T')[0]);
         const userLeaves = (await pool.request().input('uid', sql.Int, userId).query("SELECT start_date, end_date FROM leaves WHERE user_id = @uid AND hr_status = 'Approved'")).recordset;
-        const userLogs = (await pool.request().input('uid', sql.Int, userId).query('SELECT punch_date, status FROM attendance_logs WHERE user_id = @uid')).recordset;
+        
+        // Select status, remark, and work_time to calculate weekly off, holidays, and OT accurately
+        const userLogs = (await pool.request().input('uid', sql.Int, userId).query('SELECT punch_date, status, remark, work_time FROM attendance_logs WHERE user_id = @uid')).recordset;
 
         const logMap = userLogs.reduce((acc, l) => {
-            acc[l.punch_date.toISOString().split('T')[0]] = l.status;
+            if (l.punch_date) {
+                try {
+                    acc[l.punch_date.toISOString().split('T')[0]] = l.status;
+                } catch (e) {
+                    console.warn('[RECONCILE] Invalid punch_date:', l.punch_date);
+                }
+            }
             return acc;
         }, {});
 
@@ -100,21 +130,16 @@ async function calculateUserMonthlyStats(userId, month, year) {
         });
 
         let totalUnaccountedGaps = 0;
-        let monthlyPresent = 0;
-        let monthlyLeaves = 0;
-        let monthlyAbsents = 0;
-
-        // --- CALCULATION BOUNDARIES ---
         // 1. Clean Slate: Only deduct for gaps starting from April 1st, 2026 (reliable data start)
         const ABSENT_DEDUCTION_START = new Date('2026-04-01');
 
+        // Historical Audit Loop (calculates leaves used/unaccounted gaps since joining)
         for (let d = new Date(joiningDate); d <= auditEnd; d.setDate(d.getDate() + 1)) {
-            if (d.getDay() === 0) continue; 
             const dateStr = d.toISOString().split('T')[0];
-            if (holidays.includes(dateStr)) continue;
-
-            const isTargetMonth = (d.getMonth() + 1) === targetMonth && d.getFullYear() === targetYear;
             const dayStatus = logMap[dateStr];
+
+            if (d.getDay() === 0) continue; 
+            if (holidays.includes(dateStr)) continue;
 
             const isOnApprovedLeave = userLeaves.some(l => {
                 const s = new Date(l.start_date);
@@ -123,13 +148,6 @@ async function calculateUserMonthlyStats(userId, month, year) {
             });
 
             if (dayStatus === 'P' || dayStatus === 'Half Day') {
-                const dayValue = dayStatus === 'Half Day' ? 0.5 : 1;
-                if (isTargetMonth) {
-                    monthlyPresent += dayValue;
-                    if (dayStatus === 'Half Day') monthlyAbsents += 0.5;
-                }
-                
-                // Half-day counts as 0.5 unaccounted gap for leave deduction
                 if (dayStatus === 'Half Day' && d >= ABSENT_DEDUCTION_START && d > probationEndDate) {
                     totalUnaccountedGaps += 0.5;
                 }
@@ -137,28 +155,102 @@ async function calculateUserMonthlyStats(userId, month, year) {
             }
 
             if (isOnApprovedLeave) {
-                if (isTargetMonth) monthlyLeaves++;
                 continue;
             }
 
-            // --- REFINED DEDUCTION LOGIC ---
-            // Only count as an unaccounted gap (Absent deduction) if:
-            // - The date is on or after the Clean Slate threshold (April 1st)
-            // - The date is AFTER the employee's 90-day probation period
             if (d >= ABSENT_DEDUCTION_START && d > probationEndDate) {
                 totalUnaccountedGaps++;
             }
-            
-            if (isTargetMonth) monthlyAbsents++;
         }
+
+        // Dedicated Targeted Month Loop (calculates monthly roster stats perfectly for past, present, or future months)
+        const getDaysInMonth = (year, month) => new Date(year, month, 0).getDate();
+        const totalDaysInTargetMonth = getDaysInMonth(targetYear, targetMonth);
+        
+        let monthlyPresent = 0;
+        let monthlyWeeklyOff = 0;
+        let monthlyHolidays = 0;
+        let monthlyLeaves = 0;
+        let monthlyAbsents = 0;
+        let monthlyWorkOTCount = 0;
+        let totalOTMinutes = 0;
+
+        for (let day = 1; day <= totalDaysInTargetMonth; day++) {
+            const d = new Date(targetYear, targetMonth - 1, day);
+            const dateStr = d.toISOString().split('T')[0];
+            const dayStatus = logMap[dateStr];
+            const dayLog = userLogs.find(l => l.punch_date && l.punch_date.toISOString().split('T')[0] === dateStr);
+
+            // Count Weekly Offs (Sundays or specifically marked 'WO' in logs)
+            if (d.getDay() === 0 || dayStatus === 'WO') {
+                monthlyWeeklyOff++;
+            }
+
+            // Count official holidays
+            if (holidays.includes(dateStr) || dayStatus === 'Holiday') {
+                monthlyHolidays++;
+            }
+
+            // Count approved leaves in target month
+            const isOnApprovedLeave = userLeaves.some(l => {
+                const s = new Date(l.start_date);
+                const e = new Date(l.end_date);
+                return d >= s && d <= e;
+            });
+            if (isOnApprovedLeave) {
+                monthlyLeaves++;
+            }
+
+            if (dayStatus === 'P' || dayStatus === 'Half Day') {
+                const dayValue = dayStatus === 'Half Day' ? 0.5 : 1;
+                monthlyPresent += dayValue;
+                if (dayStatus === 'Half Day') {
+                    monthlyAbsents += 0.5;
+                }
+            } else if (!isOnApprovedLeave && d.getDay() !== 0 && !holidays.includes(dateStr)) {
+                // If it is in the past or present, count as absent if no log and no leave/holiday/weekly off
+                const todayOnlyDate = new Date();
+                todayOnlyDate.setHours(0,0,0,0);
+                const dOnlyDate = new Date(d);
+                dOnlyDate.setHours(0,0,0,0);
+                if (dOnlyDate <= todayOnlyDate) {
+                    monthlyAbsents++;
+                }
+            }
+
+            // Count days with Overtime remarks and sum the extra minutes (work_time > 8 hours/480 mins)
+            if (dayLog && dayLog.remark && dayLog.remark.toUpperCase().includes('OT')) {
+                monthlyWorkOTCount++;
+                if (dayLog.work_time) {
+                    try {
+                        const [h, m] = dayLog.work_time.split(':').map(Number);
+                        const totalMinutes = (h || 0) * 60 + (m || 0);
+                        if (totalMinutes > 480) { // 8 hours standard shift
+                            totalOTMinutes += (totalMinutes - 480);
+                        }
+                    } catch (e) {
+                        console.warn('Failed to parse work_time for OT:', dayLog.work_time);
+                    }
+                }
+            }
+        }
+
+        const otHours = Math.floor(totalOTMinutes / 60);
+        const otMins = totalOTMinutes % 60;
+        const totalOTHoursStr = `${otHours}:${otMins.toString().padStart(2, '0')}`;
 
         return {
             employee_id: userId,
             month: targetMonth,
             year: targetYear,
             total_present: monthlyPresent,
+            total_weekly_off: monthlyWeeklyOff,
+            total_holidays: monthlyHolidays,
             total_leaves: monthlyLeaves,
             total_absent: monthlyAbsents,
+            total_work_ot: monthlyWorkOTCount.toString(),
+            total_ot_hours: totalOTHoursStr,
+            available_leaves: Math.max(0, totalAccrued - totalUsedLeaves - totalUnaccountedGaps),
             available_leave_balance: Math.max(0, totalAccrued - totalUsedLeaves - totalUnaccountedGaps)
         };
 
