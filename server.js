@@ -308,6 +308,50 @@ const getPool = async () => {
       console.warn('⚠️ Non-critical fun_quizzes migration warning:', migErr.message);
     }
 
+    // RECONCILE UNSTAGE/UNSUBMITTED QUIZ ATTEMPTS INTO COMPLETIONS
+    try {
+      await _pool.request().query(`
+        -- 1. Create a temp table of unsubmitted correct attempts grouped by employee and date
+        SELECT 
+          employee_id, 
+          CAST(qa.created_at AS DATE) as comp_date,
+          SUM(CASE WHEN qa.is_correct = 1 THEN 1 ELSE 0 END) as correct_cnt,
+          -- We join with fun_quizzes to get the exact point rewards
+          SUM(CASE WHEN qa.is_correct = 1 THEN ISNULL(fq.points_reward, 100) ELSE 0 END) as total_pts
+        INTO #UnsubmittedCompletions
+        FROM quiz_attempts qa
+        JOIN fun_quizzes fq ON qa.quiz_id = fq.id
+        WHERE ISNULL(qa.is_submitted, 0) = 0
+        GROUP BY employee_id, CAST(qa.created_at AS DATE);
+
+        -- 2. Update existing quiz_completions records
+        UPDATE qc
+        SET qc.total_points = qc.total_points + uc.total_pts,
+            qc.correct_count = qc.correct_count + uc.correct_cnt
+        FROM quiz_completions qc
+        JOIN #UnsubmittedCompletions uc ON qc.employee_id = uc.employee_id AND qc.completion_date = uc.comp_date;
+
+        -- 3. Insert new quiz_completions records
+        INSERT INTO quiz_completions (employee_id, completion_date, total_points, correct_count)
+        SELECT uc.employee_id, uc.comp_date, uc.total_pts, uc.correct_cnt
+        FROM #UnsubmittedCompletions uc
+        WHERE uc.total_pts > 0 AND NOT EXISTS (
+          SELECT 1 FROM quiz_completions qc 
+          WHERE qc.employee_id = uc.employee_id AND qc.completion_date = uc.comp_date
+        );
+
+        -- 4. Mark all as submitted
+        UPDATE quiz_attempts
+        SET is_submitted = 1
+        WHERE ISNULL(is_submitted, 0) = 0;
+
+        DROP TABLE #UnsubmittedCompletions;
+      `);
+      console.log('✅ Reconciled any pending quiz attempts into quiz completions.');
+    } catch (recErr) {
+      console.warn('⚠️ Pending quiz reconciliation warning:', recErr.message);
+    }
+
     console.log('✅ Suggestions and Quizzes tracking systems initialized.');
   } catch (err) {
     console.error('❌ Failed to initialize database migrations:', err.message);
@@ -10863,19 +10907,63 @@ app.post(['/api/quizzes/:id/answer', '/api/fun-quizzes/submit-answer'], verifyTo
     console.log(`[QUIZ DEBUG] User Selected Answer: "${directAnswer}" (len: ${directAnswer.length})`);
     console.log(`[QUIZ DEBUG] Match Solution: ${isCorrect === 1 ? 'YES' : 'NO'}`);
 
-    // 2. Insert Attempt Log with direct answer text
+    // 2. Insert Attempt Log with direct answer text (marked as is_submitted = 1 immediately)
     await pool.request()
       .input('quizId', sql.Int, quizId)
       .input('userId', sql.Int, userId)
       .input('opt', sql.NVarChar, directAnswer)
       .input('isCorrect', sql.Bit, isCorrect)
       .query(`
-        INSERT INTO quiz_attempts (quiz_id, employee_id, selected_option, is_correct)
-        VALUES (@quizId, @userId, @opt, @isCorrect)
+        INSERT INTO quiz_attempts (quiz_id, employee_id, selected_option, is_correct, is_submitted)
+        VALUES (@quizId, @userId, @opt, @isCorrect, 1)
         `);
 
-    // 3. (REMOVED) Immediate Point Injection
-    // Points are now granted upon calling /api/quizzes/submit-session
+    // 3. Immediate Point Injection directly into quiz_completions if correct!
+    if (isCorrect === 1) {
+      const today = new Date().toISOString().split('T')[0];
+      const points = quizData.points_reward || 0;
+      
+      const transaction = new sql.Transaction(pool);
+      await transaction.begin();
+      try {
+        const checkCompletion = await transaction.request()
+          .input('userId', sql.Int, userId)
+          .input('today', sql.Date, today)
+          .query(`
+            SELECT id FROM quiz_completions 
+            WHERE employee_id = @userId AND completion_date = @today
+          `);
+
+        if (checkCompletion.recordset.length > 0) {
+          // Increment existing record
+          await transaction.request()
+            .input('userId', sql.Int, userId)
+            .input('today', sql.Date, today)
+            .input('pts', sql.Int, points)
+            .query(`
+              UPDATE quiz_completions 
+              SET total_points = total_points + @pts,
+                  correct_count = correct_count + 1
+              WHERE employee_id = @userId AND completion_date = @today
+            `);
+        } else {
+          // Create new record
+          await transaction.request()
+            .input('userId', sql.Int, userId)
+            .input('today', sql.Date, today)
+            .input('pts', sql.Int, points)
+            .query(`
+              INSERT INTO quiz_completions (employee_id, completion_date, total_points, correct_count)
+              VALUES (@userId, @today, @pts, 1)
+            `);
+        }
+        await transaction.commit();
+        console.log(`[QUIZ POINTS INJECTION] Automatically awarded ${points} points to User ${userId} for correct answer.`);
+      } catch (transErr) {
+        await transaction.rollback();
+        console.error('[QUIZ POINTS INJECTION ERROR]:', transErr);
+      }
+    }
 
     res.json({
       success: true,
