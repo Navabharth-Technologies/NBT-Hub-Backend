@@ -285,10 +285,32 @@ const getPool = async () => {
           ALTER TABLE [dbo].[employee_suggestions] ADD [requirement] NVARCHAR(MAX);
         END
       END
+
+      -- FUN QUIZZES SOFT DELETE MIGRATION
+      IF EXISTS (SELECT * FROM sys.tables WHERE name = 'fun_quizzes')
+      BEGIN
+        IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('fun_quizzes') AND name = 'is_deleted')
+        BEGIN
+          ALTER TABLE fun_quizzes ADD is_deleted BIT DEFAULT 0;
+        END
+      END
     `);
-    console.log('✅ Suggestions tracking system initialized.');
+
+    // Ensure all NULL is_deleted values are updated to 0
+    try {
+      await _pool.request().query(`
+        IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('fun_quizzes') AND name = 'is_deleted')
+        BEGIN
+          EXEC('UPDATE fun_quizzes SET is_deleted = 0 WHERE is_deleted IS NULL');
+        END
+      `);
+    } catch (migErr) {
+      console.warn('⚠️ Non-critical fun_quizzes migration warning:', migErr.message);
+    }
+
+    console.log('✅ Suggestions and Quizzes tracking systems initialized.');
   } catch (err) {
-    console.error('❌ Failed to initialize suggestions table:', err.message);
+    console.error('❌ Failed to initialize database migrations:', err.message);
   }
 
   return _pool;
@@ -2331,25 +2353,130 @@ app.post(['/api/profile/upload-doc', '/api/profile/upload-document', '/api/uploa
     return res.status(400).json({ error: 'userId, docType, and fileData are required.' });
   }
 
-  // Map user-friendly names to DB columns
   const columnMap = {
+    // 1. PAN Card
     'pancard': 'pancard_photo',
     'pan_card': 'pancard_photo',
+    'pan': 'pancard_photo',
+    'pancard_photo': 'pancard_photo',
+    'pan_card_photo': 'pancard_photo',
+    'pancard_proof': 'pancard_photo',
+    'pan_card_proof': 'pancard_photo',
+    'pan_card_copy': 'pancard_photo',
+    'pancardproof': 'pancard_photo',
+    'pancardphoto': 'pancard_photo',
+
+    // 2. Aadhar Card
     'aadhar': 'adharcard_photo',
     'aadhar_card': 'adharcard_photo',
+    'adhar': 'adharcard_photo',
+    'adhar_card': 'adharcard_photo',
+    'adharcard': 'adharcard_photo',
+    'adharcard_photo': 'adharcard_photo',
+    'aadharcard_photo': 'adharcard_photo',
+    'adhar_card_photo': 'adharcard_photo',
+    'aadhar_card_photo': 'adharcard_photo',
+    'aadhar_proof': 'adharcard_photo',
+    'adhar_proof': 'adharcard_photo',
+    'aadhar_card_proof': 'adharcard_photo',
+    'adhar_card_proof': 'adharcard_photo',
+    'aadharcard_proof': 'adharcard_photo',
+    'adharcard_proof': 'adharcard_photo',
+    'aadharcardproof': 'adharcard_photo',
+    'adharcardproof': 'adharcard_photo',
+    'aadharcardphoto': 'adharcard_photo',
+    'adharcardphoto': 'adharcard_photo',
+    'aadhar_card_copy': 'adharcard_photo',
+    'adhar_card_copy': 'adharcard_photo',
+
+    // 3. Experience Letter
     'experience': 'experience_letter_photo',
+    'experience_letter': 'experience_letter_photo',
+    'experience_letter_photo': 'experience_letter_photo',
+    'experience_letter_proof': 'experience_letter_photo',
+    'experience_letter_copy': 'experience_letter_photo',
+    'experienceletter': 'experience_letter_photo',
+    'exp_letter': 'experience_letter_photo',
+    'exp_letter_copy': 'experience_letter_photo',
+
+    // 4. Voter ID
     'voterid': 'voter_id_photo',
     'voter_id': 'voter_id_photo',
+    'voter_id_proof': 'voter_id_photo',
+    'voter_id_photo': 'voter_id_photo',
+    'voterid_proof': 'voter_id_photo',
+    'voteridproof': 'voter_id_photo',
+    'voter_id_card': 'voter_id_photo',
+    'voter_id_card_photo': 'voter_id_photo',
+    'voter_id_copy': 'voter_id_photo',
+
+    // 5. Passport
     'passport': 'passport_photo',
+    'passport_photo': 'passport_photo',
+    'passport_proof': 'passport_photo',
+    'passport_copy': 'passport_photo',
+    'passportproof': 'passport_photo',
+    'passportphoto': 'passport_photo',
+
+    // 6. Payslip
     'payslip': 'previous_company_payslip',
+    'pay_slip': 'previous_company_payslip',
+    'previous_company_payslip': 'previous_company_payslip',
+    'previous_payslip': 'previous_company_payslip',
+    'previouspayslip': 'previous_company_payslip',
+    'payslip_photo': 'previous_company_payslip',
+    'payslip_proof': 'previous_company_payslip',
+    'payslip_copy': 'previous_company_payslip',
+    'previous_company_payslip_photo': 'previous_company_payslip',
+    'previous_company_payslip_proof': 'previous_company_payslip',
+    'previous_company_payslip_copy': 'previous_company_payslip',
+
+    // 7. Passbook
     'passbook': 'passbook_photo',
     'bank_passbook': 'passbook_photo',
+    'passbook_photo': 'passbook_photo',
+    'passbook_proof': 'passbook_photo',
+    'passbook_copy': 'passbook_photo',
+    'bank_passbook_photo': 'passbook_photo',
+    'bank_passbook_proof': 'passbook_photo',
+    'bank_passbook_copy': 'passbook_photo',
+
+    // 8. SSLC Marks Card
     'sslc_marks': 'sslc_markscard',
+    'sslc': 'sslc_markscard',
+    'sslc_markscard': 'sslc_markscard',
+    'sslc_marks_card': 'sslc_markscard',
+    'sslc_photo': 'sslc_markscard',
+    'sslc_proof': 'sslc_markscard',
+    'sslc_copy': 'sslc_markscard',
+
+    // 9. PUC Marks Card
     'puc_marks': 'puc_markscard',
-    'ug_pg_marks': 'ug_pg_markscard'
+    'puc': 'puc_markscard',
+    'puc_markscard': 'puc_markscard',
+    'puc_marks_card': 'puc_markscard',
+    'puc_photo': 'puc_markscard',
+    'puc_proof': 'puc_markscard',
+    'puc_copy': 'puc_markscard',
+
+    // 10. UG/PG Marks Card / Degree
+    'ug_pg_marks': 'ug_pg_markscard',
+    'ug_pg': 'ug_pg_markscard',
+    'ug_pg_markscard': 'ug_pg_markscard',
+    'ug_pg_marks_card': 'ug_pg_markscard',
+    'ug_pg_photo': 'ug_pg_markscard',
+    'ug_pg_proof': 'ug_pg_markscard',
+    'ug_pg_copy': 'ug_pg_markscard',
+    'degree': 'ug_pg_markscard',
+    'degree_marks': 'ug_pg_markscard',
+    'degree_markscard': 'ug_pg_markscard',
+    'degree_marks_card': 'ug_pg_markscard',
+    'degree_photo': 'ug_pg_markscard',
+    'degree_proof': 'ug_pg_markscard',
+    'degree_copy': 'ug_pg_markscard'
   };
 
-  const dbColumn = columnMap[docType.toLowerCase()] || docType.replace(/\s+/g, '_');
+  const dbColumn = columnMap[docType.toLowerCase().trim()] || docType.replace(/\s+/g, '_');
 
   try {
     const pool = await getPool();
@@ -3032,10 +3159,8 @@ async function getUsersMap() {
 
 // 1b. Get raw historical database backup logs for all synced attendance entries
 app.get(['/api/attendance_logs', '/api/attendance logs', '/api/attendance%20logs'], verifyToken, async (req, res) => {
-  const { startDate, endDate, team, status, page = 1, limit = 50 } = req.query;
+  const { startDate, endDate, team, status } = req.query;
   const userId = sanitizeNumericId(req.query.userId);
-  const safeLimit = Math.min(parseInt(limit) || 50, 100);
-  const offset = (parseInt(page) - 1) * safeLimit;
 
   try {
     const pool = await getPool();
@@ -3088,10 +3213,6 @@ app.get(['/api/attendance_logs', '/api/attendance logs', '/api/attendance%20logs
     }
 
     queryStr += ` ORDER BY a.punch_date DESC`;
-    queryStr += ` OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY`;
-
-    request.input('offset', sql.Int, offset);
-    request.input('limit', sql.Int, safeLimit);
 
     const result = await request.query(queryStr);
 
@@ -3137,8 +3258,8 @@ app.get(['/api/attendance_logs', '/api/attendance logs', '/api/attendance%20logs
       success: true,
       count: mappedData.length,
       totalRecords: parseInt(totalRecords),
-      page: parseInt(page),
-      limit: parseInt(limit),
+      page: 1,
+      limit: mappedData.length,
       data: mappedData
     });
   } catch (err) {
@@ -4148,24 +4269,101 @@ app.put('/api/admin/birthdays/:userId', verifyToken, async (req, res) => {
 
 // --- DASHBOARD ANALYTICS ROUTES --- //
 
+// 9.9. Get Dashboard Metrics and Stats
+app.get('/api/dashboard-stats', async (req, res) => {
+  try {
+    const pool = await getPool();
+    const result = await pool.request().query(`
+      SELECT
+        (SELECT COUNT(*) FROM users WITH (NOLOCK)) as totalEmployees,
+        (SELECT COUNT(*) FROM master_tasks WITH (NOLOCK)) as totalTasks,
+        (SELECT COUNT(*) FROM leaves WITH (NOLOCK) WHERE (rm_status <> 'Rejected' AND pm_status <> 'Rejected' AND hr_status <> 'Rejected' AND hr_status <> 'Approved')) as pendingLeaves,
+        (SELECT COUNT(*) FROM support_tickets WITH (NOLOCK) WHERE status IN ('Open', 'In Progress')) as openTickets,
+        (SELECT COUNT(*) FROM employee_suggestions WITH (NOLOCK)) as totalSuggestions
+    `);
+
+    const stats = result.recordset[0] || {
+      totalEmployees: 0,
+      totalTasks: 0,
+      pendingLeaves: 0,
+      openTickets: 0,
+      totalSuggestions: 0
+    };
+
+    res.json({
+      success: true,
+      data: stats,
+      // Supporting raw flat properties for maximum frontend dashboard compatibility
+      totalEmployees: stats.totalEmployees,
+      totalTasks: stats.totalTasks,
+      pendingLeaves: stats.pendingLeaves,
+      openTickets: stats.openTickets,
+      totalSuggestions: stats.totalSuggestions
+    });
+  } catch (err) {
+    console.error('[DASHBOARD STATS ERROR]:', err);
+    res.status(500).json({ error: 'Failed to fetch dashboard stats', details: err.message });
+  }
+});
+
 // 10. Get All Users (for Metrics)
 // --- CACHED DASHBOARD ANALYTICS --- //
 let allUsersCache = null;
 let lastAllUsersCacheUpdate = 0;
 
 app.get('/api/users', async (req, res) => {
-  const now = Date.now();
-  if (allUsersCache && (now - lastAllUsersCacheUpdate < 300000)) return res.json(allUsersCache);
+  const page = req.query.page ? parseInt(req.query.page) : null;
+  const limit = req.query.limit ? Math.min(parseInt(req.query.limit) || 10, 100) : null;
 
+  // If pagination is not requested, use the memory cache to make it extremely fast
+  if (!page) {
+    const now = Date.now();
+    if (allUsersCache && (now - lastAllUsersCacheUpdate < 300000)) return res.json(allUsersCache);
+
+    try {
+      let pool = await getPool();
+      const result = await pool.request().query('SELECT id, name, email, role, team, joining_date FROM users WITH (NOLOCK) ORDER BY name ASC');
+      allUsersCache = result.recordset;
+      lastAllUsersCacheUpdate = now;
+      return res.json(allUsersCache);
+    } catch (err) {
+      if (allUsersCache) return res.json(allUsersCache);
+      return res.status(500).json({ error: 'Failed to fetch users' });
+    }
+  }
+
+  // If pagination IS requested, fetch paged results dynamically from the database
+  const offset = (page - 1) * limit;
   try {
-    let pool = await getPool();
-    const result = await pool.request().query('SELECT id, name, email, role, team, joining_date FROM users WITH (NOLOCK)');
-    allUsersCache = result.recordset;
-    lastAllUsersCacheUpdate = now;
-    res.json(allUsersCache);
+    const pool = await getPool();
+    const request = pool.request();
+    request.input('offset', sql.Int, offset);
+    request.input('limit', sql.Int, limit);
+
+    // Fetch total users count
+    const countRes = await pool.request().query('SELECT COUNT(*) as total FROM users WITH (NOLOCK)');
+    const totalCount = countRes.recordset[0]?.total || 0;
+
+    const result = await request.query(`
+      SELECT id, name, email, role, team, joining_date 
+      FROM users WITH (NOLOCK) 
+      ORDER BY name ASC 
+      OFFSET @offset ROWS 
+      FETCH NEXT @limit ROWS ONLY
+    `);
+
+    res.json({
+      success: true,
+      data: result.recordset,
+      pagination: {
+        total: totalCount,
+        page: page,
+        limit: limit,
+        pages: Math.ceil(totalCount / limit)
+      }
+    });
   } catch (err) {
-    if (allUsersCache) return res.json(allUsersCache);
-    res.status(500).json({ error: 'Failed to fetch users' });
+    res.status(500).json({ error: 'Failed to fetch users dynamically' });
   }
 });
 
@@ -6170,15 +6368,55 @@ app.get(['/api/notifications', '/api/notifications/:userId'], verifyToken, async
     return res.status(403).json({ error: 'Access denied to these alerts' });
   }
 
+  const page = req.query.page ? parseInt(req.query.page) : null;
+  const limit = req.query.limit ? Math.min(parseInt(req.query.limit) || 10, 50) : null;
+
+  if (!page) {
+    // Backward compatibility: fetch top 100 notifications in a single call
+    try {
+      const pool = await getPool();
+      const result = await pool.request()
+        .input('uid', sql.Int, userId)
+        .query('SELECT TOP 100 * FROM notifications WITH (NOLOCK) WHERE target_user_id = @uid ORDER BY created_at DESC');
+      return res.json(result.recordset);
+    } catch (err) {
+      console.error('[NOTIFICATIONS FETCH ERROR]', err);
+      return res.status(500).json({ error: 'Failed to fetch notifications' });
+    }
+  }
+
+  // Paginated load optimized with OFFSET/FETCH and COUNT(*) OVER() to avoid dual querying
+  const offset = (page - 1) * limit;
   try {
     const pool = await getPool();
-    const result = await pool.request()
-      .input('uid', sql.Int, userId)
-      .query('SELECT TOP 100 * FROM notifications WITH (NOLOCK) WHERE target_user_id = @uid ORDER BY created_at DESC');
-    res.json(result.recordset);
+    const request = pool.request();
+    request.input('uid', sql.Int, userId);
+    request.input('offset', sql.Int, offset);
+    request.input('limit', sql.Int, limit);
+
+    const result = await request.query(`
+      SELECT *, COUNT(*) OVER() as totalCount
+      FROM notifications WITH (NOLOCK)
+      WHERE target_user_id = @uid
+      ORDER BY created_at DESC
+      OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY
+    `);
+
+    const totalCount = result.recordset.length > 0 ? result.recordset[0].totalCount : 0;
+
+    res.json({
+      success: true,
+      data: result.recordset,
+      pagination: {
+        total: totalCount,
+        page: page,
+        limit: limit,
+        pages: Math.ceil(totalCount / limit)
+      }
+    });
   } catch (err) {
-    console.error('[NOTIFICATIONS FETCH ERROR]', err);
-    res.status(500).json({ error: 'Failed to fetch notifications' });
+    console.error('[NOTIFICATIONS PAGINATED FETCH ERROR]', err);
+    res.status(500).json({ error: 'Failed to fetch paginated notifications' });
   }
 });
 
@@ -6698,26 +6936,69 @@ app.delete('/api/interns/:id', async (req, res) => {
 // GET: All tickets for a user (including assigned agent details)
 app.get('/api/support-tickets', async (req, res) => {
   const { userId } = req.query;
+  const page = req.query.page ? parseInt(req.query.page) : null;
+  const limit = req.query.limit ? Math.min(parseInt(req.query.limit) || 10, 50) : null;
+
   try {
     const pool = await getPool();
     const request = pool.request();
+
+    if (!page) {
+      // Backward compatibility: fetch all records without pagination
+      let query = `
+         SELECT t.*, 
+                u.name as creatorName, u.email as creatorEmail,
+                t.created_at as created_at, 
+                t.updated_at as updated_at,
+                sa.agent_name as assignedAgent
+         FROM support_tickets t WITH (NOLOCK)
+         LEFT JOIN support_agents sa WITH (NOLOCK) ON t.department = sa.department
+         LEFT JOIN users u WITH (NOLOCK) ON t.user_id = u.id
+      `;
+      if (userId) {
+        query += ' WHERE t.user_id = @userId';
+        request.input('userId', sql.Int, userId);
+      }
+      query += ' ORDER BY t.created_at DESC';
+      const result = await request.query(query);
+      return res.json(result.recordset);
+    }
+
+    // Paginated load optimized with OFFSET/FETCH and COUNT(*) OVER() to avoid dual querying
+    const offset = (page - 1) * limit;
+    request.input('offset', sql.Int, offset);
+    request.input('limit', sql.Int, limit);
+
     let query = `
        SELECT t.*, 
               u.name as creatorName, u.email as creatorEmail,
               t.created_at as created_at, 
               t.updated_at as updated_at,
-              sa.agent_name as assignedAgent
-       FROM support_tickets t
-       LEFT JOIN support_agents sa ON t.department = sa.department
-       LEFT JOIN users u ON t.user_id = u.id
+              sa.agent_name as assignedAgent,
+              COUNT(*) OVER() as totalCount
+       FROM support_tickets t WITH (NOLOCK)
+       LEFT JOIN support_agents sa WITH (NOLOCK) ON t.department = sa.department
+       LEFT JOIN users u WITH (NOLOCK) ON t.user_id = u.id
     `;
     if (userId) {
       query += ' WHERE t.user_id = @userId';
       request.input('userId', sql.Int, userId);
     }
-    query += ' ORDER BY t.created_at DESC';
+    query += ' ORDER BY t.created_at DESC OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY';
+    
     const result = await request.query(query);
-    res.json(result.recordset);
+    const totalCount = result.recordset.length > 0 ? result.recordset[0].totalCount : 0;
+
+    res.json({
+      success: true,
+      data: result.recordset,
+      pagination: {
+        total: totalCount,
+        page: page,
+        limit: limit,
+        pages: Math.ceil(totalCount / limit)
+      }
+    });
   } catch (err) {
     console.error('Failed to fetch tickets:', err);
     res.status(500).json({ error: 'Failed to retrieve support tickets' });
@@ -8133,7 +8414,7 @@ const masterLeaveListHandler = async (req, res) => {
 };
 
 app.get('/api/leaves/all', verifyToken, masterLeaveListHandler);
-app.get('/api/admin/leaves', verifyToken, masterLeaveListHandler);
+app.get(['/api/admin/leaves', '/api/admin/leave-requests', '/api/admin/leave-request'], verifyToken, masterLeaveListHandler);
 app.get(['/api/admin/leaves/all', '/api/leaves/admin/all'], verifyToken, masterLeaveListHandler);
 app.get(['/api/leaves/team', '/api/leave/team'], verifyToken, masterLeaveListHandler);
 app.get('/api/leaves/comprehensive', verifyToken, masterLeaveListHandler);
@@ -10462,20 +10743,16 @@ app.delete(['/api/quizzes/:id', '/api/fun-quizzes/:id'], verifyToken, async (req
   try {
     const pool = await getPool();
 
-    // Delete associated attempts first to maintain referential integrity
-    await pool.request()
-      .input('quizId', sql.Int, quizId)
-      .query('DELETE FROM quiz_attempts WHERE quiz_id = @quizId');
-
+    // SOFT DELETE: Mark as deleted to keep referential integrity and track points!
     const result = await pool.request()
       .input('id', sql.Int, quizId)
-      .query('DELETE FROM fun_quizzes WHERE id = @id');
+      .query('UPDATE fun_quizzes SET is_deleted = 1 WHERE id = @id');
 
     if (result.rowsAffected[0] === 0) {
       return res.status(404).json({ error: 'Quiz not found.' });
     }
 
-    res.json({ success: true, message: 'Quiz deleted successfully!' });
+    res.json({ success: true, message: 'Quiz successfully hidden (soft-deleted). Associated points are fully preserved!' });
   } catch (err) {
     console.error('[QUIZ DELETE ERROR]:', err);
     res.status(500).json({ error: 'Failed to delete quiz', details: err.message });
@@ -10508,6 +10785,7 @@ app.get(['/api/quizzes/active', '/api/quizzes', '/api/fun-quizzes', '/api/quizze
         FROM fun_quizzes q
         LEFT JOIN users u ON q.created_by = u.id
         LEFT JOIN quiz_attempts a ON q.id = a.quiz_id AND a.employee_id = @userId
+        WHERE ISNULL(q.is_deleted, 0) = 0
         ORDER BY q.created_at DESC
       `);
 
@@ -10559,7 +10837,7 @@ app.post(['/api/quizzes/:id/answer', '/api/fun-quizzes/submit-answer'], verifyTo
                a.id as attempt_id 
         FROM fun_quizzes q
         LEFT JOIN quiz_attempts a ON q.id = a.quiz_id AND a.employee_id = @userId
-        WHERE q.id = @quizId
+        WHERE q.id = @quizId AND ISNULL(q.is_deleted, 0) = 0
       `);
 
     if (quizCheck.recordset.length === 0) {
@@ -12493,6 +12771,41 @@ const initializeThreadReactionsTable = async (providedPool) => {
   }
 };
 
+// DB Initialization for Query Optimizations (Indexes)
+const initializeDatabaseIndexes = async (providedPool) => {
+  try {
+    const pool = providedPool || await getPool();
+    await pool.request().query(`
+      -- Optimization Index for Leaves table (User query & history scroll)
+      IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_leaves_user_id_created_at' AND object_id = OBJECT_ID('leaves'))
+      BEGIN
+        CREATE INDEX idx_leaves_user_id_created_at ON leaves(user_id, created_at DESC);
+      END
+
+      -- Optimization Index for Notifications table (User alerts infinite scroll)
+      IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_notifications_target_user_id_created_at' AND object_id = OBJECT_ID('notifications'))
+      BEGIN
+        CREATE INDEX idx_notifications_target_user_id_created_at ON notifications(target_user_id, created_at DESC);
+      END
+
+      -- Optimization Index for Support Tickets table (Support scroll/history lookup)
+      IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_support_tickets_user_id_created_at' AND object_id = OBJECT_ID('support_tickets'))
+      BEGIN
+        CREATE INDEX idx_support_tickets_user_id_created_at ON support_tickets(user_id, created_at DESC);
+      END
+
+      -- Optimization Index for Users table (Search/Directory lookup autocomplete)
+      IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_users_name_email' AND object_id = OBJECT_ID('users'))
+      BEGIN
+        CREATE INDEX idx_users_name_email ON users(name, email);
+      END
+    `);
+    Log.success('Database', 'Query optimization indexes are ready');
+  } catch (err) {
+    Log.error('Database', 'Failed to initialize database indexes', err.message);
+  }
+};
+
 // Initialize server ONLY after database is ready
 getPool().then(async (pool) => {
   console.clear();
@@ -12510,6 +12823,7 @@ getPool().then(async (pool) => {
   await runMigration('Attendance', initializeAttendanceTable);
   await runMigration('Threads', initializeThreadCommentsTable);
   await runMigration('Reactions', initializeThreadReactionsTable);
+  await runMigration('Indexes', initializeDatabaseIndexes);
   app.listen(PORT, '0.0.0.0', () => {
     Log.ready(`System operational on port ${PORT}`);
     Log.divider();
