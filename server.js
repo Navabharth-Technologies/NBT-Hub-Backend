@@ -226,8 +226,16 @@ const sanitizeNumericId = (rawId) => {
 
   // Clean up any trailing commas or whitespace and ensure it's a native JS Number (required by mssql driver)
   const cleaned = idStr.replace(/,/g, '').trim();
-  const parsed = parseInt(cleaned, 10);
-  return isNaN(parsed) ? null : parsed;
+  let parsed = parseInt(cleaned, 10);
+  if (isNaN(parsed)) return null;
+
+  // --- DYNAMIC ID BRIDGE: AUTO-CORRECT 6-DIGIT SESSIONS (20250X -> 2025X) ---
+  const strId = String(parsed);
+  if (strId.startsWith('20250') && strId.length === 6) {
+    parsed = parseInt(strId.replace('20250', '2025'), 10);
+  }
+
+  return parsed;
 };
 
 // --- PASSWORD RESET OTP STORE --- //
@@ -237,7 +245,7 @@ const otps = new Map(); // Store: { email: { code, expires } }
 const driveService = require('./google-drive-service');
 
 // NEW: NBT Career Portal Integration (Job Listings & Applications)
-const { incomingRouter, publishJobToWebsite } = require('./nbt-integration');
+const { incomingRouter, publishJobToWebsite, syncApplications } = require('./nbt-integration');
 
 /**
  * Helper to upload a Multer file to Google Drive and return the link
@@ -420,6 +428,20 @@ const normalizeVideoUrl = (url, req = null) => {
 };
 
 /**
+ * Formats a point value to the Indian (INR) numbering style (e.g. 1,00,000 or 50,000)
+ */
+const formatINR = (val) => {
+  const num = parseInt(val, 10);
+  if (isNaN(num)) return '0';
+  let str = num.toString();
+  if (str.length <= 3) return str;
+  let lastThree = str.substring(str.length - 3);
+  let otherNumbers = str.substring(0, str.length - 3);
+  otherNumbers = otherNumbers.replace(/\B(?=(\d{2})+(?!\d))/g, ',');
+  return otherNumbers + ',' + lastThree;
+};
+
+/**
  * Normalizes all photo fields within a profile object
  */
 const normalizeProfile = (profile) => {
@@ -544,13 +566,78 @@ app.use((req, res, next) => {
 const REWARD_CATEGORIES = ['Performance', 'Peer Recognition', 'Service Anniversary', 'Fun Quiz', 'Core Values', 'Other'];
 
 
-// 2.5 Static Folder Serving (for uploaded images/videos)
-// app.use('/uploads', express.static(path.join(__dirname, 'uploads'))); // Retired local storage
+// 2.5 Static Folder Serving & Resilient Career Resume Proxy
+const resumeProxyHandler = async (req, res, next) => {
+  const { filename } = req.params;
+  if (!filename) return res.status(400).send('Invalid filename');
+
+  // If this is a Google Drive proxy request, let it continue to next matching route
+  if (filename === 'drive') {
+    return next();
+  }
+
+  // 1. Try local storage first
+  const localPath = path.join(__dirname, 'uploads', filename);
+  if (fs.existsSync(localPath)) {
+    return res.sendFile(localPath);
+  }
+
+  // 2. Fallback: Search career portal database for resume_url matching filename
+  try {
+    const pool = await getPool();
+    const queryRes = await pool.request()
+      .input('filename', sql.NVarChar, `%${filename}%`)
+      .query('SELECT TOP 1 resume_url FROM job_applications WHERE resume_url LIKE @filename');
+
+    if (queryRes.recordset.length > 0) {
+      const externalUrl = queryRes.recordset[0].resume_url;
+      console.log(`[RESUME PROXY] Serving external resume for ${filename} -> ${externalUrl}`);
+
+      // Stream the PDF directly to bypass Render / browser CORS / security blocks
+      const fileRes = await fetch(externalUrl);
+      if (fileRes.ok) {
+        res.setHeader('Content-Type', fileRes.headers.get('content-type') || 'application/pdf');
+        res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
+        
+        if (fileRes.body && typeof fileRes.body.pipe === 'function') {
+          return fileRes.body.pipe(res);
+        } else if (fileRes.body) {
+          const reader = fileRes.body.getReader();
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            res.write(value);
+          }
+          return res.end();
+        }
+      }
+      
+      // Fallback: Redirect if streaming fails
+      return res.redirect(externalUrl);
+    }
+  } catch (err) {
+    console.error('[RESUME PROXY ERROR] Failed to stream resume:', err.message);
+  }
+
+  res.status(404).send('File not found');
+};
+
+// Register routes explicitly for maximum compatibility across all routing architectures
+app.get('/uploads/:filename', resumeProxyHandler);
+app.get('/api/uploads/:filename', resumeProxyHandler);
+app.get('/uploads/uploads/:filename', resumeProxyHandler);
+app.get('/api/uploads/uploads/:filename', resumeProxyHandler);
 
 // 2.55 GOOGLE DRIVE PROXY SERVICE
 // Bypasses "You need access" and iframe connectivity issues by streaming files through the backend.
 // Note: We use /uploads/drive as a prefix because the frontend automatically prepends /uploads/ to relative paths.
-app.get(['/uploads/drive/:fileId', '/api/drive/stream/:fileId'], async (req, res) => {
+app.get([
+  '/uploads/drive/:fileId', 
+  '/api/uploads/drive/:fileId', 
+  '/uploads/uploads/drive/:fileId', 
+  '/api/uploads/uploads/drive/:fileId', 
+  '/api/drive/stream/:fileId'
+], async (req, res) => {
   const { fileId } = req.params;
   if (!fileId || fileId === 'undefined') return res.status(400).send('Invalid File ID');
 
@@ -610,6 +697,9 @@ app.get('/api/status', (req, res) => {
  *   - 'token_invalid'     → JWT signature mismatch or tampering
  *   - 'server_error'      → database or internal error during verification
  */
+// --- PERFORMANCE CACHE: Token Version Cache to prevent DB bottlenecks ---
+const tokenVersionCache = new Map();
+
 const getVerifiedUser = async (token) => {
   if (!token) return { user: null, reason: 'no_token' };
   try {
@@ -623,19 +713,31 @@ const getVerifiedUser = async (token) => {
     }
 
     let table = 'users';
-    if (decoded.userType === 'new_joinee') table = 'new_joinees';
-    else if (decoded.userType === 'intern') table = 'interns';
+    const userType = decoded.userType || 'employee';
+    if (userType === 'new_joinee') table = 'new_joinees';
+    else if (userType === 'intern') table = 'interns';
 
-    const result = await pool.request()
-      .input('id', sql.Int, decoded.id)
-      .query(`SELECT token_version FROM ${table} WHERE id = @id`);
+    const cacheKey = `${userType}_${decoded.id}`;
+    const now = Date.now();
+    const cached = tokenVersionCache.get(cacheKey);
 
-    if (result.recordset.length === 0) {
-      Log.auth(`Account Not Found: User ID ${decoded.id} in ${table}`, 'This account may have been deleted or the token is for a different environment.');
-      return { user: null, reason: 'account_deleted' };
+    let currentVersion = 0;
+    if (cached && cached.expiry > now) {
+      currentVersion = cached.version;
+    } else {
+      const result = await pool.request()
+        .input('id', sql.Int, decoded.id)
+        .query(`SELECT token_version FROM ${table} WHERE id = @id`);
+
+      if (result.recordset.length === 0) {
+        Log.auth(`Account Not Found: User ID ${decoded.id} in ${table}`, 'This account may have been deleted or the token is for a different environment.');
+        return { user: null, reason: 'account_deleted' };
+      }
+
+      currentVersion = result.recordset[0].token_version || 0;
+      // Cache token version for 5 seconds (5000ms) to make parallel requests extremely fast
+      tokenVersionCache.set(cacheKey, { version: currentVersion, expiry: now + 5000 });
     }
-
-    const currentVersion = result.recordset[0].token_version || 0;
     const tokenVersion = decoded.token_version || 0;
 
     // REJECTION LOGIC: If DB has a newer version, the token is stale/revoked
@@ -882,6 +984,13 @@ app.delete('/api/job-postings/:id', verifyToken, async (req, res) => {
 // GET: List all incoming job applications
 app.get('/api/job-applications', verifyToken, async (req, res) => {
   try {
+    // Resilient Pull-Sync: Pull new job applications from portal automatically before loading
+    try {
+      await syncApplications();
+    } catch (syncErr) {
+      console.error('[AUTO-SYNC WARNING] Failed to pull-sync applications:', syncErr.message);
+    }
+
     const pool = await getPool();
     const result = await pool.request().query(`
       SELECT 
@@ -897,6 +1006,33 @@ app.get('/api/job-applications', verifyToken, async (req, res) => {
   } catch (err) {
     Log.error('Job Applications', 'Failed to fetch applications', err.message);
     res.status(500).json({ error: 'Failed to fetch job applications' });
+  }
+});
+
+// GET: Manually trigger a pull-sync of job applications from portal (Authenticated)
+app.get('/api/job-applications/sync', verifyToken, async (req, res) => {
+  try {
+    const syncRes = await syncApplications();
+    res.json(syncRes);
+  } catch (err) {
+    Log.error('Job Applications Sync', 'Failed to manually sync', err.message);
+    res.status(500).json({ error: 'Failed to sync job applications' });
+  }
+});
+
+// GET: Public manual sync endpoint using the webhook secret as a key
+app.get('/api/public/job-applications/sync', async (req, res) => {
+  const { key } = req.query;
+  if (!key || key !== process.env.NBT_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized. Invalid or missing secret key.' });
+  }
+
+  try {
+    const syncRes = await syncApplications();
+    res.json(syncRes);
+  } catch (err) {
+    Log.error('Public Job Applications Sync', 'Failed to sync', err.message);
+    res.status(500).json({ error: 'Failed to sync job applications' });
   }
 });
 
@@ -1322,6 +1458,8 @@ app.post(['/api/password/reset-with-otp', '/api/auth/reset-with-otp'], async (re
         .query('UPDATE new_joinees SET password = @pass, token_version = ISNULL(token_version, 0) + 1 WHERE email_id = @email');
     }
 
+    // Invalidate token cache
+    tokenVersionCache.clear();
     otps.delete(email);
     Log.success('Auth', `Password successfully reset via OTP for ${email}`);
     res.json({ success: true, message: 'Password updated successfully' });
@@ -1378,6 +1516,9 @@ app.post(['/api/password/change-password', '/api/profile/update-password'], veri
       .input('newVersion', sql.Int, newTokenVersion)
       .query(`UPDATE ${table} SET password = @pass, token_version = @newVersion WHERE id = @id`);
 
+    // Invalidate token cache
+    tokenVersionCache.clear();
+
     // Generate a FRESH token for the current device with the new token_version
     // This ensures the device that changed the password stays logged in
     const freshToken = jwt.sign(
@@ -1431,6 +1572,9 @@ app.post('/api/logout/global', verifyToken, async (req, res) => {
       .input('id', sql.Int, id)
       .input('newVersion', sql.Int, newVersion)
       .query(`UPDATE ${table} SET token_version = @newVersion WHERE id = @id`);
+
+    // Invalidate token cache
+    tokenVersionCache.clear();
 
     Log.auth(`Global Logout performed for ${email}`, `token_version bumped to v${newVersion}. All active sessions invalidated.`);
     res.json({ success: true, message: 'Logged out from all devices successfully.', logoutAll: true });
@@ -1780,6 +1924,8 @@ const handleProfileGet = async (req, res) => {
                u.phone_number, u.profile_picture, u.about_me, 
                u.date_of_birth, u.team, u.reporting_manager_id, u.joining_date,
                m.name AS reporting_manager_name,
+               (SELECT ISNULL(SUM(points), 0) FROM employee_rewards WHERE employee_id = u.id) as total_reward_points,
+               (SELECT ISNULL(SUM(total_points), 0) FROM quiz_completions WHERE employee_id = u.id) as total_quiz_points,
                a.*,
                p.*
         FROM users u
@@ -1806,7 +1952,18 @@ const handleProfileGet = async (req, res) => {
         }
 
         const intern = internResult.recordset[0];
-        return res.json({ ...intern, employee_id: intern.id, userType: 'intern' });
+        return res.json({ 
+          ...intern, 
+          employee_id: intern.id, 
+          userType: 'intern',
+          rewardPoints: '0',
+          quizPoints: '0',
+          totalPoints: '0',
+          totalRep: '0',
+          reward_points: '0',
+          quiz_points: '0',
+          total_points: '0'
+        });
       }
 
       const nj = joineeResult.recordset[0];
@@ -1818,7 +1975,14 @@ const handleProfileGet = async (req, res) => {
         userType: 'new_joinee',
         employee_id: nj.id,
         team: 'Onboarding',
-        aboutMe: 'New Joinee - Profile Pending'
+        aboutMe: 'New Joinee - Profile Pending',
+        rewardPoints: '0',
+        quizPoints: '0',
+        totalPoints: '0',
+        totalRep: '0',
+        reward_points: '0',
+        quiz_points: '0',
+        total_points: '0'
       });
     }
 
@@ -1842,6 +2006,16 @@ const handleProfileGet = async (req, res) => {
       reportingManagerId: userRow.reporting_manager_id,
       reportingManagerName: userRow.reporting_manager_name,
       reportingManager: userRow.reporting_manager_name, // Support for existing UI fields
+      rewardPoints: formatINR(userRow.total_reward_points),
+      quizPoints: formatINR(userRow.total_quiz_points),
+      totalPoints: formatINR((userRow.total_reward_points || 0) + (userRow.total_quiz_points || 0)),
+      totalRep: formatINR((userRow.total_reward_points || 0) + (userRow.total_quiz_points || 0)),
+      reward_points: formatINR(userRow.total_reward_points),
+      quiz_points: formatINR(userRow.total_quiz_points),
+      total_points: formatINR((userRow.total_reward_points || 0) + (userRow.total_quiz_points || 0)),
+      rewardPointsNum: userRow.total_reward_points || 0,
+      quizPointsNum: userRow.total_quiz_points || 0,
+      totalPointsNum: (userRow.total_reward_points || 0) + (userRow.total_quiz_points || 0),
       assets: assetData
     });
 
@@ -4830,6 +5004,63 @@ app.post(['/api/assign-task', '/api/tasks', '/api/master-task'], async (req, res
   } catch (err) {
 
     console.error('âŒ SQL ERROR:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 12.9 Superadmin Endpoint to View Tasks Grouped by Team and Status (Supports standard & admin endpoints)
+app.get(['/api/admin/tasks/team-status', '/api/tasks/team-status'], verifyToken, async (req, res) => {
+  // Check if role is Founder, CEO, Admin, HR, etc.
+  if (!isHRRole(req.user.role)) {
+    return res.status(403).json({ error: 'Access denied. Superadmin privileges required.' });
+  }
+
+  try {
+    let pool = await getPool();
+    if (!pool || typeof pool.request !== 'function') {
+      return res.status(503).json({ error: 'Database is currently offline' });
+    }
+
+    const result = await pool.request().query(`
+      SELECT 
+        at.id, 
+        at.title as task_name,
+        at.description,
+        at.status, 
+        at.progress, 
+        at.deadline,
+        at.created_at,
+        at.updated_at,
+        COALESCE(u_owner.name, 'System/Admin') as assigner_name,
+        COALESCE(u_assignee.name, j_assignee.name, 'Unassigned') as assignee_name,
+        ISNULL(COALESCE(u_assignee.team, CASE WHEN j_assignee.id IS NOT NULL THEN 'New Joinee' ELSE NULL END), 'No Team') as assignee_team,
+        COALESCE(u_assignee.role, j_assignee.role, 'Employee') as assignee_role
+      FROM master_tasks at WITH (NOLOCK)
+      LEFT JOIN users u_owner WITH (NOLOCK) ON at.owner_id = u_owner.id
+      LEFT JOIN users u_assignee WITH (NOLOCK) ON at.assignee_id = u_assignee.id
+      LEFT JOIN new_joinees j_assignee WITH (NOLOCK) ON at.assignee_id = j_assignee.id
+      WHERE at.type = 'TASK'
+      ORDER BY assignee_team ASC, at.created_at DESC
+    `);
+
+    // Group the tasks by team in backend for cleaner frontend processing
+    const grouped = {};
+    result.recordset.forEach(task => {
+      const team = task.assignee_team || 'No Team';
+      if (!grouped[team]) {
+        grouped[team] = [];
+      }
+      grouped[team].push(task);
+    });
+
+    res.json({
+      success: true,
+      total_tasks: result.recordset.length,
+      teams_count: Object.keys(grouped).length,
+      data: grouped
+    });
+  } catch (err) {
+    console.error('❌ SQL ERROR in team-status:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -9439,7 +9670,7 @@ const monthNames = [
  * 40. Generate/Create Pay Slip (Admin/HR only)
  * Logic: Supports both initial creation and updates for a specific month/year.
  */
-app.post(['/api/admin/pay-slips', '/api/pay_slip'], verifyToken, async (req, res) => {
+app.post(['/api/admin/pay-slips', '/api/admin/payslips', '/api/pay_slip', '/api/payslips'], verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
   if (!role.includes('hr') && !role.includes('human resource') && !role.includes('ceo') && !role.includes('admin')) {
     return res.status(403).json({ error: 'Unauthorized: Only Admin/HR can generate pay slips.' });
@@ -9573,12 +9804,37 @@ app.post(['/api/admin/pay-slips', '/api/pay_slip'], verifyToken, async (req, res
   }
 });
 
+/**
+ * 40.5 GET Eligible Users for Pay Slip Generation (Includes HR & Managers)
+ */
+app.get('/api/admin/pay-slips/eligible-users', verifyToken, async (req, res) => {
+  const role = (req.user.role || '').toLowerCase();
+  if (!role.includes('hr') && !role.includes('human resource') && !role.includes('ceo') && !role.includes('admin')) {
+    return res.status(403).json({ error: 'Unauthorized: Only Admin/HR can access payroll eligible list.' });
+  }
+
+  try {
+    const pool = await getPool();
+    const result = await pool.request().query(`
+      SELECT u.id, u.name, u.email, u.role, u.team, u.joining_date,
+             ep.department, ep.salary as basic_salary, ep.pt as pt_deduction
+      FROM users u WITH (NOLOCK)
+      LEFT JOIN employee_profiles ep WITH (NOLOCK) ON u.id = ep.employee_id
+      ORDER BY u.name ASC
+    `);
+    res.json(result.recordset);
+  } catch (err) {
+    console.error('[ELIGIBLE USERS FETCH ERROR]:', err);
+    res.status(500).json({ error: 'Failed to fetch payroll eligible users.' });
+  }
+});
+
 const { calculateUserMonthlyStats } = require('./scripts/reconcile-attendance');
 
 /**
  * 41. Calculate Monthly Attendance Summary (For UI Pre-fill)
  */
-app.get('/api/admin/pay-slips/calculate-summary', verifyToken, async (req, res) => {
+app.get(['/api/admin/pay-slips/calculate-summary', '/api/admin/payslips/calculate-summary', '/api/payslips/calculate-summary'], verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
   if (!role.includes('hr') && !role.includes('human resource') && !role.includes('ceo') && !role.includes('admin')) {
     return res.status(403).json({ error: 'Unauthorized: Admin access required.' });
@@ -9699,7 +9955,7 @@ app.get('/api/admin/pay-slips/calculate-summary', verifyToken, async (req, res) 
 /**
  * 41. Fetch My Pay Slips (Employee Role)
  */
-app.get('/api/pay-slips/my', verifyToken, async (req, res) => {
+app.get(['/api/pay-slips/my', '/api/payslips/my'], verifyToken, async (req, res) => {
   const userId = req.user.id;
   console.log(`[DEBUG] Pay Slip Request for User ID: ${userId} (Type: ${typeof userId})`);
 
@@ -9939,21 +10195,28 @@ app.get('/api/admin/mandatory-suggestions/audit/trigger', async (req, res) => {
 /**
  * 42. Get All Pay Slips (Admin/HR Management View)
  */
-app.get('/api/admin/pay-slips', verifyToken, async (req, res) => {
+app.get(['/api/admin/pay-slips', '/api/admin/payslips', '/api/payslips'], verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  if (!role.includes('hr') && !role.includes('human resource') && !role.includes('ceo') && !role.includes('admin')) {
-    return res.status(403).json({ error: 'Unauthorized access to organizational payroll records.' });
-  }
+  const userId = req.user.id;
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('ceo') || role.includes('admin');
 
   const { month, year, team } = req.query;
   const empIdParam = req.query.employee_id || req.query.employeeId || req.query.userId || req.query.empId;
 
+  // Security: If not Admin/HR, they can ONLY view their own payslips.
+  // Force target employee ID to be their own user ID if they are not admin.
+  let targetEmpId = null;
+  if (!isAdmin) {
+    targetEmpId = userId;
+  } else if (empIdParam) {
+    targetEmpId = sanitizeNumericId(empIdParam);
+  }
+
   try {
     const pool = await getPool();
 
-    // If an employee_id is specifically requested along with month and year, check and return default pre-fill if not found
-    if (empIdParam && month && year) {
-      const targetEmpId = sanitizeNumericId(empIdParam);
+    // If an employee_id is specifically requested (or forced for non-admins) along with month and year, check and return pre-fill
+    if (targetEmpId && month && year) {
       const monthNames = [
         "", "January", "February", "March", "April", "May", "June",
         "July", "August", "September", "October", "November", "December"
@@ -10071,6 +10334,15 @@ app.get('/api/admin/pay-slips', verifyToken, async (req, res) => {
       WHERE 1=1
     `;
 
+    // Force filtering for non-admins to only see their own payslips
+    if (!isAdmin) {
+      query += ' AND ps.employee_id = @userId';
+      request.input('userId', sql.Int, userId);
+    } else if (targetEmpId) {
+      query += ' AND ps.employee_id = @empId';
+      request.input('empId', sql.Int, targetEmpId);
+    }
+
     if (month) { 
       let targetMonth = 0;
       const monthNames = ["", "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
@@ -10086,7 +10358,6 @@ app.get('/api/admin/pay-slips', verifyToken, async (req, res) => {
     }
     if (year) { query += ' AND ps.year = @year'; request.input('year', sql.Int, year); }
     if (team) { query += ' AND u.team = @team'; request.input('team', sql.NVarChar, team); }
-    if (empIdParam) { query += ' AND ps.employee_id = @empId'; request.input('empId', sql.Int, sanitizeNumericId(empIdParam)); }
 
     query += ' ORDER BY ps.year DESC, ps.month DESC, ps.emp_name ASC';
     const result = await request.query(query);
@@ -10100,7 +10371,7 @@ app.get('/api/admin/pay-slips', verifyToken, async (req, res) => {
 /**
  * 43. Get Specific Pay Slip Details
  */
-app.get('/api/pay-slips/:id', verifyToken, async (req, res) => {
+app.get(['/api/pay-slips/:id', '/api/payslips/:id'], verifyToken, async (req, res) => {
   const id = sanitizeNumericId(req.params.id);
   const userId = req.user.id;
   const role = (req.user.role || '').toLowerCase();
@@ -10138,9 +10409,30 @@ app.get('/api/rewards/points/:employee_id', verifyToken, async (req, res) => {
     const pool = await getPool();
     const result = await pool.request()
       .input('eid', sql.Int, employee_id)
-      .query('SELECT SUM(points) as totalPoints FROM employee_rewards WHERE employee_id = @eid');
+      .query(`
+        SELECT 
+          (SELECT ISNULL(SUM(points), 0) FROM employee_rewards WHERE employee_id = @eid) as total_reward_points,
+          (SELECT ISNULL(SUM(total_points), 0) FROM quiz_completions WHERE employee_id = @eid) as total_quiz_points
+      `);
 
-    res.json({ employee_id, totalPoints: result.recordset[0]?.totalPoints || 0 });
+    const rewardPoints = result.recordset[0]?.total_reward_points || 0;
+    const quizPoints = result.recordset[0]?.total_quiz_points || 0;
+    const totalPoints = rewardPoints + quizPoints;
+
+    res.json({ 
+      employee_id, 
+      totalPoints: formatINR(totalPoints),
+      rewardPoints: formatINR(rewardPoints),
+      quizPoints: formatINR(quizPoints),
+      // Legacy compatibility keys
+      total_reward_points: formatINR(rewardPoints),
+      total_quiz_points: formatINR(quizPoints),
+      reward_points: formatINR(rewardPoints),
+      quiz_points: formatINR(quizPoints),
+      totalPointsNum: totalPoints,
+      rewardPointsNum: rewardPoints,
+      quizPointsNum: quizPoints
+    });
   } catch (err) {
     console.error('[REWARD POINTS FETCH ERROR]:', err);
     res.status(500).json({ error: 'Failed to fetch reward points summary' });
@@ -10152,7 +10444,9 @@ app.get('/api/rewards/points/:employee_id', verifyToken, async (req, res) => {
  * This is a private trick to adjust points without going through the standard quiz/task flow.
  */
 app.post('/api/admin/rewards/bypass', async (req, res) => {
-  const { userId, points, reason, secret } = req.body;
+  const userId = sanitizeNumericId(req.body.userId);
+  const points = req.body.points !== undefined ? req.body.points : (req.body.total_points !== undefined ? req.body.total_points : req.body.totalPoints);
+  const { reason, secret } = req.body;
 
   // Hidden security check
   if (secret !== 'nbt_dev_2026_override') {
@@ -10165,18 +10459,15 @@ app.post('/api/admin/rewards/bypass', async (req, res) => {
     await transaction.begin();
 
     try {
-      // 1. Log to history silently
+      // Log silently to employee_rewards to correctly adjust user's point totals
       await transaction.request()
         .input('userId', sql.Int, userId)
         .input('pts', sql.Int, points)
-        .input('reason', sql.NVarChar, reason || 'System Adjustment')
-        .query('INSERT INTO rewards_history (user_id, points, reason, created_at) VALUES (@userId, @pts, @reason, DATEADD(MINUTE, 330, GETUTCDATE()))');
-
-      // 2. Update user total
-      await transaction.request()
-        .input('userId', sql.Int, userId)
-        .input('pts', sql.Int, points)
-        .query('UPDATE users SET reward_points = ISNULL(reward_points, 0) + @pts WHERE id = @userId');
+        .input('reason', sql.NVarChar, reason || 'Developer Adjustment')
+        .query(`
+          INSERT INTO employee_rewards (employee_id, reward_name, points, category, granted_by, note, created_at)
+          VALUES (@userId, @reason, @pts, 'Other', 20250, @reason, DATEADD(MINUTE, 330, GETUTCDATE()))
+        `);
 
       await transaction.commit();
       res.json({ success: true, message: 'Adjustment processed silently.' });
@@ -10212,17 +10503,32 @@ app.get('/api/rewards/user/:employee_id', verifyToken, async (req, res) => {
         ORDER BY r.created_at DESC;
         
         -- 2. Get Total Points
-        SELECT SUM(points) as totalPoints FROM employee_rewards WHERE employee_id = @eid;
+        SELECT 
+          (SELECT ISNULL(SUM(points), 0) FROM employee_rewards WHERE employee_id = @eid) as total_reward_points,
+          (SELECT ISNULL(SUM(total_points), 0) FROM quiz_completions WHERE employee_id = @eid) as total_quiz_points;
       `);
 
     const history = result.recordsets[0] || [];
     const pointsSummary = result.recordsets[1][0];
-    const totalPoints = pointsSummary ? (pointsSummary.totalPoints || 0) : 0;
+    const rewardPoints = pointsSummary ? (pointsSummary.total_reward_points || 0) : 0;
+    const quizPoints = pointsSummary ? (pointsSummary.total_quiz_points || 0) : 0;
+    const totalPoints = rewardPoints + quizPoints;
+
+    const formattedHistory = history.map(item => ({
+      ...item,
+      points: formatINR(item.points),
+      pointsNum: item.points
+    }));
 
     res.json({
       employee_id,
-      totalPoints,
-      history
+      totalPoints: formatINR(totalPoints),
+      rewardPoints: formatINR(rewardPoints),
+      quizPoints: formatINR(quizPoints),
+      totalPointsNum: totalPoints,
+      rewardPointsNum: rewardPoints,
+      quizPointsNum: quizPoints,
+      history: formattedHistory
     });
   } catch (err) {
     console.error('[REWARD USER HISTORY FETCH ERROR]:', err);
@@ -10301,7 +10607,7 @@ app.post('/api/rewards', verifyToken, async (req, res) => {
  * 45. Get My Awards & Global Ranking (Supports both standard and legacy calls)
  */
 app.get(['/api/rewards', '/api/rewards/my'], verifyToken, async (req, res) => {
-  const userId = req.user.id;
+  const userId = sanitizeNumericId(req.user.id);
   try {
     const pool = await getPool();
 
@@ -10373,12 +10679,19 @@ app.get(['/api/rewards', '/api/rewards/my'], verifyToken, async (req, res) => {
     else if (stats.total_rep >= 500) score = 'Medium';
 
     res.json({
-      awards,
+      awards: awards.map(a => ({
+        ...a,
+        points: formatINR(a.points),
+        pointsNum: a.points
+      })),
       summary: {
-        totalRep: stats.total_rep,
+        totalRep: formatINR(stats.total_rep),
         globalRank: stats.rank === 'Unranked' ? 'Unranked' : `#${stats.rank}`,
-        rewardPoints: stats.total_reward_points || 0,
-        quizPoints: stats.total_quiz_points || 0,
+        rewardPoints: formatINR(stats.total_reward_points || 0),
+        quizPoints: formatINR(stats.total_quiz_points || 0),
+        totalRepNum: stats.total_rep,
+        rewardPointsNum: stats.total_reward_points || 0,
+        quizPointsNum: stats.total_quiz_points || 0,
         endorsements: stats.endorsements,
         leadershipScore: score
       }
@@ -10397,13 +10710,13 @@ app.get(['/api/rewards', '/api/rewards/my'], verifyToken, async (req, res) => {
  * 47. Get Rewards Given by User (Manager Audit History)
  */
 app.get('/api/rewards/given', verifyToken, async (req, res) => {
-  const userId = req.query.userId || req.user.id;
+  const userId = sanitizeNumericId(req.query.userId || req.user.id);
   console.log(`[DEBUG] Rewards Given History Request for User ID: ${userId} (Type: ${typeof userId})`);
 
   try {
     const pool = await getPool();
     const result = await pool.request()
-      .input('userId', sql.Int, parseInt(userId))
+      .input('userId', sql.Int, userId)
       .query(`
         SELECT 
           r.*, 
@@ -10456,7 +10769,13 @@ app.get('/api/admin/rewards/history', verifyToken, async (req, res) => {
       ORDER BY r.created_at DESC
     `);
 
-    res.json(result.recordset);
+    const formatted = result.recordset.map(row => ({
+      ...row,
+      points: formatINR(row.points),
+      pointsNum: row.points
+    }));
+
+    res.json(formatted);
   } catch (err) {
     console.error('[ADMIN REWARD HISTORY ERROR]:', err);
     res.status(500).json({ error: 'Failed to extract organizational reward history' });
@@ -10495,18 +10814,33 @@ app.get(['/api/rewards/leaderboard', '/api/quizzes/leaderboard'], verifyToken, a
       ORDER BY total_rep DESC
     `);
 
-    const formattedLeaderboard = result.recordset.map(row => ({
-      ...row,
-      rankDisplay: `#${row.rank}`,
-      // Comprehensive keys for frontend compatibility
-      rewardPoints: row.total_reward_points || 0,
-      quizPoints: row.total_quiz_points || 0,
-      reward_points: row.total_reward_points || 0,
-      quiz_points: row.total_quiz_points || 0,
-      reward: row.total_reward_points || 0,
-      quiz: row.total_quiz_points || 0,
-      totalPoints: row.total_rep || 0
-    }));
+    const formattedLeaderboard = result.recordset.map(row => {
+      const rewardPoints = row.total_reward_points || 0;
+      const quizPoints = row.total_quiz_points || 0;
+      const totalPoints = row.total_rep || 0;
+
+      return {
+        ...row,
+        rankDisplay: `#${row.rank}`,
+        // Format native SQL keys to INR style
+        total_rep: formatINR(totalPoints),
+        total_reward_points: formatINR(rewardPoints),
+        total_quiz_points: formatINR(quizPoints),
+        // Comprehensive keys formatted for INR style
+        rewardPoints: formatINR(rewardPoints),
+        quizPoints: formatINR(quizPoints),
+        reward_points: formatINR(rewardPoints),
+        quiz_points: formatINR(quizPoints),
+        reward: formatINR(rewardPoints),
+        quiz: formatINR(quizPoints),
+        totalPoints: formatINR(totalPoints),
+        // Add raw numbers for calculations/sorting
+        rewardPointsNum: rewardPoints,
+        quizPointsNum: quizPoints,
+        totalPointsNum: totalPoints,
+        totalRepNum: totalPoints
+      };
+    });
 
     res.json(formattedLeaderboard);
   } catch (err) {
@@ -10614,10 +10948,386 @@ app.get('/api/employees/leaderboard/all', verifyToken, async (req, res) => {
       GROUP BY u.id, u.name, u.role, u.team, u.profile_picture
       ORDER BY total_rep DESC, u.name ASC
     `);
-    res.json({ success: true, data: result.recordset });
+
+    const formatted = result.recordset.map(row => ({
+      ...row,
+      total_rep: formatINR(row.total_rep),
+      totalRepNum: row.total_rep,
+      totalPoints: formatINR(row.total_rep),
+      total_points: formatINR(row.total_rep),
+      totalPointsNum: row.total_rep
+    }));
+
+    res.json({ success: true, data: formatted });
   } catch (err) {
     console.error('[FULL LEADERBOARD ERROR]:', err);
     res.status(500).json({ error: 'Failed to extract full organizational rankings.' });
+  }
+});
+
+// GET: Public Comprehensive Leaderboard using webhook secret key (Direct Browser Access)
+app.get('/api/public/employees/leaderboard/all', async (req, res) => {
+  const { key } = req.query;
+  if (!key || key !== process.env.NBT_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized. Invalid or missing secret key.' });
+  }
+
+  try {
+    const pool = await getPool();
+    const result = await pool.request().query(`
+      WITH CombinedPoints AS (
+        SELECT employee_id, points, 1 as is_award FROM employee_rewards
+        UNION ALL
+        SELECT employee_id, total_points as points, 0 as is_award FROM quiz_completions
+      )
+      SELECT 
+        u.id, u.name, u.role, u.team, u.profile_picture,
+        ISNULL(SUM(cp.points), 0) as total_rep,
+        ISNULL(SUM(cp.is_award), 0) as total_awards,
+        DENSE_RANK() OVER (ORDER BY ISNULL(SUM(cp.points), 0) DESC) as rank
+      FROM users u WITH (NOLOCK)
+      LEFT JOIN CombinedPoints cp WITH (NOLOCK) ON u.id = cp.employee_id
+      GROUP BY u.id, u.name, u.role, u.team, u.profile_picture
+      ORDER BY total_rep DESC, u.name ASC
+    `);
+
+    const formatted = result.recordset.map(row => ({
+      ...row,
+      total_rep: formatINR(row.total_rep),
+      totalRepNum: row.total_rep,
+      totalPoints: formatINR(row.total_rep),
+      total_points: formatINR(row.total_rep),
+      totalPointsNum: row.total_rep
+    }));
+
+    // Auto-detect browser/HTML requests
+    const wantsHtml = req.headers.accept && req.headers.accept.includes('text/html') && !req.query.json;
+
+    if (wantsHtml) {
+      const top3 = formatted.slice(0, 3);
+      const podiumHtml = top3.map((emp, index) => {
+        const medalColor = index === 0 ? 'var(--gold)' : index === 1 ? 'var(--silver)' : 'var(--bronze)';
+        const medalIcon = index === 0 ? '👑' : index === 1 ? '🥈' : '🥉';
+        const rankLabel = index === 0 ? '1st' : index === 1 ? '2nd' : '3rd';
+        const initials = emp.name ? emp.name.split(' ').map(n => n[0]).join('').substring(0, 2).toUpperCase() : 'EE';
+        
+        return `
+          <div class="podium-card rank-${index + 1}" style="border-top: 4px solid ${medalColor}">
+            <div class="podium-badge" style="background: ${medalColor}">${rankLabel} ${medalIcon}</div>
+            <div class="avatar-container">
+              ${emp.profile_picture ? `<img src="${emp.profile_picture}" class="podium-avatar" alt="${emp.name}" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">` : ''}
+              <div class="avatar-fallback" style="display: ${emp.profile_picture ? 'none' : 'flex'}">${initials}</div>
+            </div>
+            <div class="podium-name">${emp.name}</div>
+            <div class="podium-role">${emp.role || 'Team Member'}</div>
+            <div class="podium-points">${emp.total_points} PTS</div>
+          </div>
+        `;
+      }).join('');
+
+      const tableRowsHtml = formatted.map((emp, index) => {
+        const medalIcon = index === 0 ? '👑' : index === 1 ? '🥈' : index === 2 ? '🥉' : `#${emp.rank}`;
+        const medalStyle = index === 0 ? 'color: var(--gold); font-weight: bold;' : index === 1 ? 'color: var(--silver); font-weight: bold;' : index === 2 ? 'color: var(--bronze); font-weight: bold;' : '';
+        const initials = emp.name ? emp.name.split(' ').map(n => n[0]).join('').substring(0, 2).toUpperCase() : 'EE';
+
+        return `
+          <tr class="table-row">
+            <td class="table-cell rank-col" style="${medalStyle}">${medalIcon}</td>
+            <td class="table-cell user-col">
+              <div class="user-info">
+                <div class="avatar-container mini">
+                  ${emp.profile_picture ? `<img src="${emp.profile_picture}" class="podium-avatar mini" alt="${emp.name}" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">` : ''}
+                  <div class="avatar-fallback mini" style="display: ${emp.profile_picture ? 'none' : 'flex'}">${initials}</div>
+                </div>
+                <div>
+                  <div class="user-name">${emp.name}</div>
+                  <div class="user-id">ID: ${emp.id}</div>
+                </div>
+              </div>
+            </td>
+            <td class="table-cell">${emp.role || '----'}</td>
+            <td class="table-cell"><span class="team-badge">${emp.team || '----'}</span></td>
+            <td class="table-cell text-center">${emp.total_awards} 🏆</td>
+            <td class="table-cell points-col text-right">${emp.total_points} PTS</td>
+          </tr>
+        `;
+      }).join('');
+
+      const html = `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NBT Hub - Live Leaderboard</title>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    body {
+      background-color: #080b11;
+      background-image: 
+        radial-gradient(at 0% 0%, rgba(99, 102, 241, 0.12) 0px, transparent 50%),
+        radial-gradient(at 100% 100%, rgba(244, 63, 94, 0.08) 0px, transparent 50%);
+      color: #f3f4f6;
+      font-family: 'Outfit', sans-serif;
+      min-height: 100vh;
+      padding: 3rem 1.5rem;
+      line-height: 1.5;
+    }
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+    .header {
+      text-align: center;
+      margin-bottom: 3.5rem;
+    }
+    .header h1 {
+      font-size: 3rem;
+      font-weight: 700;
+      letter-spacing: -0.025em;
+      background: linear-gradient(135deg, #a5b4fc 0%, #6366f1 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      margin-bottom: 0.75rem;
+    }
+    .header p {
+      color: #9ca3af;
+      font-size: 1.25rem;
+      font-weight: 300;
+    }
+    
+    /* Podium Ranks Grid */
+    .podium-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 2rem;
+      margin-bottom: 4rem;
+    }
+    .podium-card {
+      background: rgba(17, 24, 39, 0.45);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      border-radius: 20px;
+      padding: 2.5rem 2rem;
+      text-align: center;
+      position: relative;
+      backdrop-filter: blur(16px);
+      box-shadow: 0 10px 40px -10px rgba(0, 0, 0, 0.6);
+      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    .podium-card:hover {
+      transform: translateY(-8px);
+      border-color: rgba(99, 102, 241, 0.3);
+      box-shadow: 0 25px 50px -12px rgba(99, 102, 241, 0.25);
+    }
+    .podium-badge {
+      position: absolute;
+      top: 1.25rem;
+      right: 1.25rem;
+      padding: 0.4rem 1rem;
+      border-radius: 9999px;
+      font-size: 0.85rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: #0c0f17;
+    }
+    
+    /* Avatar Handling */
+    .avatar-container {
+      width: 108px;
+      height: 108px;
+      border-radius: 50%;
+      margin: 0 auto 1.75rem auto;
+      overflow: hidden;
+      border: 3px solid rgba(255, 255, 255, 0.12);
+      background: linear-gradient(135deg, #1f2937, #111827);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+    }
+    .avatar-container.mini {
+      width: 46px;
+      height: 46px;
+      margin: 0;
+      border: 2px solid rgba(255, 255, 255, 0.08);
+    }
+    .podium-avatar {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+    .avatar-fallback {
+      width: 100%;
+      height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 2.25rem;
+      font-weight: 700;
+      background: linear-gradient(135deg, #6366f1, #d946ef);
+      color: white;
+    }
+    .avatar-fallback.mini {
+      font-size: 1rem;
+    }
+    
+    .podium-name {
+      font-size: 1.45rem;
+      font-weight: 600;
+      color: #f3f4f6;
+      margin-bottom: 0.35rem;
+    }
+    .podium-role {
+      font-size: 0.95rem;
+      color: #9ca3af;
+      margin-bottom: 1.5rem;
+    }
+    .podium-points {
+      display: inline-block;
+      padding: 0.55rem 1.5rem;
+      background: rgba(99, 102, 241, 0.12);
+      border: 1px solid rgba(99, 102, 241, 0.22);
+      border-radius: 9999px;
+      font-size: 1.1rem;
+      font-weight: 700;
+      color: #a5b4fc;
+    }
+    
+    /* Table styling */
+    .table-container {
+      background: rgba(17, 24, 39, 0.45);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      border-radius: 20px;
+      overflow-x: auto;
+      backdrop-filter: blur(16px);
+      box-shadow: 0 10px 40px -10px rgba(0, 0, 0, 0.6);
+    }
+    .leaderboard-table {
+      width: 100%;
+      border-collapse: collapse;
+      text-align: left;
+    }
+    .table-header {
+      background: rgba(255, 255, 255, 0.02);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    }
+    .header-cell {
+      padding: 1.25rem 1.75rem;
+      font-size: 0.85rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: #9ca3af;
+    }
+    .table-row {
+      border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+      transition: background-color 0.2s ease;
+    }
+    .table-row:hover {
+      background-color: rgba(255, 255, 255, 0.015);
+    }
+    .table-cell {
+      padding: 1.25rem 1.75rem;
+      vertical-align: middle;
+      font-size: 0.95rem;
+    }
+    .rank-col {
+      font-size: 1.15rem;
+      font-weight: 600;
+      color: #9ca3af;
+      width: 90px;
+    }
+    .user-col {
+      min-width: 280px;
+    }
+    .user-info {
+      display: flex;
+      align-items: center;
+      gap: 1.1rem;
+    }
+    .user-name {
+      font-weight: 600;
+      color: #f3f4f6;
+    }
+    .user-id {
+      font-size: 0.8rem;
+      color: #9ca3af;
+    }
+    .team-badge {
+      display: inline-block;
+      padding: 0.3rem 0.85rem;
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      border-radius: 9999px;
+      font-size: 0.8rem;
+      font-weight: 500;
+      color: #d1d5db;
+    }
+    .points-col {
+      font-weight: 700;
+      color: #818cf8;
+      font-size: 1.05rem;
+    }
+    
+    .text-center { text-align: center; }
+    .text-right { text-align: right; }
+    
+    :root {
+      --gold: #fbbf24;
+      --silver: #cbd5e1;
+      --bronze: #d97706;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>NBT Leaderboard</h1>
+      <p>Live Performance & Reputation Rankings</p>
+    </div>
+    
+    <!-- Top 3 Podium Grid -->
+    <div class="podium-grid">
+      ${podiumHtml}
+    </div>
+    
+    <!-- Complete Ranks List -->
+    <div class="table-container">
+      <table class="leaderboard-table">
+        <thead class="table-header">
+          <tr>
+            <th class="header-cell">Rank</th>
+            <th class="header-cell">Employee</th>
+            <th class="header-cell">Designation</th>
+            <th class="header-cell">Team</th>
+            <th class="header-cell text-center">Awards Count</th>
+            <th class="header-cell text-right">Reputation Points</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${tableRowsHtml}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</body>
+</html>
+      `;
+
+      res.setHeader('Content-Type', 'text/html');
+      return res.send(html);
+    }
+
+    res.json({ success: true, data: formatted });
+  } catch (err) {
+    console.error('[PUBLIC FULL LEADERBOARD ERROR]:', err);
+    res.status(500).json({ error: 'Failed to extract organizational rankings.' });
   }
 });
 
@@ -10652,7 +11362,21 @@ app.get('/api/quizzes/user-points', verifyToken, async (req, res) => {
       GROUP BY ap.id, ap.name, ap.role, ap.team, ap.profile_picture
       ORDER BY total_quiz_points DESC
     `);
-    res.json(result.recordset);
+
+    const formatted = result.recordset.map(row => {
+      const qp = row.total_quiz_points || 0;
+      return {
+        ...row,
+        total_quiz_points: formatINR(qp),
+        quizPoints: formatINR(qp),
+        quiz: formatINR(qp),
+        total_quiz_points_num: qp,
+        quizPointsNum: qp,
+        quizNum: qp
+      };
+    });
+
+    res.json(formatted);
   } catch (err) {
     console.error('[QUIZ USER POINTS ERROR]:', err);
     res.status(500).json({ error: 'Failed to extract quiz points' });
@@ -11078,7 +11802,13 @@ app.get(['/api/fun-quizzes/leaderboard', '/api/quizzes/leaderboard/daily'], veri
         ORDER BY points DESC
       `);
 
-    res.json({ data: result.recordset });
+    const formatted = result.recordset.map(row => ({
+      ...row,
+      points: formatINR(row.points),
+      pointsNum: row.points
+    }));
+
+    res.json({ data: formatted });
   } catch (err) {
     console.error('[QUIZ LEADERBOARD ERROR]:', err);
     res.status(500).json({ error: 'Failed to fetch leaderboard' });

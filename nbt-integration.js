@@ -212,8 +212,8 @@ incomingRouter.post('/application', async (req, res) => {
     console.log(`📩 New application received: ${candidateName} → ${jobTitle} (ATS ID: ${atsJobId})`);
 
     // ──────────────────────────────────────────────────────────────
-    const { sql, poolPromise } = require('./db');
-    const pool = await poolPromise;
+    const { sql, getPool } = require('./db');
+    const pool = await getPool();
 
     // Sanitize atsJobId: if it's a string like "123", parseInt it. 
     // If it's missing, it will be null (which is fine if DB allows it)
@@ -257,6 +257,70 @@ incomingRouter.post('/application', async (req, res) => {
     return res.status(500).json({ error: 'Failed to process application', details: err.message });
   }
 });
+
+// ── 2B. Pull/Sync applications from careers website (Fallback pull-sync mechanism) ──
+async function syncApplications() {
+  try {
+    const { sql, getPool } = require('./db');
+    const pool = await getPool();
+
+    console.log(`[SYNC] Querying external Careers website at ${CAREERS_BACKEND}/api/admin/applications...`);
+    const resWeb = await fetch(`${CAREERS_BACKEND}/api/admin/applications`, {
+      headers: {
+        'x-admin-key': ADMIN_API_KEY
+      }
+    });
+
+    if (!resWeb.ok) {
+      throw new Error(`External API responded with status ${resWeb.status}`);
+    }
+
+    const webData = await resWeb.json();
+    const apps = webData.applications || [];
+    console.log(`[SYNC] Received ${apps.length} applications from Careers Website. Synced count checking...`);
+
+    let importedCount = 0;
+    for (const app of apps) {
+      // Check if already imported
+      const checkDup = await pool.request()
+        .input('webAppId', sql.NVarChar, app.id)
+        .query('SELECT id FROM job_applications WHERE website_application_id = @webAppId');
+
+      if (checkDup.recordset.length === 0) {
+        // Import it!
+        // atsJobId is stored as reference to the local job posting's internal ID
+        const sanitizedJobId = app.atsJobId ? parseInt(String(app.atsJobId).replace(/,/g, ''), 10) : null;
+        let finalAppliedAt = app.submittedAt ? new Date(app.submittedAt) : new Date();
+        if (isNaN(finalAppliedAt.getTime())) finalAppliedAt = new Date();
+
+        await pool.request()
+          .input('name', sql.NVarChar, app.candidate?.name || 'Unknown')
+          .input('email', sql.NVarChar, app.candidate?.email || 'no-email@provided.com')
+          .input('phone', sql.NVarChar, app.candidate?.phone || '')
+          .input('title', sql.NVarChar, app.job?.title || 'General Application')
+          .input('jobId', sql.Int, sanitizedJobId)
+          .input('webAppId', sql.NVarChar, app.id)
+          .input('resume', sql.NVarChar, app.resumeUrl || '')
+          .input('cover', sql.NVarChar, app.coverLetter || '')
+          .input('applied', sql.DateTime, finalAppliedAt)
+          .input('loc', sql.NVarChar, app.location || '')
+          .input('dept', sql.NVarChar, app.department || '')
+          .input('exp', sql.NVarChar, app.experience || '')
+          .query(`
+            INSERT INTO job_applications (candidate_name, email, phone, job_title, internal_job_id, website_application_id, resume_url, cover_letter, status, applied_at, location, department, experience)
+            VALUES (@name, @email, @phone, @title, @jobId, @webAppId, @resume, @cover, 'APPLIED', @applied, @loc, @dept, @exp)
+          `);
+        console.log(`[SYNC] Imported new job application: ${app.candidate?.name} (${app.job?.title})`);
+        importedCount++;
+      }
+    }
+    console.log(`[SYNC] Sync complete! Imported ${importedCount} new application(s).`);
+    return { success: true, imported: importedCount };
+  } catch (err) {
+    console.error('❌ Error during application pull-sync:', err.message);
+    return { success: false, error: err.message };
+  }
+}
 
 // ═════════════════════════════════════════════════════════════════════
 // PART 3: USAGE EXAMPLES — Wire into your HR tool's existing routes
@@ -333,4 +397,5 @@ module.exports = {
   updateCandidateStatus: pushStatusUpdate, // Alias for status updates
   mapToWebsiteStatus,
   incomingRouter,
+  syncApplications,
 };
