@@ -10431,6 +10431,148 @@ app.get(['/api/pay-slips/:id', '/api/payslips/:id'], verifyToken, async (req, re
   }
 });
 
+/**
+ * 43.5 Update / Edit Pay Slip Details (HR/Admin only)
+ */
+app.put(['/api/admin/pay-slips/:id', '/api/admin/payslips/:id', '/api/payslips/:id'], verifyToken, async (req, res) => {
+  const role = (req.user.role || '').toLowerCase();
+  if (!role.includes('hr') && !role.includes('human resource') && !role.includes('ceo') && !role.includes('admin')) {
+    return res.status(403).json({ error: 'Unauthorized: Only Admin/HR can update payslips.' });
+  }
+
+  const id = sanitizeNumericId(req.params.id);
+  if (!id) return res.status(400).json({ error: 'Invalid or missing pay slip ID.' });
+
+  const {
+    emp_name, department, designation,
+    total_present, total_weekly_off, total_holidays, total_leaves, total_absent,
+    total_work_ot, total_ot_hours, basic_salary, bonus_ref_amt,
+    pf_deduction, esi_deduction, pt_deduction,
+    hra, conveyance, special_allowance, lwf, income_tax,
+    performance_incentive, yearly_incentive
+  } = req.body;
+
+  try {
+    const pool = await getPool();
+    
+    // Check if the record exists
+    const checkRes = await pool.request()
+      .input('id', sql.Int, id)
+      .query('SELECT employee_id FROM pay_slips WHERE id = @id');
+      
+    if (checkRes.recordset.length === 0) {
+      return res.status(404).json({ error: 'Pay slip record not found' });
+    }
+
+    // Server-side recalculate totals for high-precision validation
+    const basic = parseFloat(basic_salary) || 0;
+    const hraAmt = parseFloat(hra) || 0;
+    const conv = parseFloat(conveyance) || 0;
+    const spec = parseFloat(special_allowance) || 0;
+    const perf = parseFloat(performance_incentive) || 0;
+    const yearly = parseFloat(yearly_incentive) || 0;
+    const bonus = parseFloat(bonus_ref_amt) || 0;
+
+    const pf = parseFloat(pf_deduction) || 0;
+    const esi = parseFloat(esi_deduction) || 0;
+    const pt = parseFloat(pt_deduction) || 0;
+    const lwfAmt = parseFloat(lwf) || 0;
+    const tax = parseFloat(income_tax) || 0;
+    const lop = parseFloat(req.body.lop_deduction) || 0;
+
+    const earnings = Math.round(basic + hraAmt + conv + spec + bonus);
+    const totalIncentive = Math.round(perf + yearly);
+    const deductions = Math.round(pf + esi + pt + lwfAmt + tax + lop);
+    const netPayable = Math.max(0, Math.round(earnings + totalIncentive - deductions));
+
+    await pool.request()
+      .input('id', sql.Int, id)
+      .input('emp_name', sql.NVarChar, emp_name || '')
+      .input('department', sql.NVarChar, department || '')
+      .input('designation', sql.NVarChar, designation || '')
+      .input('total_present', sql.Decimal(5, 2), total_present || 0)
+      .input('total_weekly_off', sql.Int, total_weekly_off || 0)
+      .input('total_holidays', sql.Int, total_holidays || 0)
+      .input('total_leaves', sql.Decimal(5, 2), total_leaves || 0)
+      .input('total_absent', sql.Decimal(5, 2), total_absent || 0)
+      .input('total_work_ot', sql.NVarChar, total_work_ot || '0:00')
+      .input('total_ot_hours', sql.NVarChar, total_ot_hours || '0:00')
+      .input('basic_salary', sql.Decimal(18, 2), basic)
+      .input('hra', sql.Decimal(18, 2), hraAmt)
+      .input('conveyance', sql.Decimal(18, 2), conv)
+      .input('special_allowance', sql.Decimal(18, 2), spec)
+      .input('performance_incentive', sql.Decimal(18, 2), perf)
+      .input('yearly_incentive', sql.Decimal(18, 2), yearly)
+      .input('total_incentive', sql.Decimal(18, 2), totalIncentive)
+      .input('bonus_ref_amt', sql.Decimal(18, 2), bonus)
+      .input('total_earnings', sql.Decimal(18, 2), earnings)
+      .input('pf_deduction', sql.Decimal(18, 2), pf)
+      .input('esi_deduction', sql.Decimal(18, 2), esi)
+      .input('pt_deduction', sql.Decimal(18, 2), pt)
+      .input('lwf', sql.Decimal(18, 2), lwfAmt)
+      .input('income_tax', sql.Decimal(18, 2), tax)
+      .input('lop_deduction', sql.Decimal(18, 2), lop)
+      .input('total_deductions', sql.Decimal(18, 2), deductions)
+      .input('net_payable', sql.Decimal(18, 2), netPayable)
+      .input('updated_by', sql.Int, req.user.id)
+      .query(`
+        UPDATE pay_slips SET 
+          emp_name = @emp_name, department = @department, designation = @designation,
+          total_present = @total_present, total_weekly_off = @total_weekly_off, total_holidays = @total_holidays,
+          total_leaves = @total_leaves, total_absent = @total_absent, total_work_ot = @total_work_ot,
+          total_ot_hours = @total_ot_hours, basic_salary = @basic_salary, bonus_ref_amt = @bonus_ref_amt,
+          hra = @hra, conveyance = @conveyance, special_allowance = @special_allowance,
+          performance_incentive = @performance_incentive, yearly_incentive = @yearly_incentive, total_incentive = @total_incentive,
+          total_earnings = @total_earnings, pf_deduction = @pf_deduction, esi_deduction = @esi_deduction,
+          pt_deduction = @pt_deduction, lwf = @lwf, income_tax = @income_tax, lop_deduction = @lop_deduction,
+          total_deductions = @total_deductions, net_payable = @net_payable,
+          updated_by = @updated_by,
+          updated_at = DATEADD(MINUTE, 330, GETUTCDATE())
+        WHERE id = @id
+      `);
+
+    res.json({ success: true, message: 'Pay slip updated successfully' });
+  } catch (err) {
+    console.error('[PAYSLIP UPDATE ERROR]:', err);
+    res.status(500).json({ error: 'Failed to update pay slip record', details: err.message });
+  }
+});
+
+/**
+ * 43.6 Delete Pay Slip (HR/Admin only)
+ */
+app.delete(['/api/admin/pay-slips/:id', '/api/admin/payslips/:id', '/api/payslips/:id'], verifyToken, async (req, res) => {
+  const role = (req.user.role || '').toLowerCase();
+  if (!role.includes('hr') && !role.includes('human resource') && !role.includes('ceo') && !role.includes('admin')) {
+    return res.status(403).json({ error: 'Unauthorized: Only Admin/HR can delete payslips.' });
+  }
+
+  const id = sanitizeNumericId(req.params.id);
+  if (!id) return res.status(400).json({ error: 'Invalid or missing pay slip ID.' });
+
+  try {
+    const pool = await getPool();
+    
+    // Check if the record exists
+    const checkRes = await pool.request()
+      .input('id', sql.Int, id)
+      .query('SELECT employee_id FROM pay_slips WHERE id = @id');
+      
+    if (checkRes.recordset.length === 0) {
+      return res.status(404).json({ error: 'Pay slip record not found' });
+    }
+
+    await pool.request()
+      .input('id', sql.Int, id)
+      .query('DELETE FROM pay_slips WHERE id = @id');
+
+    res.json({ success: true, message: 'Pay slip deleted successfully.' });
+  } catch (err) {
+    console.error('[PAYSLIP DELETE ERROR]:', err);
+    res.status(500).json({ error: 'Failed to delete pay slip record', details: err.message });
+  }
+});
+
 
 // --- AWARDS & RECOGNITION (REPUTATION) SYSTEM --- //
 
