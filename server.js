@@ -9813,8 +9813,9 @@ app.post(['/api/admin/pay-slips', '/api/admin/payslips', '/api/pay_slip', '/api/
  */
 app.get('/api/admin/pay-slips/eligible-users', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  if (!role.includes('hr') && !role.includes('human resource') && !role.includes('ceo') && !role.includes('admin')) {
-    return res.status(403).json({ error: 'Unauthorized: Only Admin/HR can access payroll eligible list.' });
+  const isPrivileged = role.includes('hr') || role.includes('human resource') || role.includes('ceo') || role.includes('admin') || role.includes('manager') || role.includes('lead') || role.includes('head') || role.includes('director');
+  if (!isPrivileged) {
+    return res.status(403).json({ error: 'Unauthorized: Privileged role required.' });
   }
 
   try {
@@ -9868,8 +9869,9 @@ const { calculateUserMonthlyStats } = require('./scripts/reconcile-attendance');
  */
 app.get(['/api/admin/pay-slips/calculate-summary', '/api/admin/payslips/calculate-summary', '/api/payslips/calculate-summary'], verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  if (!role.includes('hr') && !role.includes('human resource') && !role.includes('ceo') && !role.includes('admin')) {
-    return res.status(403).json({ error: 'Unauthorized: Admin access required.' });
+  const isPrivileged = role.includes('hr') || role.includes('human resource') || role.includes('ceo') || role.includes('admin') || role.includes('manager') || role.includes('lead') || role.includes('head') || role.includes('director');
+  if (!isPrivileged) {
+    return res.status(403).json({ error: 'Unauthorized: Privileged role required.' });
   }
 
   const { month, year } = req.query;
@@ -10230,15 +10232,15 @@ app.get('/api/admin/mandatory-suggestions/audit/trigger', async (req, res) => {
 app.get(['/api/admin/pay-slips', '/api/admin/payslips', '/api/payslips'], verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
   const userId = req.user.id;
-  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('ceo') || role.includes('admin');
+  const isAdminOrManager = role.includes('hr') || role.includes('human resource') || role.includes('ceo') || role.includes('admin') || role.includes('manager') || role.includes('lead') || role.includes('head') || role.includes('director');
 
   const { month, year, team } = req.query;
   const empIdParam = req.query.employee_id || req.query.employeeId || req.query.userId || req.query.empId;
 
-  // Security: If not Admin/HR, they can ONLY view their own payslips.
-  // Force target employee ID to be their own user ID if they are not admin.
+  // Security: If not Admin/HR/Manager, they can ONLY view their own payslips.
+  // Force target employee ID to be their own user ID if they are not privileged.
   let targetEmpId = null;
-  if (!isAdmin) {
+  if (!isAdminOrManager) {
     targetEmpId = userId;
   } else if (empIdParam) {
     targetEmpId = sanitizeNumericId(empIdParam);
@@ -10366,8 +10368,8 @@ app.get(['/api/admin/pay-slips', '/api/admin/payslips', '/api/payslips'], verify
       WHERE 1=1
     `;
 
-    // Force filtering for non-admins to only see their own payslips
-    if (!isAdmin) {
+    // Force filtering for standard non-privileged users to only see their own payslips
+    if (!isAdminOrManager) {
       query += ' AND ps.employee_id = @userId';
       request.input('userId', sql.Int, userId);
     } else if (targetEmpId) {
@@ -10407,7 +10409,7 @@ app.get(['/api/pay-slips/:id', '/api/payslips/:id'], verifyToken, async (req, re
   const id = sanitizeNumericId(req.params.id);
   const userId = req.user.id;
   const role = (req.user.role || '').toLowerCase();
-  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('ceo') || role.includes('admin');
+  const isAdminOrManager = role.includes('hr') || role.includes('human resource') || role.includes('ceo') || role.includes('admin') || role.includes('manager') || role.includes('lead') || role.includes('head') || role.includes('director');
 
   try {
     const pool = await getPool();
@@ -10418,8 +10420,8 @@ app.get(['/api/pay-slips/:id', '/api/payslips/:id'], verifyToken, async (req, re
     if (result.recordset.length === 0) return res.status(404).json({ error: 'Pay slip record not found' });
     const paySlip = result.recordset[0];
 
-    // Security: Only the owner or HR/Management can view
-    if (paySlip.employee_id !== userId && !isAdmin) {
+    // Security: Only the owner or HR/Manager can view
+    if (paySlip.employee_id !== userId && !isAdminOrManager) {
       return res.status(403).json({ error: 'Unauthorized: You can only view your own pay slips.' });
     }
 
