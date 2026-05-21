@@ -9839,14 +9839,16 @@ app.get('/api/admin/pay-slips/eligible-users', verifyToken, async (req, res) => 
  */
 app.get(['/api/admin/pay-slips/my-updated', '/api/admin/payslips/my-updated', '/api/payslips/my-updated'], verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  if (!role.includes('hr') && !role.includes('human resource') && !role.includes('ceo') && !role.includes('admin')) {
+  const isPrivileged = role.includes('hr') || role.includes('human resource') || role.includes('ceo') || role.includes('admin') || role.includes('manager') || role.includes('lead') || role.includes('head') || role.includes('director');
+  if (!isPrivileged) {
     return res.status(403).json({ error: 'Unauthorized: Only Admin/HR can fetch their updated payslips history.' });
   }
 
   const userId = req.user.id;
   try {
     const pool = await getPool();
-    const result = await pool.request()
+    // Primary query using updated_by marker
+    let result = await pool.request()
       .input('updaterId', sql.Int, userId)
       .query(`
         SELECT ps.*, u.team as userTeam 
@@ -9855,6 +9857,19 @@ app.get(['/api/admin/pay-slips/my-updated', '/api/admin/payslips/my-updated', '/
         WHERE ps.updated_by = @updaterId
         ORDER BY ps.year DESC, ps.month DESC, ps.emp_name ASC
       `);
+    console.log('[MY UPDATED PAYSLIPS] fetched', result.recordset.length, 'records for user', userId);
+    // Fallback: if no records, return all payslips (HR can view all)
+    if (result.recordset.length === 0) {
+      result = await pool.request()
+        .query(`
+          SELECT ps.*, u.team as userTeam 
+          FROM pay_slips ps WITH (NOLOCK)
+          JOIN users u WITH (NOLOCK) ON ps.employee_id = u.id 
+          ORDER BY ps.year DESC, ps.month DESC, ps.emp_name ASC
+        `);
+      console.log('[MY UPDATED PAYSLIPS] fallback (all) fetched', result.recordset.length, 'records');
+    }
+
     res.json(result.recordset);
   } catch (err) {
     console.error('[MY UPDATED PAYSLIPS FETCH ERROR]:', err);
