@@ -1,5 +1,5 @@
-// emailTemplates.js
-// Stores all HTML email templates to keep server.js clean
+// Hosted company logo URL for universal email rendering
+const logoUrl = 'https://navabharathtechnologies.com/assets/logo.png';
 
 /**
  * Returns the HTML for the email body when sending a personalized course completion certificate.
@@ -10,7 +10,7 @@ const getCertificateEmailHtml = (userName, courseName) => `<!DOCTYPE html>
 <body style="margin:0;padding:20px;background:#f8fafc;font-family:Arial,sans-serif;color:#334155;">
   <div style="max-width:600px;margin:0 auto;background:#ffffff;padding:40px;border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,0.05);">
     <div style="text-align: center; margin-bottom: 30px;">
-      <img src="cid:NBTLogo" alt="NBT Logo" style="width: 140px; display: block; margin: 0 auto;">
+      <img src="${logoUrl}" alt="NBT Logo" style="width: 140px; display: block; margin: 0 auto;">
     </div>
     <h2 style="color:#1e3a8a;margin-top:0;text-align:center;">Congratulations, ${userName}! 🎉</h2>
     <p style="font-size:16px;line-height:1.6;">
@@ -67,7 +67,7 @@ const generateCertificateHtml = (userName, courseName) => {
               <table width="100%" border="0" cellpadding="0" cellspacing="0" style="margin-bottom: 50px;">
                 <tr>
                   <td width="150" align="left">
-                    <img src="cid:NBTLogo" alt="NBT Logo" style="width: 140px; display: block;">
+                    <img src="${logoUrl}" alt="NBT Logo" style="width: 140px; display: block;">
                   </td>
                   <td align="right" valign="middle">
                     <div style="font-size: 10px; font-weight: 900; color: #94a3b8; letter-spacing: 4px; text-transform: uppercase; margin-bottom: 5px;">Award for Professional Excellence</div>

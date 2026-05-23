@@ -29,20 +29,6 @@ const sendAppEmail = async ({ to, subject, html, text, attachments }) => {
   try {
     const finalAttachments = [...(attachments || [])];
 
-    // Automatically attach the company logo as a CID for use in templates
-    const logoPath = path.join(__dirname, 'assets', 'NBT logo.png');
-    if (fs.existsSync(logoPath)) {
-      console.log(`[MAILER] Attaching logo from: ${logoPath}`);
-      finalAttachments.push({
-        filename: 'NBT logo.png',
-        path: logoPath,
-        cid: 'NBTLogo' // Clean ID matching the user's naming preference
-      });
-    } else {
-      console.warn(`[MAILER WARNING] Logo file not found at: ${logoPath}`);
-    }
-
-
     const info = await mailTransporter.sendMail({
       from: `"NBT Hub Management" <${process.env.EMAIL_USER}>`,
       to,
@@ -302,6 +288,42 @@ const getPool = async () => {
           ALTER TABLE fun_quizzes ADD is_deleted BIT DEFAULT 0;
         END
       END
+
+      -- ASSETS STOCK TABLE INITIALIZATION
+      IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[assets_stock]') AND type in (N'U'))
+      BEGIN
+        CREATE TABLE [dbo].[assets_stock] (
+          [id] INT IDENTITY(1,1) PRIMARY KEY,
+          [laptop_details] NVARCHAR(MAX) NULL,
+          [mouse] NVARCHAR(255) NULL,
+          [keyboard] NVARCHAR(255) NULL,
+          [laptop_stand] NVARCHAR(255) NULL,
+          [ruf_pad] NVARCHAR(255) NULL,
+          [pendrive] NVARCHAR(255) NULL,
+          [mobile] NVARCHAR(255) NULL,
+          [camera] NVARCHAR(255) NULL,
+          [earphone_headphone] NVARCHAR(255) NULL,
+          [tablet] NVARCHAR(255) NULL,
+          [returned_by_employee_id] NVARCHAR(50) NULL,
+          [returned_by_name] NVARCHAR(255) NULL,
+          [returned_by_designation] NVARCHAR(255) NULL,
+          [returned_date] DATETIME NULL,
+          [created_at] DATETIME DEFAULT DATEADD(MINUTE, 330, GETUTCDATE()),
+          [updated_at] DATETIME DEFAULT DATEADD(MINUTE, 330, GETUTCDATE())
+        )
+      END
+      ELSE
+      BEGIN
+        -- MIGRATION: Add returned_by columns if they don't exist yet
+        IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[assets_stock]') AND name = 'returned_by_employee_id')
+          ALTER TABLE [dbo].[assets_stock] ADD [returned_by_employee_id] NVARCHAR(50) NULL;
+        IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[assets_stock]') AND name = 'returned_by_name')
+          ALTER TABLE [dbo].[assets_stock] ADD [returned_by_name] NVARCHAR(255) NULL;
+        IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[assets_stock]') AND name = 'returned_by_designation')
+          ALTER TABLE [dbo].[assets_stock] ADD [returned_by_designation] NVARCHAR(255) NULL;
+        IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[assets_stock]') AND name = 'returned_date')
+          ALTER TABLE [dbo].[assets_stock] ADD [returned_date] DATETIME NULL;
+      END
     `);
 
     // Ensure all NULL is_deleted values are updated to 0
@@ -480,12 +502,55 @@ const normalizeProfile = (profile) => {
   return profile;
 };
 
-// --- ASSET DATA MAPPING HELPER ---
+// --- ROBUST ASSET VALUE TRANSLATOR ---
+const getAssetValue = (data, colName) => {
+  if (!data) return null;
+  const normalized = {};
+  for (const key of Object.keys(data)) {
+    normalized[key.toLowerCase().replace(/_/g, '')] = data[key];
+  }
+
+  const lookups = {
+    laptop_details: ['laptopdetails', 'laptop', 'laptop_details'],
+    mouse: ['mouse', 'hasmouse', 'mouse_status'],
+    keyboard: ['keyboard', 'haskeyboard', 'keyboard_status'],
+    laptop_stand: ['laptopstand', 'haslaptopstand', 'laptop_stand', 'stand'],
+    ruf_pad: ['rufpad', 'hasrufpad', 'ruf_pad'],
+    pendrive: ['pendrive', 'haspendrive'],
+    mobile: ['mobile', 'hasmobile', 'companymobile', 'hascompanymobile', 'company_mobile', 'mobile_handset'],
+    camera: ['camera', 'hascamera', 'externalcamera', 'hasexternalcamera', 'external_camera', 'webcam'],
+    earphone_headphone: ['earphoneheadphone', 'hasearphoneheadphone', 'earphone', 'hasearphone', 'earphone_headphone', 'headphone', 'headphones', 'earphones'],
+    tablet: ['tablet', 'hastablet']
+  };
+
+  const keysToTry = lookups[colName] || [colName.toLowerCase().replace(/_/g, '')];
+  for (const k of keysToTry) {
+    if (normalized.hasOwnProperty(k)) {
+      const val = normalized[k];
+      if (colName === 'laptop_details') {
+        return val ? String(val) : null;
+      }
+      if (val === true || val === 1 || String(val).toLowerCase() === 'true' || String(val).toLowerCase() === 'yes') {
+        return 'Yes';
+      }
+      if (val === false || val === 0 || String(val).toLowerCase() === 'false' || String(val).toLowerCase() === 'no') {
+        return 'No';
+      }
+      return val ? String(val) : 'No';
+    }
+  }
+  return colName === 'laptop_details' ? null : 'No';
+};
+
 const mapAssetRow = (row) => {
   if (!row) return null;
 
   const trimVal = (val) => (val && typeof val === 'string') ? val.trim() : (val || '');
-  const isYes = (val) => trimVal(val).toLowerCase() === 'yes';
+  const isYes = (val) => {
+    if (val === true || val === 1) return true;
+    if (!val) return false;
+    return String(val).trim().toLowerCase() === 'yes' || String(val).trim().toLowerCase() === 'true';
+  };
 
   const laptop = trimVal(row.laptop_details);
 
@@ -493,28 +558,138 @@ const mapAssetRow = (row) => {
   let serial = row.serial_number || '';
   if (!serial && laptop) {
     const serialMatch = laptop.match(/Serial\s*(?:No|Number)?\s*:\s*([^\n\r,]+)/i);
-    if (serialMatch) serial = serialMatch[1].trim();
+    if (serialMatch) serial = serialMatch[1].trim().replace(/\)+$/, '').trim();
   }
 
+  const normalizedMouse = isYes(row.mouse) ? 'Yes' : 'No';
+  const normalizedKeyboard = isYes(row.keyboard) ? 'Yes' : 'No';
+  const normalizedLaptopStand = isYes(row.laptop_stand) ? 'Yes' : 'No';
+  const normalizedRufPad = isYes(row.ruf_pad) ? 'Yes' : 'No';
+  const normalizedPendrive = isYes(row.pendrive) ? 'Yes' : 'No';
+  const normalizedMobile = isYes(row.mobile) ? 'Yes' : 'No';
+  const normalizedCamera = isYes(row.camera) ? 'Yes' : 'No';
+  const normalizedEarphone = isYes(row.earphone_headphone) ? 'Yes' : 'No';
+  const normalizedTablet = isYes(row.tablet) ? 'Yes' : 'No';
+
   return {
-    ...row, // 1. PRESERVE ORIGINAL STRINGS ("Yes"/"No")
+    ...row, // Preserve database columns
     id: row.id,
     employeeId: row.employee_id,
     employeeName: row.employee_name,
     designation: row.designation,
     joiningDate: row.joining_date,
     lastWorkingDate: row.last_working_date,
+    
+    // Normalized snake_case and alternative names for frontend direct rendering
+    laptop_details: laptop,
+    laptop: laptop,
+    mouse: normalizedMouse,
+    keyboard: normalizedKeyboard,
+    laptop_stand: normalizedLaptopStand,
+    stand: normalizedLaptopStand,
+    ruf_pad: normalizedRufPad,
+    rufpad: normalizedRufPad,
+    pendrive: normalizedPendrive,
+    mobile: normalizedMobile,
+    camera: normalizedCamera,
+    webcam: normalizedCamera,
+    earphone_headphone: normalizedEarphone,
+    earphone: normalizedEarphone,
+    headphone: normalizedEarphone,
+    tablet: normalizedTablet,
+
+    // CamelCase boolean equivalents
     laptopDetails: laptop,
-    serialNumber: serial, // Extracted or virtual
-    hasMouse: (row.mouse || '').toLowerCase() === 'yes',
-    hasKeyboard: (row.keyboard || '').toLowerCase() === 'yes',
-    hasLaptopStand: (row.laptop_stand || '').toLowerCase() === 'yes',
-    hasRufPad: (row.ruf_pad || '').toLowerCase() === 'yes',
-    hasPendrive: (row.pendrive || '').toLowerCase() === 'yes',
-    hasMobile: (row.mobile || '').toLowerCase() === 'yes',
-    hasCamera: (row.camera || '').toLowerCase() === 'yes',
-    hasEarphone: (row.earphone_headphone || '').toLowerCase() === 'yes',
-    hasTablet: (row.tablet || '').toLowerCase() === 'yes',
+    serialNumber: serial,
+    hasMouse: isYes(row.mouse),
+    hasKeyboard: isYes(row.keyboard),
+    hasLaptopStand: isYes(row.laptop_stand),
+    hasRufPad: isYes(row.ruf_pad),
+    hasPendrive: isYes(row.pendrive),
+    hasMobile: isYes(row.mobile),
+    hasCamera: isYes(row.camera),
+    hasEarphone: isYes(row.earphone_headphone),
+    hasTablet: isYes(row.tablet),
+    
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+};
+
+const mapAssetStockRow = (row) => {
+  if (!row) return null;
+
+  const trimVal = (val) => (val && typeof val === 'string') ? val.trim() : (val || '');
+  const isYes = (val) => {
+    if (val === true || val === 1) return true;
+    if (!val) return false;
+    return String(val).trim().toLowerCase() === 'yes' || String(val).trim().toLowerCase() === 'true';
+  };
+
+  const laptop = trimVal(row.laptop_details);
+
+  // Extract Serial Number if present in details
+  let serial = row.serial_number || '';
+  if (!serial && laptop) {
+    const serialMatch = laptop.match(/Serial\s*(?:No|Number)?\s*:\s*([^\n\r,]+)/i);
+    if (serialMatch) serial = serialMatch[1].trim().replace(/\)+$/, '').trim();
+  }
+
+  const normalizedMouse = isYes(row.mouse) ? 'Yes' : 'No';
+  const normalizedKeyboard = isYes(row.keyboard) ? 'Yes' : 'No';
+  const normalizedLaptopStand = isYes(row.laptop_stand) ? 'Yes' : 'No';
+  const normalizedRufPad = isYes(row.ruf_pad) ? 'Yes' : 'No';
+  const normalizedPendrive = isYes(row.pendrive) ? 'Yes' : 'No';
+  const normalizedMobile = isYes(row.mobile) ? 'Yes' : 'No';
+  const normalizedCamera = isYes(row.camera) ? 'Yes' : 'No';
+  const normalizedEarphone = isYes(row.earphone_headphone) ? 'Yes' : 'No';
+  const normalizedTablet = isYes(row.tablet) ? 'Yes' : 'No';
+
+  return {
+    ...row, // Preserve database columns
+    id: row.id,
+    
+    // Normalized snake_case and alternative names for frontend direct rendering
+    laptop_details: laptop,
+    laptop: laptop,
+    mouse: normalizedMouse,
+    keyboard: normalizedKeyboard,
+    laptop_stand: normalizedLaptopStand,
+    stand: normalizedLaptopStand,
+    ruf_pad: normalizedRufPad,
+    rufpad: normalizedRufPad,
+    pendrive: normalizedPendrive,
+    mobile: normalizedMobile,
+    camera: normalizedCamera,
+    webcam: normalizedCamera,
+    earphone_headphone: normalizedEarphone,
+    earphone: normalizedEarphone,
+    headphone: normalizedEarphone,
+    tablet: normalizedTablet,
+
+    // CamelCase equivalents
+    laptopDetails: laptop,
+    serialNumber: serial,
+    hasMouse: isYes(row.mouse),
+    hasKeyboard: isYes(row.keyboard),
+    hasLaptopStand: isYes(row.laptop_stand),
+    hasRufPad: isYes(row.ruf_pad),
+    hasPendrive: isYes(row.pendrive),
+    hasMobile: isYes(row.mobile),
+    hasCamera: isYes(row.camera),
+    hasEarphone: isYes(row.earphone_headphone),
+    hasTablet: isYes(row.tablet),
+
+    // Employee who returned/pledged this asset (null for newly purchased stock)
+    returnedByEmployeeId: row.returned_by_employee_id || null,
+    returnedByName: row.returned_by_name || null,
+    returnedByDesignation: row.returned_by_designation || null,
+    returnedDate: row.returned_date || null,
+    returned_by_employee_id: row.returned_by_employee_id || null,
+    returned_by_name: row.returned_by_name || null,
+    returned_by_designation: row.returned_by_designation || null,
+    returned_date: row.returned_date || null,
+    
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
@@ -2293,21 +2468,31 @@ app.get('/api/users/:id/photo', async (req, res) => {
     }
 
     const picData = result.recordset[0].profile_picture;
-    if (picData.startsWith('data:image')) {
-      const parts = picData.split(',');
-      const mime = parts[0].split(':')[1].split(';')[0];
-      const buffer = Buffer.from(parts[1], 'base64');
-      res.setHeader('Content-Type', mime);
-      res.setHeader('Cache-Control', 'no-cache, must-revalidate');
-      return res.send(buffer);
-    } else if (picData.startsWith('http')) {
-      return res.redirect(normalizeVideoUrl(picData));
-    } else {
-      const buffer = Buffer.from(picData, 'base64');
+    if (Buffer.isBuffer(picData)) {
       res.setHeader('Content-Type', 'image/png');
       res.setHeader('Cache-Control', 'no-cache, must-revalidate');
-      return res.send(buffer);
+      return res.send(picData);
     }
+
+    if (typeof picData === 'string') {
+      if (picData.startsWith('data:image')) {
+        const parts = picData.split(',');
+        const mime = parts[0].split(':')[1].split(';')[0];
+        const buffer = Buffer.from(parts[1], 'base64');
+        res.setHeader('Content-Type', mime);
+        res.setHeader('Cache-Control', 'no-cache, must-revalidate');
+        return res.send(buffer);
+      } else if (picData.startsWith('http')) {
+        return res.redirect(normalizeVideoUrl(picData));
+      } else {
+        const buffer = Buffer.from(picData, 'base64');
+        res.setHeader('Content-Type', 'image/png');
+        res.setHeader('Cache-Control', 'no-cache, must-revalidate');
+        return res.send(buffer);
+      }
+    }
+
+    return res.status(404).send('Not Found');
   } catch (err) {
     res.status(500).send('Error');
   }
@@ -5904,29 +6089,58 @@ app.get('/api/threads/:id/comments', async (req, res) => {
 // 5.1 Edit a Comment
 app.put('/api/threads/:threadId/comments/:commentId', async (req, res) => {
   const { threadId, commentId } = req.params;
-  const userId = req.body.userId || req.body.user_id || req.body.employeeId || req.body.employee_id;
-  const commentText = req.body.comment || req.body.text || req.body.content;
+  const body = req.body || {};
+  const query = req.query || {};
+  
+  // Extract comment text from all possible frontend field naming conventions
+  const commentText = body.comment || body.text || body.content || body.commentText || body.comment_text || body.newComment || body.commentBody || query.comment || query.text;
+  
+  // Extract user ID from body, query, or JWT fallback
+  let userId = body.userId || body.user_id || body.employeeId || body.employee_id || query.userId || query.user_id || query.employeeId || query.employee_id;
 
-  if (!userId || !commentText) return res.status(400).json({ error: 'User ID and comment text are required' });
+  if (!userId) {
+    const authHeader = req.headers['authorization'];
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      const token = authHeader.split(' ')[1];
+      const { user: decoded } = await getVerifiedUser(token);
+      if (decoded) {
+        userId = decoded.id;
+      }
+    }
+  }
+
+  if (!userId || !commentText) {
+    return res.status(400).json({ error: 'User ID and comment text are required to update comment' });
+  }
 
   try {
     const pool = await getPool();
     // Verify ownership
     const checkResult = await pool.request()
-      .input('id', sql.Int, commentId)
+      .input('id', sql.Int, parseInt(commentId, 10))
       .query('SELECT user_id FROM thread_comments WHERE id = @id');
 
     if (checkResult.recordset.length === 0) return res.status(404).json({ error: 'Comment not found' });
-    if (checkResult.recordset[0].user_id.toString() !== String(userId)) {
+    
+    const dbUserId = checkResult.recordset[0].user_id;
+    if (dbUserId === null || dbUserId === undefined || String(dbUserId).trim() !== String(userId).trim()) {
       return res.status(403).json({ error: 'Unauthorized: Can only modify your own comments' });
     }
 
     await pool.request()
-      .input('id', sql.Int, commentId)
+      .input('id', sql.Int, parseInt(commentId, 10))
       .input('comment', sql.NVarChar(sql.MAX), commentText)
       .query('UPDATE thread_comments SET comment = @comment WHERE id = @id');
 
-    res.json({ message: 'Comment updated successfully' });
+    res.json({ 
+      success: true, 
+      message: 'Comment updated successfully',
+      comment: commentText,
+      text: commentText,
+      content: commentText,
+      id: parseInt(commentId, 10),
+      commentId: parseInt(commentId, 10)
+    });
   } catch (err) {
     console.error('Comment update failed:', err);
     res.status(500).json({ error: 'Failed to update comment' });
@@ -5936,7 +6150,21 @@ app.put('/api/threads/:threadId/comments/:commentId', async (req, res) => {
 // 5.2 Delete a Comment
 app.delete('/api/threads/:threadId/comments/:commentId', async (req, res) => {
   const { threadId, commentId } = req.params;
-  const userId = req.body.userId || req.body.user_id || req.query.userId || req.query.user_id;
+  const body = req.body || {};
+  const query = req.query || {};
+  
+  let userId = body.userId || body.user_id || query.userId || query.user_id;
+
+  if (!userId) {
+    const authHeader = req.headers['authorization'];
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      const token = authHeader.split(' ')[1];
+      const { user: decoded } = await getVerifiedUser(token);
+      if (decoded) {
+        userId = decoded.id;
+      }
+    }
+  }
 
   if (!userId) return res.status(400).json({ error: 'User ID is required to verify ownership' });
 
@@ -7449,6 +7677,62 @@ app.get('/api/courses', async (req, res) => {
   } catch (err) {
     console.error('Fetch courses error:', err);
     res.status(500).json({ error: 'Failed to fetch academic catalog' });
+  }
+});
+
+// 26.1b GET: Fetch all courses for a specific user (enrolment + progress)
+// Called by: GET /api/user-courses?userId=<id>
+// Returns every course the user has touched (started, completed, enrolled) with their progress state.
+// Admin/HR can pass any userId; regular users are limited to their own via the token.
+app.get('/api/user-courses', verifyToken, async (req, res) => {
+  try {
+    const pool = await getPool();
+
+    // Resolve target user: query param takes precedence (for admin views); fallback to self
+    const requestedId = sanitizeNumericId(req.query.userId || req.query.user_id);
+    const selfId = req.user.id;
+    const role = (req.user.role || '').toLowerCase();
+    const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
+
+    // Non-admins can only fetch their own courses
+    const targetId = (isAdmin && requestedId) ? requestedId : selfId;
+
+    if (!targetId) return res.status(400).json({ error: 'Missing userId parameter.' });
+
+    const result = await pool.request()
+      .input('uid', sql.Int, targetId)
+      .query(`
+        SELECT
+          c.id,
+          c.title,
+          c.description,
+          c.category,
+          c.pdf_url,
+          c.video_url,
+          c.deadline,
+          c.created_at,
+          c.updated_at,
+          ISNULL(uc.completed, 0)   AS completed,
+          uc.completed_at,
+          uc.user_email,
+          uc.course_title           AS enrolled_title,
+          uc.updated_at             AS last_activity
+        FROM user_courses uc WITH (NOLOCK)
+        JOIN courses c WITH (NOLOCK) ON c.id = uc.course_id
+        WHERE uc.user_id = @uid
+        ORDER BY uc.updated_at DESC
+      `);
+
+    const normalizedData = result.recordset.map(row => ({
+      ...row,
+      video_url: normalizeVideoUrl(row.video_url, req),
+      pdf_url:   normalizeVideoUrl(row.pdf_url, req),
+    }));
+
+    res.json(normalizedData);
+  } catch (err) {
+    console.error('[USER COURSES FETCH ERROR]:', err);
+    res.status(500).json({ error: 'Failed to fetch user courses' });
   }
 });
 
@@ -9374,10 +9658,12 @@ cron.schedule('40 9 * * *', () => triggerAttendanceSync('09:40 AM IST'), { timez
 cron.schedule('0 10 * * *', () => triggerAttendanceSync('10:00 AM IST'), { timezone: "Asia/Kolkata" });
 // 01:35 PM IST
 cron.schedule('35 13 * * *', () => triggerAttendanceSync('01:35 PM IST'), { timezone: "Asia/Kolkata" });
-// 02:15 PM IST
-cron.schedule('15 14 * * *', () => triggerAttendanceSync('02:15 PM IST'), { timezone: "Asia/Kolkata" });
-// 02:30 PM IST
-cron.schedule('30 14 * * *', () => triggerAttendanceSync('02:30 PM IST'), { timezone: "Asia/Kolkata" });
+// 01:40 PM IST
+cron.schedule('40 13 * * *', () => triggerAttendanceSync('01:40 PM IST'), { timezone: "Asia/Kolkata" });
+// 02:35 PM IST
+cron.schedule('35 14 * * *', () => triggerAttendanceSync('02:35 PM IST'), { timezone: "Asia/Kolkata" });
+// 02:40 PM IST
+cron.schedule('40 14 * * *', () => triggerAttendanceSync('02:40 PM IST'), { timezone: "Asia/Kolkata" });
 // 06:05 PM IST
 cron.schedule('5 18 * * *', () => triggerAttendanceSync('06:05 PM IST'), { timezone: "Asia/Kolkata" });
 // 06:30 PM IST
@@ -11896,7 +12182,7 @@ app.post(['/api/quizzes/:id/answer', '/api/fun-quizzes/submit-answer'], verifyTo
 /**
  * 46.3.1 Submit Full Quiz Session (Aggregate Points)
  */
-app.post(['/api/quizzes/submit-session', '/api/quizzes/submit-total'], verifyToken, async (req, res) => {
+app.post(['/api/quizzes/submit-session', '/api/quizzes/submit-total', '/api/fun-quizzes/submit'], verifyToken, async (req, res) => {
   const userId = req.user.id;
   const today = new Date().toISOString().split('T')[0];
 
@@ -11927,6 +12213,26 @@ app.post(['/api/quizzes/submit-session', '/api/quizzes/submit-total'], verifyTok
     const correctCount = summary.correct_count || 0;
 
     if (totalAttempts === 0) {
+      // Check if they already have completions for today (due to Immediate Point Injection)
+      const checkCompletion = await pool.request()
+        .input('userId', sql.Int, userId)
+        .input('today', sql.Date, today)
+        .query(`
+          SELECT total_points, correct_count FROM quiz_completions 
+          WHERE employee_id = @userId AND completion_date = @today
+        `);
+
+      if (checkCompletion.recordset.length > 0) {
+        const comp = checkCompletion.recordset[0];
+        console.log(`[QUIZ SUBMIT] User ${userId} session already finalized for today. Returning cached results.`);
+        return res.json({
+          success: true,
+          message: 'Quiz session already submitted and finalized!',
+          totalPoints: comp.total_points,
+          correctCount: comp.correct_count
+        });
+      }
+
       console.warn(`[QUIZ SUBMIT] User ${userId} rejected: No attempts found for ${today}`);
       return res.status(400).json({ error: 'No quiz attempts found for today. Please answer at least one quiz before submitting.' });
     }
@@ -12452,6 +12758,150 @@ app.get(['/api/service-certificates/:id', '/api/service_certificate_requests/:id
 });
 
 /**
+ * Helper to resolve an employee's official name and designation from their ID (either numeric user ID or HR employee ID).
+ */
+const resolveEmployeeDetails = async (pool, empId) => {
+  if (!empId || empId === 'undefined' || empId === 'null') {
+    return { name: null, designation: null };
+  }
+  try {
+    const empRes = await pool.request()
+      .input('empLookupId', sql.NVarChar, String(empId))
+      .query(`
+        SELECT TOP 1 
+          ISNULL(e.emp_name, u.name) AS emp_name,
+          ISNULL(e.designation, u.role) AS emp_designation
+        FROM users u
+        LEFT JOIN employee e ON e.user_id = u.id
+        WHERE u.id = TRY_CAST(@empLookupId AS INT)
+           OR e.emp_id = @empLookupId
+      `);
+    if (empRes.recordset.length > 0) {
+      return {
+        name: empRes.recordset[0].emp_name || null,
+        designation: empRes.recordset[0].emp_designation || null
+      };
+    }
+  } catch (err) {
+    console.warn('[RESOLVE EMPLOYEE DETAILS ERROR]:', err.message);
+  }
+  return { name: null, designation: null };
+};
+
+/**
+ * Helper: Automatically transfer service certificate pledged assets to general stock.
+ * This function handles column mapping, NVARCHAR Yes/No values, and cleans up assigned assets.
+ */
+const addCertAssetsToStock = async (pool, cert, body) => {
+  try {
+    const getVal = (key, fallback) => {
+      // First try to fetch from update body (if provided)
+      if (body) {
+        const val = getAssetValue(body, key);
+        // If the key exists in body, use it (do not default to cert value if body explicitly cleared it)
+        const normalizedKey = key.toLowerCase().replace(/_/g, '');
+        const bodyHasKey = Object.keys(body).some(bk => bk.toLowerCase().replace(/_/g, '') === normalizedKey || bk.toLowerCase().replace(/_/g, '') === 'has' + normalizedKey);
+        if (bodyHasKey) return val;
+      }
+      // Otherwise fall back to the existing request column
+      return getAssetValue(cert, key);
+    };
+
+    const stockLaptop = getAssetValue(body, 'laptop_details') || cert.laptop_details || '';
+    const rawSerial = getAssetValue(body, 'serial_number') || cert.serial_number || '';
+    // Only treat as a real serial if it's non-empty and not a boolean-ish default value
+    const isRealSerial = rawSerial && !['no', 'false', '0', 'null', 'undefined'].includes(String(rawSerial).trim().toLowerCase());
+    const stockSerial = isRealSerial ? rawSerial : '';
+    const finalLaptopDetails = [stockLaptop, stockSerial ? `(Serial: ${stockSerial})` : ''].filter(Boolean).join(' ').trim();
+
+    // Map columns from certificate request schema to assets_stock schema
+    const stockMouse = getVal('mouse');
+    const stockKeyboard = getVal('keyboard');
+    const stockLaptopStand = getVal('laptop_stand');
+    const stockRufPad = getVal('ruf_pad');
+    const stockPendrive = getVal('pendrive');
+    const stockMobile = getVal('mobile');
+    const stockCamera = getVal('camera');
+    const stockEarphone = getVal('earphone_headphone');
+    const stockTablet = getVal('tablet');
+
+    // Only add to stock if there are actually some assets pledged/provided
+    const hasAnyAssets = finalLaptopDetails ||
+      stockMouse === 'Yes' || stockKeyboard === 'Yes' || stockLaptopStand === 'Yes' ||
+      stockRufPad === 'Yes' || stockPendrive === 'Yes' || stockMobile === 'Yes' ||
+      stockCamera === 'Yes' || stockEarphone === 'Yes' || stockTablet === 'Yes';
+
+    if (!hasAnyAssets) {
+      console.log(`[CERT APPROVE] No assets pledged for certificate request ID: ${cert.id}`);
+      return;
+    }
+
+    // Resolve employee details from cert record or body for audit trail
+    const returnedByEmpId = String(cert.employee_id || (body && body.employee_id) || '');
+    let resolvedName = cert.employee_name || (body && body.employee_name) || null;
+    let resolvedDesignation = cert.designation || (body && body.designation) || null;
+
+    // Resolve from database using robust helper if name/designation is missing
+    if (returnedByEmpId && (!resolvedName || !resolvedDesignation)) {
+      const empDetails = await resolveEmployeeDetails(pool, returnedByEmpId);
+      resolvedName = resolvedName || empDetails.name;
+      resolvedDesignation = resolvedDesignation || empDetails.designation;
+    }
+
+    const stockReq = pool.request();
+    stockReq.input('laptop_details', sql.NVarChar, finalLaptopDetails || null);
+    stockReq.input('mouse', sql.NVarChar, stockMouse);
+    stockReq.input('keyboard', sql.NVarChar, stockKeyboard);
+    stockReq.input('laptop_stand', sql.NVarChar, stockLaptopStand);
+    stockReq.input('ruf_pad', sql.NVarChar, stockRufPad);
+    stockReq.input('pendrive', sql.NVarChar, stockPendrive);
+    stockReq.input('mobile', sql.NVarChar, stockMobile);
+    stockReq.input('camera', sql.NVarChar, stockCamera);
+    stockReq.input('earphone_headphone', sql.NVarChar, stockEarphone);
+    stockReq.input('tablet', sql.NVarChar, stockTablet);
+    stockReq.input('returned_by_employee_id', sql.NVarChar, returnedByEmpId || null);
+    stockReq.input('returned_by_name', sql.NVarChar, resolvedName || null);
+    stockReq.input('returned_by_designation', sql.NVarChar, resolvedDesignation || null);
+
+    await stockReq.query(`
+      INSERT INTO assets_stock (
+        laptop_details, mouse, keyboard, laptop_stand, ruf_pad, 
+        pendrive, mobile, camera, earphone_headphone, tablet,
+        returned_by_employee_id, returned_by_name, returned_by_designation,
+        returned_date, created_at, updated_at
+      ) VALUES (
+        @laptop_details, @mouse, @keyboard, @laptop_stand, @ruf_pad, 
+        @pendrive, @mobile, @camera, @earphone_headphone, @tablet,
+        @returned_by_employee_id, @returned_by_name, @returned_by_designation,
+        DATEADD(MINUTE, 330, GETUTCDATE()), DATEADD(MINUTE, 330, GETUTCDATE()), DATEADD(MINUTE, 330, GETUTCDATE())
+      )
+    `);
+    console.log(`[CERT APPROVE] Assets added to stock (with employee audit) for cert request: ${cert.id}`);
+
+    // Now, release/delete the employee's existing assigned assets from the assets table!
+    const empIdStr = String(cert.employee_id || (body && body.employee_id));
+    if (empIdStr && empIdStr !== 'undefined' && empIdStr !== 'null') {
+      const empResult = await pool.request()
+        .input('targetId', sql.NVarChar, empIdStr)
+        .query(`
+          SELECT emp_id FROM employee 
+          WHERE (TRY_CAST(@targetId AS INT) IS NOT NULL AND user_id = TRY_CAST(@targetId AS INT))
+             OR emp_id = @targetId
+        `);
+      const officialEmpId = empResult.recordset[0]?.emp_id || empIdStr;
+
+      const deleteReq = pool.request();
+      deleteReq.input('empId', sql.NVarChar, String(empIdStr));
+      deleteReq.input('officialEmpId', sql.NVarChar, String(officialEmpId || ''));
+      await deleteReq.query('DELETE FROM assets WHERE employee_id = @empId OR employee_id = @officialEmpId');
+      console.log(`[CERT APPROVE] Released and cleared assigned assets for employee: ${empIdStr} / ${officialEmpId}`);
+    }
+  } catch (err) {
+    console.error('[CERT APPROVE ASSET STOCKING ERROR]:', err);
+  }
+};
+
+/**
  * 56. Review Service Certificate Request (Admin/HR Only)
  */
 app.put(['/api/admin/service-certificates/:id', '/api/service-certificates/:id', '/api/service-certificates', '/api/service_certificates/:id', '/api/service_certificates', '/api/service_certificate_requests/:id', '/api/service_certificate_requests'], verifyToken, async (req, res) => {
@@ -12553,6 +13003,13 @@ app.put(['/api/admin/service-certificates/:id', '/api/service-certificates/:id',
         updateQuery += ", " + sets.join(", ") + " WHERE id = @id";
         await request.query(updateQuery);
       }
+
+      // Automatically add pledged assets to stock table if status is Approved
+      const isNewlyApproved = (status === 'Approved' || req.body.status === 'Approved') && certificate.status !== 'Approved';
+      if (isNewlyApproved) {
+        await addCertAssetsToStock(pool, certificate, req.body);
+      }
+
       res.json({ success: true, message: 'Service certificate request updated successfully.', id: certificate.id });
 
     } else {
@@ -12586,7 +13043,14 @@ app.put(['/api/admin/service-certificates/:id', '/api/service-certificates/:id',
 
       const insertQuery = `INSERT INTO service_certificate_requests (${cols.join(', ')}) OUTPUT INSERTED.id VALUES (${vals.join(', ')})`;
       const result = await request.query(insertQuery);
-      res.status(201).json({ success: true, message: 'Service certificate request created successfully.', id: result.recordset[0].id });
+      const newId = result.recordset[0].id;
+
+      if (finalStatus === 'Approved') {
+        const certRecord = { id: newId, employee_id: targetEmpId };
+        await addCertAssetsToStock(pool, certRecord, req.body);
+      }
+
+      res.status(201).json({ success: true, message: 'Service certificate request created successfully.', id: newId });
     }
 
   } catch (err) {
@@ -13134,7 +13598,12 @@ app.post('/api/assets', verifyToken, async (req, res) => {
     ];
 
     columns.forEach(col => {
-      let val = data[col] || data[col.replace(/_/g, '')] || data[col.charAt(0).toUpperCase() + col.slice(1).replace(/_/g, '')] || null;
+      let val;
+      if (['employee_id', 'employee_name', 'designation', 'joining_date', 'last_working_date'].includes(col)) {
+        val = data[col] || data[col.replace(/_/g, '')] || data[col.charAt(0).toUpperCase() + col.slice(1).replace(/_/g, '')] || null;
+      } else {
+        val = getAssetValue(data, col);
+      }
       if (['joining_date', 'last_working_date'].includes(col)) {
         const isValidDate = val && !isNaN(new Date(val).getTime());
         request.input(col, sql.Date, isValidDate ? val : null);
@@ -13202,10 +13671,23 @@ app.put('/api/assets/:id', verifyToken, async (req, res) => {
       'pendrive', 'mobile', 'camera', 'earphone_headphone', 'tablet'
     ];
 
+    const hasProperty = (col) => {
+      if (['employee_id', 'employee_name', 'designation', 'joining_date', 'last_working_date'].includes(col)) {
+        return data.hasOwnProperty(col) || data.hasOwnProperty(col.replace(/_/g, '')) || data.hasOwnProperty(col.charAt(0).toUpperCase() + col.slice(1).replace(/_/g, ''));
+      }
+      const normalizedKey = col.toLowerCase().replace(/_/g, '');
+      return Object.keys(data).some(bk => bk.toLowerCase().replace(/_/g, '') === normalizedKey || bk.toLowerCase().replace(/_/g, '') === 'has' + normalizedKey);
+    };
+
     const updateClauses = [];
     columns.forEach(col => {
-      if (data.hasOwnProperty(col)) {
-        let val = data[col];
+      if (hasProperty(col)) {
+        let val;
+        if (['employee_id', 'employee_name', 'designation', 'joining_date', 'last_working_date'].includes(col)) {
+          val = data[col] || data[col.replace(/_/g, '')] || data[col.charAt(0).toUpperCase() + col.slice(1).replace(/_/g, '')] || null;
+        } else {
+          val = getAssetValue(data, col);
+        }
         if (['joining_date', 'last_working_date'].includes(col)) {
           const isValidDate = val && !isNaN(new Date(val).getTime());
           request.input(col, sql.Date, isValidDate ? val : null);
@@ -13242,6 +13724,468 @@ app.delete('/api/assets/:id', verifyToken, async (req, res) => {
   } catch (err) {
     console.error('[ASSET DELETE ERROR]:', err);
     res.status(500).json({ error: 'Failed to delete asset record' });
+  }
+});
+
+// GET: All assets in stock — filterable by UI tab name, returns data + tab counts together
+//
+// UI Filter Tab  →  ?filter=  value
+// ─────────────────────────────────────────
+// All            →  (omit param or all)
+// Laptops        →  laptops   | laptop
+// Keyboards      →  keyboards | keyboard
+// Mice           →  mice      | mouse
+// Mobiles        →  mobiles   | mobile
+// Accessories    →  accessories  (stand, ruf_pad, pendrive, camera, earphone, tablet)
+// Others         →  others    (rows with no items in any category)
+//
+// ?returnedBy=<emp_id>  → further filter by who returned the assets
+//
+// Response shape:
+//   {
+//     data:   [ ...filtered stock rows... ],
+//     counts: { all, laptops, keyboards, mice, mobiles, accessories, others }
+//   }
+app.get('/api/assets-stock', verifyToken, async (req, res) => {
+  const role = (req.user.role || '').toLowerCase();
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
+
+  if (!isAdmin) return res.status(403).json({ error: 'Unauthorized: Admin access required.' });
+
+  // ── SQL condition fragments per UI tab ──────────────────────────────────────
+  const TAB_CONDITIONS = {
+    laptops:     `(laptop_details IS NOT NULL AND laptop_details <> '')`,
+    keyboards:   `keyboard = 'Yes'`,
+    mice:        `mouse = 'Yes'`,
+    mobiles:     `mobile = 'Yes'`,
+    // Accessories = any peripheral that is NOT a laptop
+    accessories: `(laptop_stand = 'Yes' OR ruf_pad = 'Yes' OR pendrive = 'Yes' OR camera = 'Yes' OR earphone_headphone = 'Yes' OR tablet = 'Yes')`,
+    // Others = rows where nothing at all is recorded
+    others:      `(
+                    (laptop_details IS NULL OR laptop_details = '') AND
+                    ISNULL(mouse,            'No') <> 'Yes' AND
+                    ISNULL(keyboard,         'No') <> 'Yes' AND
+                    ISNULL(mobile,           'No') <> 'Yes' AND
+                    ISNULL(laptop_stand,     'No') <> 'Yes' AND
+                    ISNULL(ruf_pad,          'No') <> 'Yes' AND
+                    ISNULL(pendrive,         'No') <> 'Yes' AND
+                    ISNULL(camera,           'No') <> 'Yes' AND
+                    ISNULL(earphone_headphone,'No') <> 'Yes' AND
+                    ISNULL(tablet,           'No') <> 'Yes'
+                  )`,
+  };
+
+  // Normalise aliases  (laptops → laptops, laptop → laptops, mice → mice, mouse → mice, …)
+  const normaliseFilter = (raw) => {
+    const f = (raw || '').trim().toLowerCase();
+    if (!f || f === 'all') return 'all';
+    if (f === 'laptop')      return 'laptops';
+    if (f === 'keyboard')    return 'keyboards';
+    if (f === 'mouse')       return 'mice';
+    if (f === 'mobile')      return 'mobiles';
+    if (f === 'accessory')   return 'accessories';
+    if (f === 'other')       return 'others';
+    return f; // already plural / exact
+  };
+
+  try {
+    const pool = await getPool();
+    const request = pool.request();
+
+    // ── Build WHERE for the selected tab ────────────────────────────────────
+    const activeFilter = normaliseFilter(req.query.filter || req.query.item || '');
+    const filterCondition = TAB_CONDITIONS[activeFilter] || null;
+
+    const whereClauses = filterCondition ? [filterCondition] : [];
+
+    // Optional: filter further by the employee who returned the assets
+    const returnedBy = req.query.returnedBy || req.query.returned_by || '';
+    if (returnedBy) {
+      request.input('retBy', sql.NVarChar, String(returnedBy));
+      whereClauses.push(`returned_by_employee_id = @retBy`);
+    }
+
+    const whereSQL = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
+
+    // ── Run both queries in parallel ─────────────────────────────────────────
+    const [dataResult, countsResult] = await Promise.all([
+      request.query(`SELECT * FROM assets_stock ${whereSQL} ORDER BY created_at DESC`),
+      pool.request().query(`
+        SELECT
+          COUNT(*)  AS total,
+          SUM(CASE WHEN ${TAB_CONDITIONS.laptops}     THEN 1 ELSE 0 END) AS laptops,
+          SUM(CASE WHEN ${TAB_CONDITIONS.keyboards}   THEN 1 ELSE 0 END) AS keyboards,
+          SUM(CASE WHEN ${TAB_CONDITIONS.mice}        THEN 1 ELSE 0 END) AS mice,
+          SUM(CASE WHEN ${TAB_CONDITIONS.mobiles}     THEN 1 ELSE 0 END) AS mobiles,
+          SUM(CASE WHEN ${TAB_CONDITIONS.accessories} THEN 1 ELSE 0 END) AS accessories,
+          SUM(CASE WHEN ${TAB_CONDITIONS.others}      THEN 1 ELSE 0 END) AS others
+        FROM assets_stock
+      `)
+    ]);
+
+    const c = countsResult.recordset[0];
+    res.json({
+      // Currently active filter tab name (echoed back so frontend can self-verify)
+      activeFilter,
+      // Filtered list of stock rows
+      data: dataResult.recordset.map(mapAssetStockRow),
+      // Counts for every tab — use these as badge numbers on the filter pills
+      counts: {
+        all:         c.total,
+        laptops:     c.laptops,
+        keyboards:   c.keyboards,
+        mice:        c.mice,
+        mobiles:     c.mobiles,
+        accessories: c.accessories,
+        others:      c.others,
+      }
+    });
+  } catch (err) {
+    console.error('[ASSETS STOCK FETCH ERROR]:', err);
+    res.status(500).json({ error: 'Failed to fetch stock assets' });
+  }
+});
+
+// GET: /api/assets-stock/summary  — lightweight alias (just the counts, no row data)
+app.get('/api/assets-stock/summary', verifyToken, async (req, res) => {
+  const role = (req.user.role || '').toLowerCase();
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
+  if (!isAdmin) return res.status(403).json({ error: 'Unauthorized: Admin access required.' });
+
+  try {
+    const pool = await getPool();
+    const result = await pool.request().query(`
+      SELECT
+        COUNT(*)  AS total,
+        SUM(CASE WHEN laptop_details IS NOT NULL AND laptop_details <> '' THEN 1 ELSE 0 END) AS laptops,
+        SUM(CASE WHEN keyboard         = 'Yes' THEN 1 ELSE 0 END) AS keyboards,
+        SUM(CASE WHEN mouse            = 'Yes' THEN 1 ELSE 0 END) AS mice,
+        SUM(CASE WHEN mobile           = 'Yes' THEN 1 ELSE 0 END) AS mobiles,
+        SUM(CASE WHEN laptop_stand = 'Yes' OR ruf_pad = 'Yes' OR pendrive = 'Yes'
+                   OR camera = 'Yes' OR earphone_headphone = 'Yes' OR tablet = 'Yes'
+                THEN 1 ELSE 0 END) AS accessories,
+        SUM(CASE WHEN (laptop_details IS NULL OR laptop_details = '')
+                   AND ISNULL(mouse,'No') <> 'Yes' AND ISNULL(keyboard,'No') <> 'Yes'
+                   AND ISNULL(mobile,'No') <> 'Yes' AND ISNULL(laptop_stand,'No') <> 'Yes'
+                   AND ISNULL(ruf_pad,'No') <> 'Yes' AND ISNULL(pendrive,'No') <> 'Yes'
+                   AND ISNULL(camera,'No') <> 'Yes' AND ISNULL(earphone_headphone,'No') <> 'Yes'
+                   AND ISNULL(tablet,'No') <> 'Yes'
+                THEN 1 ELSE 0 END) AS others
+      FROM assets_stock
+    `);
+
+    const c = result.recordset[0];
+    res.json({ all: c.total, laptops: c.laptops, keyboards: c.keyboards, mice: c.mice, mobiles: c.mobiles, accessories: c.accessories, others: c.others });
+  } catch (err) {
+    console.error('[ASSETS STOCK SUMMARY ERROR]:', err);
+    res.status(500).json({ error: 'Failed to fetch stock summary' });
+  }
+});
+
+// POST: Add new asset to stock (e.g. company bought new set of assets)
+app.post('/api/assets-stock', verifyToken, async (req, res) => {
+  const role = (req.user.role || '').toLowerCase();
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
+
+  if (!isAdmin) return res.status(403).json({ error: 'Unauthorized: Admin access required.' });
+
+  const data = req.body;
+  try {
+    const pool = await getPool();
+    const request = pool.request();
+
+    const columns = [
+      'laptop_details', 'mouse', 'keyboard', 'laptop_stand', 'ruf_pad',
+      'pendrive', 'mobile', 'camera', 'earphone_headphone', 'tablet'
+    ];
+
+    columns.forEach(col => {
+      let val = getAssetValue(data, col);
+      request.input(col, sql.NVarChar, val ? String(val) : null);
+    });
+
+    // Optional: who returned/donated this asset (for manually entered stock)
+    const returnedByEmpId = data.returned_by_employee_id || data.returnedByEmployeeId || null;
+    let returnedByName = data.returned_by_name || data.returnedByName || null;
+    let returnedByDesignation = data.returned_by_designation || data.returnedByDesignation || null;
+
+    if (returnedByEmpId && (!returnedByName || !returnedByDesignation)) {
+      const empDetails = await resolveEmployeeDetails(pool, returnedByEmpId);
+      returnedByName = returnedByName || empDetails.name;
+      returnedByDesignation = returnedByDesignation || empDetails.designation;
+    }
+
+    request.input('returned_by_employee_id', sql.NVarChar, returnedByEmpId ? String(returnedByEmpId) : null);
+    request.input('returned_by_name', sql.NVarChar, returnedByName || null);
+    request.input('returned_by_designation', sql.NVarChar, returnedByDesignation || null);
+
+    const query = `
+      INSERT INTO assets_stock (
+        ${columns.join(', ')},
+        returned_by_employee_id, returned_by_name, returned_by_designation,
+        returned_date, created_at, updated_at
+      )
+      VALUES (
+        ${columns.map(c => '@' + c).join(', ')},
+        @returned_by_employee_id, @returned_by_name, @returned_by_designation,
+        DATEADD(MINUTE, 330, GETUTCDATE()), DATEADD(MINUTE, 330, GETUTCDATE()), DATEADD(MINUTE, 330, GETUTCDATE())
+      )
+    `;
+
+    await request.query(query);
+    res.status(201).json({
+      success: true,
+      message: 'Asset added to stock successfully'
+    });
+  } catch (err) {
+    console.error('[ASSET STOCK CREATE ERROR]:', err);
+    res.status(500).json({ error: 'Failed to add asset to stock' });
+  }
+});
+
+// PUT: Update stock asset record
+app.put('/api/assets-stock/:id', verifyToken, async (req, res) => {
+  const role = (req.user.role || '').toLowerCase();
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
+
+  if (!isAdmin) return res.status(403).json({ error: 'Unauthorized: Admin access required.' });
+
+  const { id } = req.params;
+  const data = req.body;
+  try {
+    const pool = await getPool();
+    const request = pool.request().input('id', sql.Int, id);
+
+    const columns = [
+      'laptop_details', 'mouse', 'keyboard', 'laptop_stand', 'ruf_pad',
+      'pendrive', 'mobile', 'camera', 'earphone_headphone', 'tablet'
+    ];
+
+    const updateClauses = [];
+    const hasProperty = (col) => {
+      const normalizedKey = col.toLowerCase().replace(/_/g, '');
+      return Object.keys(data).some(bk => bk.toLowerCase().replace(/_/g, '') === normalizedKey || bk.toLowerCase().replace(/_/g, '') === 'has' + normalizedKey);
+    };
+    columns.forEach(col => {
+      if (hasProperty(col)) {
+        let val = getAssetValue(data, col);
+        request.input(col, sql.NVarChar, val ? String(val) : null);
+        updateClauses.push(`${col} = @${col}`);
+      }
+    });
+
+    if (updateClauses.length === 0) return res.status(400).json({ error: 'No data provided to update' });
+
+    const query = `UPDATE assets_stock SET ${updateClauses.join(', ')}, updated_at = DATEADD(MINUTE, 330, GETUTCDATE()) WHERE id = @id`;
+    await request.query(query);
+    res.json({ success: true, message: 'Stock asset record updated' });
+  } catch (err) {
+    console.error('[ASSET STOCK UPDATE ERROR]:', err);
+    res.status(500).json({ error: 'Failed to update stock asset record' });
+  }
+});
+
+// DELETE: Remove asset from stock
+app.delete('/api/assets-stock/:id', verifyToken, async (req, res) => {
+  const role = (req.user.role || '').toLowerCase();
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
+
+  if (!isAdmin) return res.status(403).json({ error: 'Unauthorized: Admin access required.' });
+
+  const { id } = req.params;
+  try {
+    const pool = await getPool();
+    await pool.request().input('id', sql.Int, id).query('DELETE FROM assets_stock WHERE id = @id');
+    res.json({ success: true, message: 'Stock asset record deleted' });
+  } catch (err) {
+    console.error('[ASSET STOCK DELETE ERROR]:', err);
+    res.status(500).json({ error: 'Failed to delete stock asset' });
+  }
+});
+
+// POST: Assign asset from stock to an employee
+app.post('/api/assets/assign', verifyToken, async (req, res) => {
+  const role = (req.user.role || '').toLowerCase();
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
+
+  if (!isAdmin) return res.status(403).json({ error: 'Unauthorized: Admin access required.' });
+
+  const { stock_id, employee_id, employee_name, designation, joining_date, last_working_date } = req.body;
+
+  if (!stock_id || !employee_id) {
+    return res.status(400).json({ error: 'Missing required fields: stock_id and employee_id are mandatory.' });
+  }
+
+  try {
+    const pool = await getPool();
+
+    // 1. Fetch asset details from stock
+    const stockRes = await pool.request()
+      .input('stock_id', sql.Int, stock_id)
+      .query('SELECT * FROM assets_stock WHERE id = @stock_id');
+
+    if (stockRes.recordset.length === 0) {
+      return res.status(404).json({ error: 'Stock asset not found.' });
+    }
+
+    const asset = stockRes.recordset[0];
+
+    // 2. Begin transaction to insert into assets and delete from assets_stock
+    const transaction = new sql.Transaction(pool);
+    await transaction.begin();
+
+    try {
+      // Insert into assets
+      const insertReq = new sql.Request(transaction);
+      const columns = [
+        'employee_id', 'employee_name', 'designation', 'joining_date', 'last_working_date',
+        'laptop_details', 'mouse', 'keyboard', 'laptop_stand', 'ruf_pad',
+        'pendrive', 'mobile', 'camera', 'earphone_headphone', 'tablet'
+      ];
+
+      const assetData = {
+        ...asset,
+        employee_id,
+        employee_name,
+        designation,
+        joining_date,
+        last_working_date
+      };
+
+      columns.forEach(col => {
+        let val = assetData[col] || null;
+        if (['joining_date', 'last_working_date'].includes(col)) {
+          const isValidDate = val && !isNaN(new Date(val).getTime());
+          insertReq.input(col, sql.Date, isValidDate ? val : null);
+        } else {
+          insertReq.input(col, sql.NVarChar, val ? String(val) : null);
+        }
+      });
+
+      // Check if employee already has an asset entry to update/upsert (since one employee might have one row in assets table)
+      const checkReq = new sql.Request(transaction);
+      checkReq.input('checkEmpId', sql.NVarChar, String(employee_id));
+      const checkRes = await checkReq.query('SELECT id FROM assets WHERE employee_id = @checkEmpId');
+      const exists = checkRes.recordset.length > 0;
+
+      let query;
+      if (exists) {
+        // If they already have an entry, update it.
+        const sets = columns.filter(c => c !== 'employee_id').map(c => `${c} = @${c}`);
+        query = `
+          UPDATE assets 
+          SET ${sets.join(', ')}, updated_at = GETUTCDATE()
+          WHERE employee_id = @employee_id
+        `;
+      } else {
+        query = `
+          INSERT INTO assets (${columns.join(', ')}, created_at, updated_at)
+          VALUES (${columns.map(c => '@' + c).join(', ')}, GETUTCDATE(), GETUTCDATE())
+        `;
+      }
+
+      await insertReq.query(query);
+
+      // Delete from assets_stock
+      const deleteReq = new sql.Request(transaction);
+      deleteReq.input('stock_id', sql.Int, stock_id);
+      await deleteReq.query('DELETE FROM assets_stock WHERE id = @stock_id');
+
+      await transaction.commit();
+      res.json({ success: true, message: 'Asset assigned successfully.' });
+    } catch (txErr) {
+      await transaction.rollback();
+      throw txErr;
+    }
+  } catch (err) {
+    console.error('[ASSET ASSIGN ERROR]:', err);
+    res.status(500).json({ error: 'Failed to assign asset' });
+  }
+});
+
+// POST: Release an employee's asset back to stock (e.g. when an employee resigns)
+app.post('/api/assets/release', verifyToken, async (req, res) => {
+  const role = (req.user.role || '').toLowerCase();
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
+
+  if (!isAdmin) return res.status(403).json({ error: 'Unauthorized: Admin access required.' });
+
+  const { asset_id } = req.body;
+
+  if (!asset_id) {
+    return res.status(400).json({ error: 'Missing required field: asset_id is mandatory.' });
+  }
+
+  try {
+    const pool = await getPool();
+
+    // 1. Fetch asset details from assets table
+    const assetRes = await pool.request()
+      .input('asset_id', sql.Int, asset_id)
+      .query('SELECT * FROM assets WHERE id = @asset_id');
+
+    if (assetRes.recordset.length === 0) {
+      return res.status(404).json({ error: 'Assigned asset record not found.' });
+    }
+
+    const asset = assetRes.recordset[0];
+
+    // 2. Begin transaction to insert into assets_stock and delete from assets
+    const transaction = new sql.Transaction(pool);
+    await transaction.begin();
+
+    try {
+      // Insert into assets_stock — preserve the returning employee's details for audit trail
+      const insertReq = new sql.Request(transaction);
+      const columns = [
+        'laptop_details', 'mouse', 'keyboard', 'laptop_stand', 'ruf_pad',
+        'pendrive', 'mobile', 'camera', 'earphone_headphone', 'tablet'
+      ];
+
+      columns.forEach(col => {
+        let val = asset[col] || null;
+        insertReq.input(col, sql.NVarChar, val ? String(val) : null);
+      });
+
+      // Save the returning employee's details so the stock record has full audit history
+      const empIdStr = String(asset.employee_id || '');
+      const empDetails = await resolveEmployeeDetails(pool, empIdStr);
+      const returnedByName = asset.employee_name || empDetails.name || null;
+      const returnedByDesignation = asset.designation || empDetails.designation || null;
+
+      insertReq.input('returned_by_employee_id', sql.NVarChar, empIdStr || null);
+      insertReq.input('returned_by_name', sql.NVarChar, returnedByName);
+      insertReq.input('returned_by_designation', sql.NVarChar, returnedByDesignation);
+
+      const query = `
+        INSERT INTO assets_stock (
+          ${columns.join(', ')},
+          returned_by_employee_id, returned_by_name, returned_by_designation,
+          returned_date, created_at, updated_at
+        )
+        VALUES (
+          ${columns.map(c => '@' + c).join(', ')},
+          @returned_by_employee_id, @returned_by_name, @returned_by_designation,
+          DATEADD(MINUTE, 330, GETUTCDATE()), DATEADD(MINUTE, 330, GETUTCDATE()), DATEADD(MINUTE, 330, GETUTCDATE())
+        )
+      `;
+
+      await insertReq.query(query);
+
+      // Delete from assets
+      const deleteReq = new sql.Request(transaction);
+      deleteReq.input('asset_id', sql.Int, asset_id);
+      await deleteReq.query('DELETE FROM assets WHERE id = @asset_id');
+
+      await transaction.commit();
+      res.json({ success: true, message: 'Asset released back to stock successfully.' });
+    } catch (txErr) {
+      await transaction.rollback();
+      throw txErr;
+    }
+  } catch (err) {
+    console.error('[ASSET RELEASE ERROR]:', err);
+    res.status(500).json({ error: 'Failed to release asset back to stock' });
   }
 });
 

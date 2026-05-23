@@ -1,3 +1,6 @@
+// Hosted company logo URL for universal email rendering
+const logoUrl = 'https://navabharathtechnologies.com/assets/logo.png';
+
 /**
  * Returns the HTML for the Saturday Suggestion Reminder email.
  */
@@ -7,7 +10,7 @@ const getSaturdayReminderHtml = (userName) => `<!DOCTYPE html>
 <body style="margin:0;padding:20px;background:#f8fafc;font-family:'Segoe UI', Roboto, Helvetica, Arial, sans-serif;color:#334155;">
   <div style="max-width: 600px; margin: 0 auto; border: 1px solid #e2e8f0; border-radius: 8px; background-color: #ffffff; box-shadow: 0 4px 12px rgba(0,0,0,0.05);">
     <div style="padding: 32px; background-color: #f8fafc; border-bottom: 1px solid #e2e8f0; border-radius: 8px 8px 0 0; text-align: center;">
-      <img src="cid:NBTLogo" alt="NBT Logo" style="width: 120px; display: block; margin: 0 auto 15px auto;">
+      <img src="${logoUrl}" alt="NBT Logo" style="width: 120px; display: block; margin: 0 auto 15px auto;">
       <h1 style="margin: 0; font-size: 20px; color: #1e293b;">NBT HUB: Saturday Suggestion Reminder</h1>
     </div>
     
@@ -38,7 +41,7 @@ const getSaturdayFinalWarningHtml = (userName) => `<!DOCTYPE html>
 <body style="margin:0;padding:20px;background:#f8fafc;font-family:'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;color:#1e293b;">
   <div style="max-width: 600px; margin: 0 auto; border: 1px solid #fca5a5; border-radius: 8px; background-color: #ffffff; border-top: 4px solid #dc2626; box-shadow: 0 4px 12px rgba(0,0,0,0.05);">
     <div style="padding: 32px 40px; text-align: center; border-bottom: 1px solid #fecaca; background-color: #fef2f2;">
-      <img src="cid:NBTLogo" alt="NBT Logo" style="width: 110px; display: block; margin: 0 auto 15px auto;">
+      <img src="${logoUrl}" alt="NBT Logo" style="width: 110px; display: block; margin: 0 auto 15px auto;">
       <p style="margin: 0; font-size: 12px; font-weight: 700; color: #991b1b; text-transform: uppercase; letter-spacing: 1.5px;">Urgent Compliance</p>
       <h1 style="margin: 8px 0 0 0; font-size: 22px; font-weight: 800; color: #7f1d1d;">Final Submission Notice</h1>
     </div>

@@ -1,3 +1,6 @@
+// Hosted company logo URL for universal email rendering
+const logoUrl = 'https://navabharathtechnologies.com/assets/logo.png';
+
 /**
  * Returns the HTML for the daily promotion reminder email sent to HR and Managers.
  */
@@ -17,7 +20,7 @@ const getPromotionReminderHtml = (candidates) => {
 <body style="margin:0;padding:20px;background:#f8fafc;font-family:Arial,sans-serif;color:#334155;">
   <div style="max-width:650px;margin:0 auto;background:#ffffff;padding:40px;border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,0.05); border-top: 6px solid #1e40af;">
     <div style="text-align: left; margin-bottom: 30px; border-bottom: 1px solid #f1f5f9; padding-bottom: 20px;">
-      <img src="cid:NBTLogo" alt="NBT Logo" style="width: 120px; display: block;">
+      <img src="${logoUrl}" alt="NBT Logo" style="width: 120px; display: block;">
     </div>
     <h2 style="color:#1e3a8a;margin-top:0;">📋 Daily Promotion Audit: ${new Date().toLocaleDateString()}</h2>
     <p style="font-size:16px;line-height:1.6;">
