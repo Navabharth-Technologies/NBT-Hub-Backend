@@ -10443,6 +10443,7 @@ const runSaturdayAudit = async (type = 'Reminder') => {
         WHERE s.employee_id IS NULL
         AND LOWER(u.role) NOT LIKE '%ceo%' 
         AND LOWER(u.role) NOT LIKE '%hr%'
+        AND LOWER(u.role) NOT LIKE '%human resource%'
         AND LOWER(u.role) NOT LIKE '%founder%'
         AND LOWER(u.role) NOT LIKE '%project manager%'
       `);
