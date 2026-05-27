@@ -5592,7 +5592,14 @@ app.get('/api/admin/tasks/completed', verifyToken, async (req, res) => {
 
 
 // 13. Get ALL Assigned Tasks (Global Management View)
-app.get('/api/tasks/all-assigned', async (req, res) => {
+app.get([
+  '/api/tasks/all-assigned', 
+  '/api/admin/master-tasks', 
+  '/api/admin/master-task', 
+  '/api/admin/tasks', 
+  '/api/master-tasks', 
+  '/api/master-task'
+], verifyToken, async (req, res) => {
   // Disable caching to prevent browser-side ERR_CACHE_WRITE_FAILURE (common with large task payloads)
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   res.setHeader('Pragma', 'no-cache');
@@ -5619,21 +5626,27 @@ app.get('/api/tasks/all-assigned', async (req, res) => {
         at.owner_id, at.assignee_id, at.status, at.progress, at.deadline,
         u.name as assigner_name,
         u.profile_picture as assigner_picture,
+        COALESCE(u_assignee.name, j_assignee.name, 'Unassigned') as assignee_name,
+        ISNULL(COALESCE(u_assignee.team, CASE WHEN j_assignee.id IS NOT NULL THEN 'New Joinee' ELSE NULL END), 'No Team') as assignee_team,
+        COALESCE(u_assignee.role, j_assignee.role, 'Employee') as assignee_role,
         at.created_at as created_at,
         at.updated_at as updated_at
       FROM master_tasks at WITH (NOLOCK)
       LEFT JOIN users u WITH (NOLOCK) ON at.owner_id = u.id
+      LEFT JOIN users u_assignee WITH (NOLOCK) ON at.assignee_id = u_assignee.id
+      LEFT JOIN new_joinees j_assignee WITH (NOLOCK) ON at.assignee_id = j_assignee.id
       WHERE at.type = 'TASK'
       ORDER BY at.created_at DESC
     `);
     res.json(result.recordset);
   } catch (err) {
-    console.error('âŒ SQL ERROR:', err.message);
+    console.error('❌ SQL ERROR in all-assigned:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// 13.2 Get Specific Master Task Details (Aliased for Task Updates Compatibility)
+
+
 app.get(['/api/master-task/:id', '/api/master-task/review/:id', '/api/assign-task/review/:id', '/api/tasks/review/:id'], async (req, res) => {
   const { id } = req.params;
 
