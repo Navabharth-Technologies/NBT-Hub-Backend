@@ -8,10 +8,11 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const nodemailer = require('nodemailer');
-const { getCertificateEmailHtml, generateCertificateHtml } = require('./templates/certificateEmailTemplate');
+const { getCertificateEmailHtml, generateCertificateImage } = require('./templates/certificateEmailTemplate');
 const { getOtpEmailHtml } = require('./templates/otpEmailTemplate');
 const { getSaturdayReminderHtml, getSaturdayFinalWarningHtml } = require('./templates/saturdayReminderTemplate');
 const { getPromotionReminderHtml } = require('./templates/promotionReminderTemplate');
+const { getEmploymentConfirmationHtml } = require('./templates/employmentConfirmationTemplate');
 
 // --- SMTP CONFIGURATION (Nodemailer) --- //
 const mailTransporter = nodemailer.createTransport({
@@ -52,46 +53,9 @@ const sendAppEmail = async ({ to, subject, html, text, attachments }) => {
  * at the exact blank-box positions. No extra header or footer.
  */
 const sendCertificateEmail = async (toEmail, userName, courseName) => {
-  const { createCanvas, loadImage } = require('canvas');
-  const certPath = path.join(__dirname, 'assets', 'certificate_final.png');
-
-  const currentDate = new Date().toLocaleDateString('en-IN', {
-    day: '2-digit', month: 'long', year: 'numeric'
-  });
-
   let generatedCertBuffer = null;
   try {
-    const image = await loadImage(certPath);
-    const canvas = createCanvas(image.width, image.height);
-    const ctx = canvas.getContext('2d');
-
-    // Draw the certificate background
-    ctx.drawImage(image, 0, 0, image.width, image.height);
-
-    // 1. Employee Name: Capitalized, Stylish Font, Custom Color
-    ctx.font = 'italic bold 115px "Georgia", "Times New Roman", serif';
-    ctx.fillStyle = '#000000ff'; // Royal Navy Blue to match certificate borders
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'alphabetic';
-    ctx.fillText(userName.toUpperCase(), image.width / 2, 725);
-
-    // 2. Course Name: Clean, Professional Serif Font
-    ctx.font = 'bold 50px "Georgia", "Times New Roman", serif';
-    ctx.fillStyle = '#1e3a8a'; // Professional Navy Blue to match the rest of the text
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'alphabetic';
-    // Placed right below "Successfully Completed the"
-    ctx.fillText(`"${courseName}"`, image.width / 2, 882);
-
-    // 3. Date: Tighter alignment to the "DATE:" label
-    ctx.font = 'bold 37px Arial, sans-serif';
-    ctx.fillStyle = '#1e3a8a'; // Match the exact navy blue of the "DATE:" label
-    ctx.textAlign = 'left';
-    ctx.textBaseline = 'alphabetic';
-    // Positioned closer to the "DATE:" label and nudged down for perfect baseline match
-    ctx.fillText(currentDate, 535, 1173);
-
-    generatedCertBuffer = canvas.toBuffer('image/png');
+    generatedCertBuffer = await generateCertificateImage(userName, courseName);
   } catch (err) {
     console.error('Error generating certificate image:', err);
   }
@@ -440,9 +404,33 @@ const normalizeVideoUrl = (url, req = null) => {
   if (val.includes('drive.google.com')) {
     const match = val.match(/\/d\/([^\/]+)/);
     if (match) {
-      // Determine base URL dynamically if req is available, otherwise default to local
-      const baseUrl = req ? `${req.protocol}://${req.get('host')}` : 'http://localhost:5000';
-      return `${baseUrl}/api/drive/stream/${match[1]}`;
+      return `/api/drive/stream/${match[1]}`;
+    }
+  }
+
+  return val;
+};
+
+/**
+ * Normalizes resume URLs for display in the career portal / job applications page.
+ */
+const normalizeResumeUrl = (url, req = null) => {
+  if (!url || typeof url !== 'string') return url;
+  let val = url.trim();
+
+  // If it's a Google Drive link, convert to the local streaming proxy path
+  if (val.includes('drive.google.com')) {
+    const match = val.match(/\/d\/([^\/]+)/);
+    if (match) {
+      return `/api/drive/stream/${match[1]}`;
+    }
+  }
+
+  // If it's an old Render link, rewrite to our local uploads proxy route
+  if (val.includes('company-website-backend-91ia.onrender.com/uploads/')) {
+    const parts = val.split('/uploads/');
+    if (parts.length > 1) {
+      return `/uploads/${parts[1]}`;
     }
   }
 
@@ -472,7 +460,8 @@ const normalizeProfile = (profile) => {
   const photoFields = [
     'profile_picture', 'pancard_photo', 'adharcard_photo', 'experience_letter_photo',
     'voter_id_photo', 'passport_photo', 'previous_company_payslip',
-    'passbook_photo', 'sslc_markscard', 'puc_markscard', 'ug_pg_markscard'
+    'passbook_photo', 'sslc_markscard', 'puc_markscard', 'ug_pg_markscard',
+    'resume'
   ];
 
   photoFields.forEach(field => {
@@ -579,7 +568,7 @@ const mapAssetRow = (row) => {
     designation: row.designation,
     joiningDate: row.joining_date,
     lastWorkingDate: row.last_working_date,
-    
+
     // Normalized snake_case and alternative names for frontend direct rendering
     laptop_details: laptop,
     laptop: laptop,
@@ -610,7 +599,7 @@ const mapAssetRow = (row) => {
     hasCamera: isYes(row.camera),
     hasEarphone: isYes(row.earphone_headphone),
     hasTablet: isYes(row.tablet),
-    
+
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
@@ -648,7 +637,7 @@ const mapAssetStockRow = (row) => {
   return {
     ...row, // Preserve database columns
     id: row.id,
-    
+
     // Normalized snake_case and alternative names for frontend direct rendering
     laptop_details: laptop,
     laptop: laptop,
@@ -689,7 +678,7 @@ const mapAssetStockRow = (row) => {
     returned_by_name: row.returned_by_name || null,
     returned_by_designation: row.returned_by_designation || null,
     returned_date: row.returned_date || null,
-    
+
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
@@ -700,7 +689,7 @@ const mapAssetStockRow = (row) => {
  */
 const emojiMap = {
   heart: '❤️',
-  like: '👍',
+  thumbsup: '👍',
   shocked: '😮',
   laugh: '😂',
   fire: '🔥',
@@ -773,7 +762,7 @@ const resumeProxyHandler = async (req, res, next) => {
       if (fileRes.ok) {
         res.setHeader('Content-Type', fileRes.headers.get('content-type') || 'application/pdf');
         res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
-        
+
         if (fileRes.body && typeof fileRes.body.pipe === 'function') {
           return fileRes.body.pipe(res);
         } else if (fileRes.body) {
@@ -786,9 +775,32 @@ const resumeProxyHandler = async (req, res, next) => {
           return res.end();
         }
       }
-      
-      // Fallback: Redirect if streaming fails
-      return res.redirect(externalUrl);
+
+      // Fallback: Show a friendly HTML explanation instead of redirecting to a broken 404 URL
+      res.status(404).send(`
+        <html>
+          <head>
+            <title>Resume Expired</title>
+            <style>
+              body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background-color: #f8fafc; color: #334155; }
+              .card { max-width: 500px; padding: 40px; background: white; border-radius: 12px; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1); text-align: center; border: 1px solid #e2e8f0; }
+              h1 { color: #e11d48; font-size: 24px; margin-bottom: 16px; font-weight: 600; }
+              p { font-size: 15px; line-height: 1.6; color: #475569; margin-bottom: 20px; }
+              .btn { display: inline-block; padding: 12px 24px; background: #0f172a; color: white; text-decoration: none; border-radius: 6px; font-weight: 500; font-size: 14px; cursor: pointer; transition: background 0.2s; }
+              .btn:hover { background: #1e293b; }
+            </style>
+          </head>
+          <body>
+            <div class="card">
+              <h1>Legacy Resume Expired</h1>
+              <p>This application was submitted on a legacy system that stored resumes temporarily. Because the legacy server has restarted, the temporary PDF file is no longer hosted on the cloud.</p>
+              <p style="font-weight: 500; color: #0284c7;"><strong>Note:</strong> All new resumes submitted starting today are stored permanently in your company Google Drive and will never expire!</p>
+              <button onclick="window.close()" class="btn">Close Window</button>
+            </div>
+          </body>
+        </html>
+      `);
+      return;
     }
   } catch (err) {
     console.error('[RESUME PROXY ERROR] Failed to stream resume:', err.message);
@@ -807,10 +819,10 @@ app.get('/api/uploads/uploads/:filename', resumeProxyHandler);
 // Bypasses "You need access" and iframe connectivity issues by streaming files through the backend.
 // Note: We use /uploads/drive as a prefix because the frontend automatically prepends /uploads/ to relative paths.
 app.get([
-  '/uploads/drive/:fileId', 
-  '/api/uploads/drive/:fileId', 
-  '/uploads/uploads/drive/:fileId', 
-  '/api/uploads/uploads/drive/:fileId', 
+  '/uploads/drive/:fileId',
+  '/api/uploads/drive/:fileId',
+  '/uploads/uploads/drive/:fileId',
+  '/api/uploads/uploads/drive/:fileId',
   '/api/drive/stream/:fileId'
 ], async (req, res) => {
   const { fileId } = req.params;
@@ -1177,7 +1189,15 @@ app.get('/api/job-applications', verifyToken, async (req, res) => {
       LEFT JOIN job_postings jl ON ja.internal_job_id = jl.id
       ORDER BY ja.applied_at DESC
     `);
-    res.json({ success: true, data: result.recordset });
+
+    const formattedData = result.recordset.map(row => {
+      if (row.resume_url) {
+        row.resume_url = normalizeResumeUrl(row.resume_url);
+      }
+      return row;
+    });
+
+    res.json({ success: true, data: formattedData });
   } catch (err) {
     Log.error('Job Applications', 'Failed to fetch applications', err.message);
     res.status(500).json({ error: 'Failed to fetch job applications' });
@@ -1373,22 +1393,10 @@ app.post('/api/login', async (req, res) => {
         userType = 'new_joinee';
         user.role = 'new_joinee';
 
-        // --- NEW JOINEE AUTO-BLOCK LOGIC (10-Day Course Enforcement) ---
-        const jDate = new Date(user.joining_date);
-        const now = new Date();
-        const diffDays = Math.ceil(Math.abs(now - jDate) / (1000 * 60 * 60 * 24));
-        const courseCompleted = (user.course_completion || 0) >= 100;
+        // --- NEW JOINEE AUTO-BLOCK LOGIC (Database Enforced) ---
+        const isUserBlocked = user.is_blocked === true || user.is_blocked === 1 || String(user.is_blocked) === 'true';
 
-        if ((diffDays > 10 && !courseCompleted) || user.is_blocked === 1) {
-          // If not already marked as blocked in DB, mark it now
-          if (user.is_blocked === 0) {
-            await pool.request()
-              .input('id', sql.Int, user.id)
-              .input('reason', sql.NVarChar, 'Course not completed within 10 days of joining.')
-              .query('UPDATE new_joinees SET is_blocked = 1, block_reason = @reason WHERE id = @id');
-            user.is_blocked = 1;
-            user.block_reason = 'Course not completed within 10 days of joining.';
-          }
+        if (isUserBlocked) {
           return res.status(403).json({
             error: 'Account Blocked',
             message: user.block_reason || 'Your account has been blocked. Please contact your Manager or HR to unblock.',
@@ -1494,21 +1502,10 @@ app.post('/api/new-joinee/login', async (req, res) => {
       { expiresIn: '365d' } // Extended session timeout for seamless work experience
     );
 
-    // --- NEW JOINEE AUTO-BLOCK LOGIC (10-Day Course Enforcement) ---
-    const jDate = new Date(joinee.joining_date);
-    const now = new Date();
-    const diffDays = Math.ceil(Math.abs(now - jDate) / (1000 * 60 * 60 * 24));
-    const courseCompleted = (joinee.course_completion || 0) >= 100;
+    // --- NEW JOINEE AUTO-BLOCK LOGIC (Database Enforced) ---
+    const isUserBlocked = joinee.is_blocked === true || joinee.is_blocked === 1 || String(joinee.is_blocked) === 'true';
 
-    if ((diffDays > 10 && !courseCompleted) || joinee.is_blocked === 1) {
-      if (joinee.is_blocked === 0) {
-        await pool.request()
-          .input('id', sql.Int, joinee.id)
-          .input('reason', sql.NVarChar, 'Course not completed within 10 days of joining.')
-          .query('UPDATE new_joinees SET is_blocked = 1, block_reason = @reason WHERE id = @id');
-        joinee.is_blocked = 1;
-        joinee.block_reason = 'Course not completed within 10 days of joining.';
-      }
+    if (isUserBlocked) {
       return res.status(403).json({
         error: 'Account Blocked',
         message: joinee.block_reason || 'Your account has been blocked. Please contact your Manager or HR to unblock.',
@@ -1836,39 +1833,84 @@ app.get('/api/subordinates/:userId', verifyToken, async (req, res) => {
 async function syncSpecificTeamTable(pool, transaction, teamName) {
   if (!teamName) return;
 
-  // Try variations for table names: standard, compact, then underscored
-  const variations = [
-    `team_${teamName.toLowerCase().replace(/\s+/g, '_').replace(/&/g, 'and')}`,
-    `team_${teamName.toLowerCase().replace(/[\s_&]+/g, '')}`,
-    `team_${teamName.toLowerCase().replace(/\s+/g, '_').replace(/&/g, '')}`
-  ];
+  try {
+    const conn = transaction || pool;
+    const req = new sql.Request(conn);
 
-  for (const tableName of variations) {
-    try {
-      const conn = transaction || pool;
-      const checkReq = new sql.Request(conn);
-      const checkResult = await checkReq.query(`SELECT OBJECT_ID(N'${tableName}', N'U') AS id`);
+    // 1. Fetch all database base tables starting with 'team_' to match edited names against original tables
+    const tablesResult = await req.query(`
+      SELECT TABLE_NAME 
+      FROM INFORMATION_SCHEMA.TABLES 
+      WHERE TABLE_TYPE = 'BASE TABLE' 
+        AND TABLE_NAME LIKE 'team_%'
+    `);
 
-      if (checkResult.recordset[0].id) {
-        console.log(`[DEEP SYNC] Refreshing table: ${tableName} for team: ${teamName}`);
-
-        const truncateReq = new sql.Request(conn);
-        await truncateReq.query(`TRUNCATE TABLE ${tableName}`);
-
-        const syncReq = new sql.Request(conn);
-        syncReq.input('team', sql.NVarChar, teamName);
-        await syncReq.query(`
-          INSERT INTO ${tableName} (user_id, emp_name, designation, team_name, reporting_manager)
-          SELECT u.id, u.name, u.role, u.team, m.name
-          FROM users u 
-          LEFT JOIN users m ON u.reporting_manager_id = m.id 
-          WHERE u.team = @team
-        `);
-        return true; // Success
-      }
-    } catch (syncErr) {
-      console.warn(`[DEEP SYNC] Skipping variation ${tableName} due to: ${syncErr.message}`);
+    const dbTables = tablesResult.recordset.map(r => r.TABLE_NAME);
+    if (dbTables.length === 0) {
+      console.warn('[DEEP SYNC] No specialized team tables (team_*) exist in the database.');
+      return false;
     }
+
+    // 2. Clean the target teamName for dynamic/fuzzy substring matching (e.g. "Testing Team" -> "testingteam")
+    const targetClean = teamName.toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (!targetClean) return false;
+
+    let matchedTableName = null;
+
+    // 3. Strategy A: Try direct matches with variations (casing, spaces, ampersands, clean)
+    const variations = [
+      `team_${teamName.toLowerCase().replace(/\s+/g, '_').replace(/&/g, 'and')}`,
+      `team_${teamName.toLowerCase().replace(/[\s_&]+/g, '')}`,
+      `team_${teamName.toLowerCase().replace(/\s+/g, '_').replace(/&/g, '')}`,
+      `team_${targetClean}`
+    ];
+
+    for (const v of variations) {
+      const match = dbTables.find(t => t.toLowerCase() === v.toLowerCase());
+      if (match) {
+        matchedTableName = match;
+        break;
+      }
+    }
+
+    // 4. Strategy B: Fuzzy Substring Matching if no direct match was found (covers original table mapped to edited team name)
+    if (!matchedTableName) {
+      const candidates = dbTables.map(t => {
+        const cleanTable = t.replace(/^team_/i, '').toLowerCase().replace(/[^a-z0-9]/g, '');
+        return { original: t, clean: cleanTable };
+      }).filter(c => c.clean.length > 0);
+
+      // Cleaned table name is a substring of clean team name (e.g., table "testing" matches edited team "Testing Team")
+      // OR Cleaned team name is a substring of clean table name (e.g., team "MLM" matches table "team_mlm_agents")
+      const bestCandidate = candidates.find(c => targetClean.includes(c.clean) || c.clean.includes(targetClean));
+      if (bestCandidate) {
+        matchedTableName = bestCandidate.original;
+      }
+    }
+
+    // 5. If we matched a table, truncate and synchronize it with the latest user alignment data
+    if (matchedTableName) {
+      console.log(`[DEEP SYNC] Found matched table: [${matchedTableName}] for team: "${teamName}"`);
+
+      const truncateReq = new sql.Request(conn);
+      await truncateReq.query(`TRUNCATE TABLE [${matchedTableName}]`);
+
+      const syncReq = new sql.Request(conn);
+      syncReq.input('team', sql.NVarChar, teamName);
+      await syncReq.query(`
+        INSERT INTO [${matchedTableName}] (user_id, emp_name, designation, team_name, reporting_manager)
+        SELECT u.id, u.name, u.role, u.team,
+          CASE WHEN m.role LIKE '%CEO%' OR m.role LIKE '%Founder%' THEN 'Founder' ELSE m.name END
+        FROM users u 
+        LEFT JOIN users m ON u.reporting_manager_id = m.id 
+        WHERE u.team = @team
+      `);
+      return true; // Success
+    } else {
+      console.warn(`[DEEP SYNC] No database table matched for team: "${teamName}"`);
+    }
+  } catch (syncErr) {
+    console.error(`[DEEP SYNC] Error synchronizing team "${teamName}":`, syncErr.message);
   }
   return false;
 }
@@ -2098,7 +2140,7 @@ const handleProfileGet = async (req, res) => {
         SELECT u.id as user_id, u.name, u.email, u.role, u.id AS employee_id, 
                u.phone_number, u.profile_picture, u.about_me, 
                u.date_of_birth, u.team, u.reporting_manager_id, u.joining_date,
-               m.name AS reporting_manager_name,
+               CASE WHEN m.role LIKE '%CEO%' OR m.role LIKE '%Founder%' THEN 'Founder' ELSE m.name END AS reporting_manager_name,
                (SELECT ISNULL(SUM(points), 0) FROM employee_rewards WHERE employee_id = u.id) as total_reward_points,
                (SELECT ISNULL(SUM(total_points), 0) FROM quiz_completions WHERE employee_id = u.id) as total_quiz_points,
                a.*,
@@ -2127,9 +2169,9 @@ const handleProfileGet = async (req, res) => {
         }
 
         const intern = internResult.recordset[0];
-        return res.json({ 
-          ...intern, 
-          employee_id: intern.id, 
+        return res.json({
+          ...intern,
+          employee_id: intern.id,
           userType: 'intern',
           rewardPoints: '0',
           quizPoints: '0',
@@ -2244,6 +2286,29 @@ app.put('/api/profile/update', verifyToken, memoryUpload.single('profilePicture'
     if (!pool || typeof pool.request !== 'function') {
       return res.status(503).json({ error: 'Database is currently offline' });
     }
+
+    // Validate manager and auto-align team if manager is updated
+    let resolvedTeam = team;
+    if (reportingManagerId !== undefined) {
+      if (reportingManagerId) {
+        const mgrResult = await pool.request()
+          .input('mgrId', sql.Int, reportingManagerId)
+          .query('SELECT name, team FROM users WHERE id = @mgrId');
+        if (mgrResult.recordset.length === 0) {
+          return res.status(400).json({ error: `Invalid Manager: No user found with ID ${reportingManagerId}` });
+        }
+
+        // If team is not explicitly provided, auto-adopt the manager's team
+        if (resolvedTeam === undefined) {
+          const mgrTeam = mgrResult.recordset[0].team;
+          if (mgrTeam) {
+            resolvedTeam = mgrTeam;
+            console.log(`[PROFILE UPDATE] Auto-aligning user's team to manager's team: "${resolvedTeam}"`);
+          }
+        }
+      }
+    }
+
     let updateQuery = 'UPDATE users SET ';
     const fieldsToUpdate = [];
 
@@ -2253,7 +2318,7 @@ app.put('/api/profile/update', verifyToken, memoryUpload.single('profilePicture'
     if (profilePicture !== undefined) fieldsToUpdate.push('profile_picture = @profile_picture');
     if (aboutMe !== undefined) fieldsToUpdate.push('about_me = @about_me');
     if (dateOfBirth !== undefined) fieldsToUpdate.push('date_of_birth = @date_of_birth');
-    if (team !== undefined) fieldsToUpdate.push('team = @team');
+    if (resolvedTeam !== undefined) fieldsToUpdate.push('team = @team');
     if (reportingManagerId !== undefined) fieldsToUpdate.push('reporting_manager_id = @reporting_manager_id');
 
     if (fieldsToUpdate.length === 0) {
@@ -2279,19 +2344,19 @@ app.put('/api/profile/update', verifyToken, memoryUpload.single('profilePicture'
     if (aboutMe !== undefined) request.input('about_me', sql.NVarChar(sql.MAX), aboutMe);
 
     if (dateOfBirth !== undefined) request.input('date_of_birth', sql.NVarChar, dateOfBirth);
-    if (team !== undefined) request.input('team', sql.NVarChar, team);
+    if (resolvedTeam !== undefined) request.input('team', sql.NVarChar, resolvedTeam);
     if (reportingManagerId !== undefined) request.input('reporting_manager_id', sql.Int, reportingManagerId);
 
     // --- CASCADING TEAM UPDATE LOGIC --- //
-    if (team !== undefined) {
-      console.log(`[CASCADE] Initiating team migration for ${email} to "${team}"`);
+    if (resolvedTeam !== undefined) {
+      console.log(`[CASCADE] Initiating team migration for ${email} to "${resolvedTeam}"`);
       const transaction = new sql.Transaction(pool);
       await transaction.begin();
 
       try {
         const tRequest = new sql.Request(transaction);
         tRequest.input('email', sql.NVarChar, email);
-        tRequest.input('newTeam', sql.NVarChar, team);
+        tRequest.input('newTeam', sql.NVarChar, resolvedTeam);
 
         // 1. Fetch current user state (Primary ID and Old Team)
         const userState = await tRequest.query('SELECT id, team FROM users WHERE email = @email');
@@ -2300,8 +2365,8 @@ app.put('/api/profile/update', verifyToken, memoryUpload.single('profilePicture'
           const oldTeam = userState.recordset[0].team;
           tRequest.input('userId', sql.Int, userId);
 
-          if (oldTeam !== team) {
-            console.log(`[CASCADE] User ${userId} moving: ${oldTeam} -> ${team}`);
+          if (oldTeam !== resolvedTeam) {
+            console.log(`[CASCADE] User ${userId} moving: ${oldTeam} -> ${resolvedTeam}`);
 
             // A. Update Users (Main Record)
             await tRequest.query(updateQuery);
@@ -2318,7 +2383,7 @@ app.put('/api/profile/update', verifyToken, memoryUpload.single('profilePicture'
 
             // D. Cross-Table Migration (Bucket Tables)
             const oldTable = getTeamTableName(oldTeam);
-            const newTable = getTeamTableName(team);
+            const newTable = getTeamTableName(resolvedTeam);
 
             if (oldTable) {
               await tRequest.query(`DELETE FROM ${oldTable} WHERE user_id = @userId`);
@@ -2334,7 +2399,7 @@ app.put('/api/profile/update', verifyToken, memoryUpload.single('profilePicture'
                 insRequest.input('name', sql.NVarChar, meta.emp_name);
                 insRequest.input('desig', sql.NVarChar, meta.designation);
                 insRequest.input('eid', sql.Int, meta.emp_id);
-                insRequest.input('tname', sql.NVarChar, team);
+                insRequest.input('tname', sql.NVarChar, resolvedTeam);
 
                 // Use a dynamic query for the table name, safely constructed via helper
                 await insRequest.query(`
@@ -2876,7 +2941,14 @@ app.post(['/api/profile/upload-doc', '/api/profile/upload-document', '/api/uploa
     'degree_marks_card': 'ug_pg_markscard',
     'degree_photo': 'ug_pg_markscard',
     'degree_proof': 'ug_pg_markscard',
-    'degree_copy': 'ug_pg_markscard'
+    'degree_copy': 'ug_pg_markscard',
+
+    // 11. Resume
+    'resume': 'resume',
+    'resume_url': 'resume',
+    'resume_photo': 'resume',
+    'resume_proof': 'resume',
+    'resume_copy': 'resume'
   };
 
   const dbColumn = columnMap[docType.toLowerCase().trim()] || docType.replace(/\s+/g, '_');
@@ -3656,6 +3728,28 @@ app.get(['/api/attendance_logs', '/api/attendance logs', '/api/attendance%20logs
       };
     }).filter(x => x !== null);
 
+    // Dynamic present and absent aggregation
+    let presentCount = 0;
+    let absentCount = 0;
+    let halfDayCount = 0;
+    let weekOffCount = 0;
+    let otherCount = 0;
+
+    mappedData.forEach(item => {
+      const statusClean = String(item.status || 'A').trim().toUpperCase();
+      if (statusClean === 'P' || statusClean === 'PRESENT') {
+        presentCount++;
+      } else if (statusClean === 'A' || statusClean === 'ABSENT') {
+        absentCount++;
+      } else if (statusClean === 'HD' || statusClean === 'HALF DAY' || statusClean === 'HALFDAY') {
+        halfDayCount++;
+      } else if (statusClean === 'WO' || statusClean === 'WEEKOFF' || statusClean === 'WEEK OFF') {
+        weekOffCount++;
+      } else {
+        otherCount++;
+      }
+    });
+
     // Wrap dynamically for UI success mapping
     res.json({
       success: true,
@@ -3663,6 +3757,14 @@ app.get(['/api/attendance_logs', '/api/attendance logs', '/api/attendance%20logs
       totalRecords: parseInt(totalRecords),
       page: 1,
       limit: mappedData.length,
+      summary: {
+        present: presentCount,
+        absent: absentCount,
+        halfDay: halfDayCount,
+        weekOff: weekOffCount,
+        others: otherCount,
+        totalChecked: mappedData.length
+      },
       data: mappedData
     });
   } catch (err) {
@@ -3712,6 +3814,117 @@ app.get('/api/admin/etime-logs', verifyToken, async (req, res) => {
   }
 });
 
+// GET: /api/admin/attendance/summary (Admin dashboard overview of Present vs Absent)
+app.get('/api/admin/attendance/summary', verifyToken, async (req, res) => {
+  const role = (req.user.role || '').toLowerCase();
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
+  if (!isAdmin) return res.status(403).json({ error: 'Unauthorized: Admin access required.' });
+
+  const { date } = req.query;
+
+  // Calculate target date (default to today in IST)
+  let targetDateStr = date;
+  if (!targetDateStr) {
+    const istOffset = 330; // UTC+5:30 in minutes
+    const now = new Date();
+    const istDate = new Date(now.getTime() + (istOffset * 60 * 1000));
+    targetDateStr = istDate.toISOString().split('T')[0];
+  }
+
+  try {
+    const pool = await getPool();
+
+    // 1. Fetch all active employees (excluding Dinesh/CEO 20250)
+    const request = pool.request();
+    request.input('targetDate', sql.Date, targetDateStr);
+
+    const usersRes = await request.query(`
+      SELECT id, name, team, designation, joining_date 
+      FROM users WITH (NOLOCK) 
+      WHERE id <> 20250 AND (joining_date IS NULL OR joining_date <= @targetDate)
+    `);
+
+    const activeUsers = usersRes.recordset;
+
+    // 2. Fetch all attendance logs for the target date
+    const logsRes = await pool.request()
+      .input('targetDate', sql.Date, targetDateStr)
+      .query(`
+        SELECT user_id, status, in_time, out_time, work_time, remark
+        FROM attendance_logs WITH (NOLOCK)
+        WHERE punch_date = @targetDate AND user_id <> 20250
+      `);
+
+    const logs = logsRes.recordset;
+    const logsMap = new Map();
+    logs.forEach(log => {
+      logsMap.set(log.user_id, log);
+    });
+
+    // 3. Reconcile active employees against logs
+    const presentList = [];
+    const absentList = [];
+    const halfDayList = [];
+    const weekOffList = [];
+
+    activeUsers.forEach(u => {
+      // Exclude if log is before joining date
+      if (u.joining_date && new Date(targetDateStr) < new Date(u.joining_date)) {
+        return; // Not joined yet
+      }
+
+      const log = logsMap.get(u.id);
+
+      const employeeInfo = {
+        id: u.id,
+        name: u.name,
+        team: u.team || 'N/A',
+        designation: u.designation || 'N/A',
+        in_time: log ? log.in_time : null,
+        out_time: log ? log.out_time : null,
+        work_time: log ? log.work_time : null,
+        remark: log ? log.remark : null
+      };
+
+      if (!log) {
+        // No attendance record means Absent
+        absentList.push(employeeInfo);
+      } else {
+        const statusClean = String(log.status || 'A').trim().toUpperCase();
+        if (statusClean === 'P' || statusClean === 'PRESENT') {
+          presentList.push(employeeInfo);
+        } else if (statusClean === 'HD' || statusClean === 'HALF DAY' || statusClean === 'HALFDAY') {
+          halfDayList.push(employeeInfo);
+        } else if (statusClean === 'WO' || statusClean === 'WEEKOFF' || statusClean === 'WEEK OFF') {
+          weekOffList.push(employeeInfo);
+        } else {
+          absentList.push(employeeInfo); // Default fallback
+        }
+      }
+    });
+
+    res.json({
+      success: true,
+      date: targetDateStr,
+      summary: {
+        totalActiveEmployees: activeUsers.length,
+        present: presentList.length,
+        absent: absentList.length,
+        halfDay: halfDayList.length,
+        weekOff: weekOffList.length
+      },
+      lists: {
+        present: presentList,
+        absent: absentList,
+        halfDay: halfDayList,
+        weekOff: weekOffList
+      }
+    });
+  } catch (err) {
+    console.error('[ADMIN ATTENDANCE SUMMARY ERROR]:', err);
+    res.status(500).json({ error: 'Failed to calculate attendance summary', details: err.message });
+  }
+});
 
 // 1c. Allow manual web-app punches to fallback directly into the local DB
 app.post('/api/attendance_logs/punch', verifyToken, async (req, res) => {
@@ -3747,30 +3960,48 @@ app.post('/api/attendance_logs/punch', verifyToken, async (req, res) => {
       .input('punchDate', require('mssql').Date, punchDateString)
       .query(`SELECT * FROM attendance_logs WHERE user_id = @userId AND punch_date = @punchDate`);
 
-    if (checkRes.recordset.length === 0) {
-      // NO RECORD FOUND: THIS IS A PUNCH IN
+    const existing = checkRes.recordset.length > 0 ? checkRes.recordset[0] : null;
+
+    if (!existing || !existing.in_time) {
+      // NO RECORD FOUND OR NO IN_TIME FOUND: THIS IS A PUNCH IN
       let determinedStatus = status;
       if (currentTimeString > '10:15') {
         determinedStatus = 'Half Day';
         console.log(`[PUNCH IN] User ${userId} checked in late at ${currentTimeString}. Status marked as Half Day.`);
       }
 
-      await pool.request()
-        .input('userId', require('mssql').Int, userId)
-        .input('punchDate', require('mssql').Date, punchDateString)
-        .input('inTime', require('mssql').NVarChar, currentTimeString)
-        .input('status', require('mssql').NVarChar, determinedStatus)
-        .input('remark', require('mssql').NVarChar, remark)
-        .input('location', require('mssql').NVarChar, location)
-        .query(`
-          INSERT INTO attendance_logs (user_id, punch_date, in_time, status, remark, last_sync, punchin_location)
-          VALUES (@userId, @punchDate, @inTime, @status, @remark, GETDATE(), @location)
-        `);
+      if (!existing) {
+        // Insert new record
+        await pool.request()
+          .input('userId', require('mssql').Int, userId)
+          .input('punchDate', require('mssql').Date, punchDateString)
+          .input('inTime', require('mssql').NVarChar, currentTimeString)
+          .input('status', require('mssql').NVarChar, determinedStatus)
+          .input('remark', require('mssql').NVarChar, remark)
+          .input('location', require('mssql').NVarChar, location)
+          .query(`
+            INSERT INTO attendance_logs (user_id, punch_date, in_time, status, remark, last_sync, punchin_location)
+            VALUES (@userId, @punchDate, @inTime, @status, @remark, GETDATE(), @location)
+          `);
+      } else {
+        // Update existing record with in_time
+        await pool.request()
+          .input('userId', require('mssql').Int, userId)
+          .input('punchDate', require('mssql').Date, punchDateString)
+          .input('inTime', require('mssql').NVarChar, currentTimeString)
+          .input('status', require('mssql').NVarChar, determinedStatus)
+          .input('remark', require('mssql').NVarChar, remark)
+          .input('location', require('mssql').NVarChar, location)
+          .query(`
+            UPDATE attendance_logs 
+            SET in_time = @inTime, status = @status, remark = @remark, last_sync = GETDATE(), punchin_location = @location
+            WHERE user_id = @userId AND punch_date = @punchDate
+          `);
+      }
 
       return res.json({ success: true, action: 'PUNCH_IN', time: currentTimeString, status: determinedStatus, message: 'Punched In successfully via Web Application.' });
     } else {
-      // RECORD FOUND: THIS IS A PUNCH OUT (or an overwrite punch out)
-      const existing = checkRes.recordset[0];
+      // RECORD FOUND AND HAS IN_TIME: THIS IS A PUNCH OUT (or an overwrite punch out)
       const inTimeStr = existing.in_time;
       let workTimeStr = existing.work_time || '00:00';
 
@@ -4819,7 +5050,7 @@ app.get('/api/teams', async (req, res) => {
     for (const user of allUsersResult.recordset) {
       const t = (user.team || '').trim();
       if (!t) continue;
-      const key = t.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+      const key = t.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim().replace(/\s+/g, '_');
       if (!teamMap[key]) {
         teamMap[key] = {
           rawName: t,
@@ -4851,12 +5082,12 @@ app.get('/api/teams', async (req, res) => {
 
     const leadMap = {};
     for (const lead of leadResult.recordset) {
-      const key = (lead.team || '').trim().toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+      const key = (lead.team || '').trim().toLowerCase().replace(/[^a-z0-9\s]/g, '').trim().replace(/\s+/g, '_');
       leadMap[key] = { name: lead.name, role: lead.role };
     }
 
     // 4. Map each unique team key (from both dynamic tables and active users) to a team object
-    const tableKeys = new Set(tablesResult.recordset.map(row => 
+    const tableKeys = new Set(tablesResult.recordset.map(row =>
       row.TABLE_NAME.toLowerCase().replace(/^team_/, '')
     ));
     const userKeys = Object.keys(teamMap);
@@ -4922,14 +5153,10 @@ app.put('/api/admin/teams/rename', verifyToken, async (req, res) => {
   try {
     const pool = await getPool();
 
-    const sanitizedOld = oldName.toLowerCase().trim()
-      .replace(/\s+/g, '_')
-      .replace(/[^a-z0-9_]/g, '');
+    const sanitizedOld = oldName.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim().replace(/\s+/g, '_');
     const oldTableName = sanitizedOld.startsWith('team_') ? sanitizedOld : `team_${sanitizedOld}`;
 
-    const sanitizedNew = newName.toLowerCase().trim()
-      .replace(/\s+/g, '_')
-      .replace(/[^a-z0-9_]/g, '');
+    const sanitizedNew = newName.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim().replace(/\s+/g, '_');
     const newTableName = sanitizedNew.startsWith('team_') ? sanitizedNew : `team_${sanitizedNew}`;
 
     const transaction = new sql.Transaction(pool);
@@ -5044,9 +5271,7 @@ const deleteTeamHandler = async (req, res) => {
   }
 
   // 3. Generate sanitized names for dynamic table dropping and comparison
-  const sanitizedInput = teamName.toLowerCase().trim()
-    .replace(/\s+/g, '_')
-    .replace(/[^a-z0-9_]/g, '');
+  const sanitizedInput = teamName.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim().replace(/\s+/g, '_');
 
   try {
     const pool = await getPool();
@@ -5293,7 +5518,7 @@ app.get('/api/tasks/all-assigned', async (req, res) => {
 });
 
 // 13.2 Get Specific Master Task Details (Aliased for Task Updates Compatibility)
-app.get('/api/master-task/:id', async (req, res) => {
+app.get(['/api/master-task/:id', '/api/master-task/review/:id', '/api/assign-task/review/:id', '/api/tasks/review/:id'], async (req, res) => {
   const { id } = req.params;
 
   try {
@@ -5404,12 +5629,13 @@ app.get('/api/tasks/assigned/:userId', verifyToken, async (req, res) => {
 });
 
 // 14.2 Submit Task Review (Manager Feedback)
-app.put(['/api/assign-task/review/:id', '/api/assigned-task/review/:id'], async (req, res) => {
+app.put(['/api/assign-task/review/:id', '/api/assigned-task/review/:id', '/api/master-task/review/:id', '/api/tasks/review/:id'], async (req, res) => {
   const { id } = req.params;
-  const { task_review, taskReview, review } = req.body;
+  const { task_review, taskReview, review, verify, status } = req.body;
   const finalReview = task_review || taskReview || review;
+  const finalVerify = verify || status;
 
-  console.log(`[TASK REVIEW] Request for ID: ${id} | Data: "${finalReview}"`);
+  console.log(`[TASK REVIEW] Request for ID: ${id} | Review: "${finalReview}" | Status: "${finalVerify}"`);
 
   try {
     const pool = await getPool();
@@ -5423,6 +5649,10 @@ app.put(['/api/assign-task/review/:id', '/api/assigned-task/review/:id'], async 
     if (finalReview !== undefined) {
       query += ', task_review = @taskReview';
       request.input('taskReview', sql.NVarChar(sql.MAX), finalReview);
+    }
+    if (finalVerify !== undefined) {
+      query += ', verify = @verify';
+      request.input('verify', sql.NVarChar, finalVerify);
     }
 
     query += ' WHERE id = @id';
@@ -5843,7 +6073,7 @@ const handleReaction = async (req, res) => {
   // Map literal emojis OR common names to standardized database strings
   const reactionMap = {
     '❤️': 'heart', 'heart': 'heart', 'love': 'heart',
-    '👍': 'like', 'thumbsup': 'like', 'thumb': 'like', 'like': 'like',
+    '👍': 'thumbsup', 'thumbsup': 'thumbsup', 'thumb': 'thumbsup',
     '😮': 'shocked', 'shocked': 'shocked', 'wow': 'shocked',
     '😂': 'laugh', 'laugh': 'laugh', 'haha': 'laugh',
     '🔥': 'fire', 'fire': 'fire', 'lit': 'fire',
@@ -5857,6 +6087,7 @@ const handleReaction = async (req, res) => {
   const columnMap = {
     heart: 'heart_count',
     like: 'likes_count',
+    thumbsup: 'thumbsup_count',
     shocked: 'shocked_count',
     laugh: 'laugh_count',
     fire: 'fire_count',
@@ -6091,10 +6322,10 @@ app.put('/api/threads/:threadId/comments/:commentId', async (req, res) => {
   const { threadId, commentId } = req.params;
   const body = req.body || {};
   const query = req.query || {};
-  
+
   // Extract comment text from all possible frontend field naming conventions
   const commentText = body.comment || body.text || body.content || body.commentText || body.comment_text || body.newComment || body.commentBody || query.comment || query.text;
-  
+
   // Extract user ID from body, query, or JWT fallback
   let userId = body.userId || body.user_id || body.employeeId || body.employee_id || query.userId || query.user_id || query.employeeId || query.employee_id;
 
@@ -6121,7 +6352,7 @@ app.put('/api/threads/:threadId/comments/:commentId', async (req, res) => {
       .query('SELECT user_id FROM thread_comments WHERE id = @id');
 
     if (checkResult.recordset.length === 0) return res.status(404).json({ error: 'Comment not found' });
-    
+
     const dbUserId = checkResult.recordset[0].user_id;
     if (dbUserId === null || dbUserId === undefined || String(dbUserId).trim() !== String(userId).trim()) {
       return res.status(403).json({ error: 'Unauthorized: Can only modify your own comments' });
@@ -6132,8 +6363,8 @@ app.put('/api/threads/:threadId/comments/:commentId', async (req, res) => {
       .input('comment', sql.NVarChar(sql.MAX), commentText)
       .query('UPDATE thread_comments SET comment = @comment WHERE id = @id');
 
-    res.json({ 
-      success: true, 
+    res.json({
+      success: true,
       message: 'Comment updated successfully',
       comment: commentText,
       text: commentText,
@@ -6152,7 +6383,7 @@ app.delete('/api/threads/:threadId/comments/:commentId', async (req, res) => {
   const { threadId, commentId } = req.params;
   const body = req.body || {};
   const query = req.query || {};
-  
+
   let userId = body.userId || body.user_id || query.userId || query.user_id;
 
   if (!userId) {
@@ -6348,7 +6579,7 @@ app.get('/api/threads/:id/reactors', async (req, res) => {
   // Reaction normalization map (consistent with handleReaction)
   const reactionMap = {
     'â¤ï¸': 'heart', 'heart': 'heart', 'love': 'heart',
-    'ðŸ‘': 'like', 'thumbsup': 'like', 'thumb': 'like', 'like': 'like',
+    'ðŸ‘': 'thumbsup', 'thumbsup': 'thumbsup', 'thumb': 'thumbsup', 'like': 'like',
     'ðŸ˜®': 'shocked', 'shocked': 'shocked', 'wow': 'shocked',
     'ðŸ˜‚': 'laugh', 'laugh': 'laugh', 'haha': 'laugh',
     'ðŸ”¥': 'fire', 'fire': 'fire', 'lit': 'fire',
@@ -6643,44 +6874,39 @@ app.put('/api/new-joinees/:id', verifyToken, async (req, res) => {
   }
 
   // Handle various frontend key formats
-  const finalName = req.body.name || req.body.Name;
-  const finalRole = req.body.role || req.body.Role || req.body.joineeRole;
-  const finalEmail = req.body.email_id || req.body.emailId || req.body.email || req.body.Email;
-  const finalJoiningDate = req.body.joining_date || req.body.joiningDate || req.body.JoiningDate;
-  const finalCourseCompletion = req.body.course_completion !== undefined ? req.body.course_completion : req.body.courseCompletion;
-  const finalHiredBy = req.body.hired_by || req.body.hiredBy || req.body.HiredBy;
-  const finalDuration = req.body.duration || req.body.Duration;
-  const finalPhoneNumber = req.body.phone_number || req.body.phone || req.body.phoneNumber || req.body.Phone;
+  const name = req.body.name || req.body.Name;
+  const joineeRole = req.body.role || req.body.Role || req.body.joineeRole;
+  const emailId = req.body.email_id || req.body.emailId || req.body.email || req.body.Email;
+  const joiningDate = req.body.joining_date || req.body.joiningDate || req.body.JoiningDate;
+  const courseCompletion = req.body.course_completion !== undefined ? req.body.course_completion : req.body.courseCompletion;
+  const hiredBy = req.body.hired_by || req.body.hiredBy || req.body.HiredBy;
+  const duration = req.body.duration || req.body.Duration;
+  const phoneNumber = req.body.phone_number || req.body.phone || req.body.phoneNumber || req.body.Phone;
   const { is_blocked, block_reason } = req.body;
 
   try {
     const pool = await getPool();
-    await pool.request()
-      .input('id', sql.Int, id)
-      .input('name', sql.NVarChar, finalName)
-      .input('role', sql.NVarChar, finalRole)
-      .input('emailId', sql.NVarChar, finalEmail)
-      .input('joiningDate', sql.Date, finalJoiningDate)
-      .input('courseCompletion', sql.Int, finalCourseCompletion)
-      .input('hiredBy', sql.NVarChar, finalHiredBy)
-      .input('isBlocked', sql.Bit, is_blocked !== undefined ? is_blocked : 0)
-      .input('blockReason', sql.NVarChar, block_reason || null)
-      .input('duration', sql.NVarChar, finalDuration || null)
-      .input('phoneNumber', sql.NVarChar, finalPhoneNumber)
-      .query(`
-        UPDATE new_joinees 
-        SET name = @name, 
-            role = @role, 
-            email_id = @emailId, 
-            joining_date = @joiningDate, 
-            course_completion = @courseCompletion, 
-            hired_by = @hiredBy,
-            is_blocked = @isBlocked,
-            block_reason = @blockReason,
-            duration = @duration,
-            phone_number = @phoneNumber
-        WHERE id = @id
-      `);
+    const request = pool.request().input('id', sql.Int, id);
+    const updates = [];
+
+    if (name !== undefined) { updates.push('name = @name'); request.input('name', sql.NVarChar, name); }
+    if (joineeRole !== undefined) { updates.push('role = @role'); request.input('role', sql.NVarChar, joineeRole); }
+    if (emailId !== undefined) { updates.push('email_id = @emailId'); request.input('emailId', sql.NVarChar, emailId); }
+    if (joiningDate !== undefined) { updates.push('joining_date = @joiningDate'); request.input('joiningDate', sql.Date, joiningDate); }
+    if (courseCompletion !== undefined) { updates.push('course_completion = @courseCompletion'); request.input('courseCompletion', sql.Int, courseCompletion); }
+    if (hiredBy !== undefined) { updates.push('hired_by = @hiredBy'); request.input('hiredBy', sql.NVarChar, hiredBy); }
+    if (is_blocked !== undefined) { updates.push('is_blocked = @isBlocked'); request.input('isBlocked', sql.Bit, is_blocked); }
+    if (block_reason !== undefined) { updates.push('block_reason = @blockReason'); request.input('blockReason', sql.NVarChar, block_reason); }
+    if (duration !== undefined) { updates.push('duration = @duration'); request.input('duration', sql.NVarChar, duration); }
+    if (phoneNumber !== undefined) { updates.push('phone_number = @phoneNumber'); request.input('phoneNumber', sql.NVarChar, phoneNumber); }
+
+    if (updates.length === 0) {
+      return res.json({ success: true, message: 'No changes provided' });
+    }
+
+    const query = `UPDATE new_joinees SET ${updates.join(', ')} WHERE id = @id`;
+    await request.query(query);
+
     res.json({ success: true, message: 'New joinee details updated successfully' });
   } catch (err) {
     console.error('New joinee update error:', err);
@@ -7025,6 +7251,98 @@ app.get('/api/admin/new-joinees/audit-now', verifyToken, async (req, res) => {
     res.status(500).json({ error: 'Manual audit failed.' });
   }
 });
+/**
+ * Admin: Manual Onboarding Promotion Audit Trigger
+ * Manually forces the check for eligible promotions, sends individual welcome emails,
+ * and sends the HR summary report immediately.
+ */
+app.get('/api/admin/onboarding/audit-now', verifyToken, async (req, res) => {
+  const role = (req.user.role || '').toLowerCase();
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo');
+  if (!isAdmin) return res.status(403).json({ error: 'Unauthorized: Admin access required.' });
+
+  try {
+    const pool = await getPool();
+
+    // 1. Fetch eligible candidates (only those who haven't been sent the welcome email yet!)
+    const joinees = await pool.request().query(`
+      SELECT id, name, email_id as email, joining_date, duration, 'New Joinee' as type
+      FROM new_joinees WITH (NOLOCK)
+      WHERE DATEDIFF(DAY, joining_date, GETDATE()) >= 10 AND (welcome_sent IS NULL OR welcome_sent = 0)
+    `);
+
+    const interns = await pool.request().query(`
+      SELECT id, name, email, joining_date, duration_months as duration, 'Intern' as type
+      FROM interns WITH (NOLOCK)
+      WHERE DATEDIFF(MONTH, joining_date, GETDATE()) >= duration_months AND (welcome_sent IS NULL OR welcome_sent = 0)
+    `);
+
+    const candidates = [...joinees.recordset, ...interns.recordset];
+
+    if (candidates.length === 0) {
+      return res.json({
+        success: true,
+        message: 'Manual audit completed. No new eligible promotions or pending welcome emails found today.'
+      });
+    }
+
+    // 2. Send welcome emails in parallel to the individuals
+    const { getWelcomeOnboardingHtml } = require('./templates/welcomeEmailTemplate');
+    const sentTo = [];
+    for (const candidate of candidates) {
+      if (candidate.email) {
+        try {
+          await sendAppEmail({
+            to: candidate.email,
+            subject: `🌟 Onboarding Complete - Congratulations, ${candidate.name}!`,
+            html: getWelcomeOnboardingHtml(candidate.name, candidate.type),
+            text: `Congratulations ${candidate.name}! You have successfully completed your ${candidate.type === 'Intern' ? 'Internship' : 'Onboarding'} duration. Welcome to the next chapter at Navabharath Technologies!`
+          });
+
+          // Mark as welcome_sent in DB
+          const table = candidate.type === 'Intern' ? 'interns' : 'new_joinees';
+          await pool.request()
+            .input('id', sql.Int, candidate.id)
+            .query(`UPDATE ${table} SET welcome_sent = 1 WHERE id = @id`);
+
+          sentTo.push({ name: candidate.name, email: candidate.email, type: candidate.type });
+          Log.success('SMTP', `Sent manual duration completion welcome email to ${candidate.name} (${candidate.email})`);
+        } catch (mailErr) {
+          console.error(`[SMTP ERROR] Failed to send welcome email to ${candidate.name}:`, mailErr.message);
+        }
+      }
+    }
+
+    // 3. Fetch HR and Admin emails
+    const admins = await pool.request().query(`
+      SELECT email FROM users WITH (NOLOCK) 
+      WHERE LOWER(role) LIKE '%hr%' OR LOWER(role) LIKE '%admin%' OR LOWER(role) LIKE '%ceo%'
+    `);
+
+    const adminEmails = admins.recordset.map(r => r.email).filter(Boolean);
+
+    if (adminEmails.length > 0) {
+      await sendAppEmail({
+        to: adminEmails.join(','),
+        subject: `📋 Manual Onboarding Alert: ${candidates.length} Promotions Pending`,
+        html: getPromotionReminderHtml(candidates),
+        text: `Daily Alert: There are ${candidates.length} team members eligible for promotion to full-time status.`
+      });
+      Log.success('SMTP', `Sent daily promotion reminder for ${candidates.length} candidates to ${adminEmails.length} admins.`);
+    }
+
+    res.json({
+      success: true,
+      message: 'Onboarding promotion audit triggered and notifications sent successfully.',
+      scanned_promotions_count: candidates.length,
+      emails_sent_to: sentTo
+    });
+
+  } catch (err) {
+    console.error('[MANUAL ONBOARDING AUDIT ERROR]:', err);
+    res.status(500).json({ error: 'Manual onboarding promotion audit failed.', details: err.message });
+  }
+});
 
 /**
  * 25.4 Bulk Unblock: Restore access for all compliance-blocked joinees
@@ -7162,7 +7480,8 @@ app.get('/api/interns', async (req, res) => {
   try {
     const pool = await getPool();
     const result = await pool.request().query(`
-      SELECT i.*, u.name as manager_name 
+      SELECT i.*, 
+             CASE WHEN u.role LIKE '%CEO%' OR u.role LIKE '%Founder%' THEN 'Founder' ELSE u.name END as manager_name 
       FROM interns i
       LEFT JOIN users u ON i.reporting_manager_id = u.id
       ORDER BY i.created_at DESC
@@ -7181,7 +7500,8 @@ app.get('/api/interns/:id', async (req, res) => {
     const result = await pool.request()
       .input('id', sql.Int, id)
       .query(`
-        SELECT i.*, u.name as manager_name 
+        SELECT i.*, 
+               CASE WHEN u.role LIKE '%CEO%' OR u.role LIKE '%Founder%' THEN 'Founder' ELSE u.name END as manager_name 
         FROM interns i
         LEFT JOIN users u ON i.reporting_manager_id = u.id
         WHERE i.id = @id
@@ -7351,6 +7671,27 @@ app.post('/api/admin/onboarding/promote', verifyToken, async (req, res) => {
 
       await transaction.commit();
       Log.success('HR', `Successfully promoted ${person.name} (${type}) to Full-time Employee.`);
+
+      // 6. Send Employment Confirmation Email to the newly promoted employee
+      const finalEmail = person.email || person.email_id;
+      const finalEmpId = emp_id || Math.floor(10000 + Math.random() * 90000);
+      const finalDesignation = newRole || person.role || 'Employee';
+      const finalTeam = team_name || person.team || 'General';
+
+      if (finalEmail) {
+        try {
+          await sendAppEmail({
+            to: finalEmail,
+            subject: `💼 Confirmation of Employment - Congratulations!`,
+            html: getEmploymentConfirmationHtml(person.name, finalDesignation, finalEmpId, finalTeam, person.joining_date),
+            text: `Dear ${person.name}, your transition has been officially approved! We confirm your appointment as a permanent, full-time employee at Navabharath Technologies.`
+          });
+          Log.success('SMTP', `Sent employment confirmation email to ${person.name} (${finalEmail})`);
+        } catch (mailErr) {
+          console.error(`[SMTP ERROR] Failed to send confirmation email to ${person.name}:`, mailErr.message);
+        }
+      }
+
       res.json({ success: true, message: `${person.name} is now a Full-time Employee!`, userId: newUserId });
 
     } catch (transErr) {
@@ -7488,7 +7829,7 @@ app.get('/api/support-tickets', async (req, res) => {
       request.input('userId', sql.Int, userId);
     }
     query += ' ORDER BY t.created_at DESC OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY';
-    
+
     const result = await request.query(query);
     const totalCount = result.recordset.length > 0 ? result.recordset[0].totalCount : 0;
 
@@ -7726,7 +8067,7 @@ app.get('/api/user-courses', verifyToken, async (req, res) => {
     const normalizedData = result.recordset.map(row => ({
       ...row,
       video_url: normalizeVideoUrl(row.video_url, req),
-      pdf_url:   normalizeVideoUrl(row.pdf_url, req),
+      pdf_url: normalizeVideoUrl(row.pdf_url, req),
     }));
 
     res.json(normalizedData);
@@ -7736,8 +8077,354 @@ app.get('/api/user-courses', verifyToken, async (req, res) => {
   }
 });
 
+// --- UNIFIED USER COURSES API (POST and PUT) ---
+// Handles start/progress/completion across both general academic catalog and onboarding curriculum.
+// Support all variations matching frontend attempts (/api/user-courses, /api/user_courses, /api/user-course, /api/user_course)
+const handleUserCourseSync = async (req, res) => {
+  const userId = req.user.id;
+
+  // Extract course ID from path params or request body
+  let courseId = req.params.id ? parseInt(req.params.id, 10) : null;
+  if (isNaN(courseId)) {
+    courseId = null;
+  }
+
+  if (!courseId) {
+    courseId = sanitizeNumericId(req.body.courseId || req.body.course_id || req.body.id || req.body.course);
+  }
+
+  if (!courseId) {
+    return res.status(400).json({ error: 'Course ID is required' });
+  }
+
+  // Determine completion and status
+  const isCompletePath = req.path.includes('/complete');
+  const completedInput = req.body.completed !== undefined ? req.body.completed : req.body.isCompleted;
+  const statusInput = req.body.status;
+
+  let isCompleted = false;
+  if (isCompletePath) {
+    isCompleted = true;
+  } else if (completedInput !== undefined) {
+    isCompleted = (completedInput === true || completedInput === 1 || completedInput === 'true');
+  } else if (statusInput !== undefined) {
+    isCompleted = (statusInput === 'Completed' || statusInput === 'completed');
+  }
+
+  const finalStatus = statusInput || (isCompleted ? 'Completed' : 'In Progress');
+
+  try {
+    const pool = await getPool();
+
+    // 1. Check if it's a general course first
+    const generalCheck = await pool.request()
+      .input('cid', sql.Int, courseId)
+      .query('SELECT 1 FROM courses WITH (NOLOCK) WHERE id = @cid');
+
+    if (generalCheck.recordset.length > 0) {
+      // Fetch metadata needed for progress tracking
+      const metaRes = await pool.request()
+        .input('cid', sql.Int, courseId)
+        .input('uid', sql.Int, userId)
+        .query(`
+          SELECT c.title as courseTitle, u.email as userEmail, u.name as userName
+          FROM courses c WITH (NOLOCK)
+          CROSS JOIN (
+            SELECT email, name FROM users WHERE id = @uid 
+            UNION 
+            SELECT email, name FROM interns WHERE id = @uid
+            UNION
+            SELECT email_id as email, name FROM new_joinees WHERE id = @uid
+          ) u
+          WHERE c.id = @cid
+        `);
+
+      if (metaRes.recordset.length === 0) {
+        return res.status(404).json({ error: 'Course metadata lookup failed' });
+      }
+
+      const { courseTitle, userEmail, userName } = metaRes.recordset[0];
+
+      // Check if already completed and if email sent
+      const checkResult = await pool.request()
+        .input('uid', sql.Int, userId)
+        .input('cid', sql.Int, courseId)
+        .query('SELECT completed, email_sent FROM user_courses WITH (NOLOCK) WHERE user_id = @uid AND course_id = @cid');
+
+      const record = checkResult.recordset[0];
+      const wasCompleted = record ? record.completed : false;
+      const emailSent = record ? record.email_sent : false;
+
+      // Update junction table
+      await pool.request()
+        .input('uid', sql.Int, userId)
+        .input('email', sql.NVarChar, userEmail)
+        .input('cid', sql.Int, courseId)
+        .input('title', sql.NVarChar, courseTitle)
+        .input('comp', sql.Bit, isCompleted ? 1 : 0)
+        .query(`
+          IF EXISTS (SELECT 1 FROM user_courses WHERE user_id = @uid AND course_id = @cid)
+            UPDATE user_courses SET 
+              completed = @comp, 
+              user_email = @email,
+              course_title = @title,
+              completed_at = CASE WHEN @comp = 1 THEN DATEADD(MINUTE, 330, GETUTCDATE()) ELSE completed_at END, 
+              updated_at = DATEADD(MINUTE, 330, GETUTCDATE()) 
+            WHERE user_id = @uid AND course_id = @cid
+          ELSE
+            INSERT INTO user_courses (user_id, user_email, course_id, course_title, completed, completed_at, updated_at) 
+            VALUES (@uid, @email, @cid, @title, @comp, CASE WHEN @comp = 1 THEN DATEADD(MINUTE, 330, GETUTCDATE()) ELSE NULL END, DATEADD(MINUTE, 330, GETUTCDATE()))
+        `);
+
+      // Send Email if newly completed and not already sent
+      if (isCompleted && !emailSent && userEmail) {
+        try {
+          await sendCertificateEmail(userEmail, userName, courseTitle);
+
+          await pool.request()
+            .input('uid', sql.Int, userId)
+            .input('cid', sql.Int, courseId)
+            .query('UPDATE user_courses SET email_sent = 1, email_sent_at = DATEADD(MINUTE, 330, GETUTCDATE()) WHERE user_id = @uid AND course_id = @cid');
+        } catch (e) { console.error('[USER COURSES SYNC EMAIL ERROR]:', e); }
+      }
+
+      return res.json({
+        success: true,
+        message: isCompleted ? 'Course marked as completed.' : 'Course progress synchronized.',
+        completed: isCompleted,
+        status: finalStatus
+      });
+    }
+
+    // 2. Check if it's a joinee course
+    const joineeCourseCheck = await pool.request()
+      .input('cid', sql.Int, courseId)
+      .query('SELECT title FROM newjoinee_courses WITH (NOLOCK) WHERE id = @cid');
+
+    if (joineeCourseCheck.recordset.length > 0) {
+      const courseTitle = joineeCourseCheck.recordset[0].title;
+
+      // Check if already completed to avoid duplicate emails
+      const prevStatusResult = await pool.request()
+        .input('jid', sql.Int, userId)
+        .input('cid', sql.Int, courseId)
+        .query('SELECT is_completed FROM joinee_course_progress WITH (NOLOCK) WHERE joinee_id = @jid AND course_id = @cid');
+      const wasCompleted = prevStatusResult.recordset.length > 0 && prevStatusResult.recordset[0].is_completed === true;
+
+      // Update joinee progress
+      await pool.request()
+        .input('jid', sql.Int, userId)
+        .input('cid', sql.Int, courseId)
+        .input('comp', sql.Bit, isCompleted ? 1 : 0)
+        .input('status', sql.NVarChar, finalStatus)
+        .query(`
+          IF EXISTS (SELECT 1 FROM joinee_course_progress WHERE joinee_id = @jid AND course_id = @cid)
+            UPDATE joinee_course_progress SET is_completed = @comp, status = @status, updated_at = DATEADD(MINUTE, 330, GETUTCDATE()) WHERE joinee_id = @jid AND course_id = @cid
+          ELSE
+            INSERT INTO joinee_course_progress (joinee_id, course_id, is_completed, status) VALUES (@jid, @cid, @comp, @status)
+        `);
+
+      // Trigger email if newly completed
+      if (isCompleted && !wasCompleted) {
+        try {
+          const joineeResult = await pool.request().input('jid', sql.Int, userId).query('SELECT name, email_id FROM new_joinees WITH (NOLOCK) WHERE id = @jid');
+          if (joineeResult.recordset.length > 0) {
+            const user = joineeResult.recordset[0];
+            if (user.email_id) {
+              await sendCertificateEmail(user.email_id, user.name, courseTitle);
+            }
+          }
+        } catch (e) { console.error('[JOINEE COURSES SYNC EMAIL ERROR]:', e); }
+      }
+
+      // Automatically recalculate overall joinee completion percentage
+      try {
+        const totalCoursesRes = await pool.request().query('SELECT COUNT(*) as total FROM newjoinee_courses WITH (NOLOCK)');
+        const completedCoursesRes = await pool.request()
+          .input('jid', sql.Int, userId)
+          .query('SELECT COUNT(*) as completed FROM joinee_course_progress WITH (NOLOCK) WHERE joinee_id = @jid AND is_completed = 1');
+
+        const total = totalCoursesRes.recordset[0].total || 1;
+        const completed = completedCoursesRes.recordset[0].completed || 0;
+        const perc = Math.round((completed / total) * 100);
+
+        await pool.request()
+          .input('perc', sql.Int, perc)
+          .input('jid', sql.Int, userId)
+          .query('UPDATE new_joinees SET course_completion = @perc WHERE id = @jid');
+
+        console.log(`[JOINEE PROGRESS] Recalculated completion for ${userId}: ${perc}% (${completed}/${total})`);
+      } catch (recalcErr) {
+        console.error('Failed to recalculate joinee course completion percentage:', recalcErr.message);
+      }
+
+      return res.json({
+        success: true,
+        message: isCompleted ? 'Joinee course marked as completed.' : 'Joinee course progress synchronized.',
+        completed: isCompleted,
+        status: finalStatus
+      });
+    }
+
+    res.status(404).json({ error: 'Course not found' });
+  } catch (err) {
+    console.error('[USER COURSES SYNC ERROR]:', err);
+    res.status(500).json({ error: 'Internal server error during course progress synchronization' });
+  }
+};
+
+// Register all POST variations
+app.post('/api/user-courses', verifyToken, handleUserCourseSync);
+app.post('/api/user_courses', verifyToken, handleUserCourseSync);
+app.post('/api/user-course', verifyToken, handleUserCourseSync);
+app.post('/api/user_course', verifyToken, handleUserCourseSync);
+
+// Register all PUT variations with dynamic parameter :id
+app.put('/api/user-courses/:id', verifyToken, handleUserCourseSync);
+app.put('/api/user_courses/:id', verifyToken, handleUserCourseSync);
+app.put('/api/user-course/:id', verifyToken, handleUserCourseSync);
+app.put('/api/user_course/:id', verifyToken, handleUserCourseSync);
+
+// Register all PUT complete variations
+app.put('/api/user-courses/complete', verifyToken, handleUserCourseSync);
+app.put('/api/user_courses/complete', verifyToken, handleUserCourseSync);
+app.put('/api/user-course/complete', verifyToken, handleUserCourseSync);
+app.put('/api/user_course/complete', verifyToken, handleUserCourseSync);
+
+// POST: Manually send/re-send certificate email
+app.post('/api/send-certificate', verifyToken, async (req, res) => {
+  const {
+    userId, user_id,
+    courseId, course_id,
+    userEmail, email,
+    userName, name,
+    courseName, courseTitle, title
+  } = req.body || {};
+
+  // Resolve target email, name, course title
+  let finalEmail = userEmail || email;
+  let finalName = userName || name;
+  let finalCourseTitle = courseName || courseTitle || title;
+
+  try {
+    const pool = await getPool();
+
+    // If we have courseId/userId, look up database to resolve missing metadata
+    const resolvedUserId = sanitizeNumericId(userId || user_id);
+    const resolvedCourseId = sanitizeNumericId(courseId || course_id);
+
+    if (resolvedUserId && resolvedCourseId) {
+      // 1. Try General Course lookup first
+      const generalRes = await pool.request()
+        .input('cid', sql.Int, resolvedCourseId)
+        .input('uid', sql.Int, resolvedUserId)
+        .query(`
+          SELECT c.title as courseTitle, u.email as userEmail, u.name as userName
+          FROM courses c WITH (NOLOCK)
+          CROSS JOIN (
+            SELECT email, name FROM users WHERE id = @uid 
+            UNION 
+            SELECT email, name FROM interns WHERE id = @uid
+            UNION
+            SELECT email_id as email, name FROM new_joinees WHERE id = @uid
+          ) u
+          WHERE c.id = @cid
+        `);
+
+      if (generalRes.recordset.length > 0) {
+        if (!finalCourseTitle) finalCourseTitle = generalRes.recordset[0].courseTitle;
+        if (!finalEmail) finalEmail = generalRes.recordset[0].userEmail;
+        if (!finalName) finalName = generalRes.recordset[0].userName;
+
+        // Mark as sent in user_courses junction table
+        await pool.request()
+          .input('uid', sql.Int, resolvedUserId)
+          .input('cid', sql.Int, resolvedCourseId)
+          .query(`
+            UPDATE user_courses 
+            SET email_sent = 1, email_sent_at = DATEADD(MINUTE, 330, GETUTCDATE())
+            WHERE user_id = @uid AND course_id = @cid
+          `);
+      } else {
+        // 2. Try Onboarding Course lookup
+        const onboardingRes = await pool.request()
+          .input('cid', sql.Int, resolvedCourseId)
+          .input('uid', sql.Int, resolvedUserId)
+          .query(`
+            SELECT c.title as courseTitle, u.email_id as userEmail, u.name as userName
+            FROM newjoinee_courses c WITH (NOLOCK)
+            CROSS JOIN new_joinees u WITH (NOLOCK)
+            WHERE c.id = @cid AND u.id = @uid
+          `);
+
+        if (onboardingRes.recordset.length > 0) {
+          if (!finalCourseTitle) finalCourseTitle = onboardingRes.recordset[0].courseTitle;
+          if (!finalEmail) finalEmail = onboardingRes.recordset[0].userEmail;
+          if (!finalName) finalName = onboardingRes.recordset[0].userName;
+        }
+      }
+    } else if (resolvedUserId && !finalEmail) {
+      // Resolve user details only
+      const userRes = await pool.request()
+        .input('uid', sql.Int, resolvedUserId)
+        .query(`
+          SELECT email, name FROM users WITH (NOLOCK) WHERE id = @uid 
+          UNION 
+          SELECT email, name FROM interns WITH (NOLOCK) WHERE id = @uid
+          UNION
+          SELECT email_id as email, name FROM new_joinees WITH (NOLOCK) WHERE id = @uid
+        `);
+      if (userRes.recordset.length > 0) {
+        finalEmail = userRes.recordset[0].email;
+        if (!finalName) finalName = userRes.recordset[0].name;
+      }
+    }
+
+    // Validation
+    if (!finalEmail) {
+      return res.status(400).json({ error: 'Recipient email is required or could not be resolved.' });
+    }
+    if (!finalName) {
+      return res.status(400).json({ error: 'Recipient name is required or could not be resolved.' });
+    }
+    if (!finalCourseTitle) {
+      return res.status(400).json({ error: 'Course title is required or could not be resolved.' });
+    }
+
+    // Trigger sending the certificate email
+    console.log(`[MANUAL CERTIFICATE] Sending certificate to ${finalEmail} (${finalName}) for ${finalCourseTitle}`);
+    await sendCertificateEmail(finalEmail, finalName, finalCourseTitle);
+
+    res.json({
+      success: true,
+      message: `Certificate of Completion successfully sent to ${finalEmail}`,
+      details: {
+        email: finalEmail,
+        name: finalName,
+        course: finalCourseTitle
+      }
+    });
+  } catch (err) {
+    console.error('[MANUAL CERTIFICATE ERROR]:', err);
+    res.status(500).json({ error: 'Failed to send certificate email', details: err.message });
+  }
+});
+
 // 26.2 Add a new course (Google Drive Cloud Storage Native)
-app.post('/api/courses', memoryUpload.fields([{ name: 'pdf', maxCount: 1 }, { name: 'video', maxCount: 1 }]), async (req, res) => {
+app.post('/api/courses', verifyToken, memoryUpload.fields([{ name: 'pdf', maxCount: 1 }, { name: 'video', maxCount: 1 }]), async (req, res) => {
+  const role = (req.user?.role || '').toLowerCase();
+  const isAuthorized = role.includes('hr') ||
+    role.includes('human resource') ||
+    role.includes('project manager') ||
+    role.includes('pm') ||
+    role.includes('admin') ||
+    role.includes('ceo') ||
+    role.includes('superadmin');
+
+  if (!isAuthorized) {
+    return res.status(403).json({ error: 'Unauthorized: Only HR, PM, and Admins can create courses' });
+  }
+
   const {
     title, description, category, deadline,
     pdf_url, pdfUrl, video_url, videoUrl
@@ -7785,14 +8472,34 @@ app.post('/api/courses', memoryUpload.fields([{ name: 'pdf', maxCount: 1 }, { na
 });
 
 // PUT: Update Course status (e.g. mark as completed or update metadata - Migrated to Google Drive)
-app.put('/api/courses/:id', memoryUpload.fields([{ name: 'pdf', maxCount: 1 }, { name: 'video', maxCount: 1 }]), async (req, res) => {
+app.put('/api/courses/:id', verifyToken, memoryUpload.fields([{ name: 'pdf', maxCount: 1 }, { name: 'video', maxCount: 1 }]), async (req, res) => {
   const { id } = req.params;
   const {
     title,
     description,
+    category,
     deadline,
-    completed
+    completed,
+    pdf_url,
+    pdfUrl,
+    video_url,
+    videoUrl
   } = req.body || {};
+
+  const role = (req.user?.role || '').toLowerCase();
+  const isAuthorized = role.includes('hr') ||
+    role.includes('human resource') ||
+    role.includes('project manager') ||
+    role.includes('pm') ||
+    role.includes('admin') ||
+    role.includes('ceo') ||
+    role.includes('superadmin');
+
+  if (title !== undefined || description !== undefined || category !== undefined || deadline !== undefined || (req.files && (req.files['pdf'] || req.files['video'])) || pdf_url !== undefined || pdfUrl !== undefined || video_url !== undefined || videoUrl !== undefined) {
+    if (!isAuthorized) {
+      return res.status(403).json({ error: 'Unauthorized: Only HR, PM, and Admins can update course metadata' });
+    }
+  }
 
   try {
     const pool = await getPool();
@@ -8127,12 +8834,7 @@ app.post('/api/courses/progress', verifyToken, async (req, res) => {
 
             if (userResult.recordset.length > 0) {
               const user = userResult.recordset[0];
-              await sendAppEmail({
-                to: user.email,
-                subject: `🎓 Certificate of Completion: ${course.title}`,
-                html: generateCertificateHtml(user.name, course.title),
-                text: `Congratulations ${user.name}! You have officially completed "${course.title}".`
-              });
+              await sendCertificateEmail(user.email, user.name, course.title);
 
               await pool.request()
                 .input('cid', sql.Int, finalCourseId)
@@ -8172,12 +8874,7 @@ app.post('/api/courses/progress', verifyToken, async (req, res) => {
         const joineeResult = await pool.request().input('jid', sql.Int, userId).query('SELECT name, email_id FROM new_joinees WITH (NOLOCK) WHERE id = @jid');
         if (joineeResult.recordset.length > 0) {
           const user = joineeResult.recordset[0];
-          await sendAppEmail({
-            to: user.email_id,
-            subject: `🎓 Certificate of Completion: ${course.title}`,
-            html: generateCertificateHtml(user.name, course.title),
-            text: `Congratulations ${user.name}! You have officially completed "${course.title}".`
-          });
+          await sendCertificateEmail(user.email_id, user.name, course.title);
         }
       }
       return res.json({ success: true, message: 'Joinee progress updated' });
@@ -8191,7 +8888,20 @@ app.post('/api/courses/progress', verifyToken, async (req, res) => {
 });
 
 // DELETE: Remove a course from the academic catalog
-app.delete('/api/courses/:id', async (req, res) => {
+app.delete('/api/courses/:id', verifyToken, async (req, res) => {
+  const role = (req.user?.role || '').toLowerCase();
+  const isAuthorized = role.includes('hr') ||
+    role.includes('human resource') ||
+    role.includes('project manager') ||
+    role.includes('pm') ||
+    role.includes('admin') ||
+    role.includes('ceo') ||
+    role.includes('superadmin');
+
+  if (!isAuthorized) {
+    return res.status(403).json({ error: 'Unauthorized: Only HR, PM, and Admins can delete courses' });
+  }
+
   const { id } = req.params;
   try {
     const pool = await getPool();
@@ -8309,7 +9019,19 @@ app.get('/api/newjoinee-courses/:id', async (req, res) => {
 
 // POST: Upload course for new joinee
 // 28.1 Add a new course to the global onboarding curriculum (Google Drive Migrated)
-app.post('/api/newjoinee-courses', memoryUpload.fields([{ name: 'pdf', maxCount: 1 }, { name: 'video', maxCount: 1 }]), async (req, res) => {
+app.post('/api/newjoinee-courses', verifyToken, memoryUpload.fields([{ name: 'pdf', maxCount: 1 }, { name: 'video', maxCount: 1 }]), async (req, res) => {
+  const role = (req.user?.role || '').toLowerCase();
+  const isAuthorized = role.includes('hr') ||
+    role.includes('human resource') ||
+    role.includes('project manager') ||
+    role.includes('pm') ||
+    role.includes('admin') ||
+    role.includes('ceo') ||
+    role.includes('superadmin');
+
+  if (!isAuthorized) {
+    return res.status(403).json({ error: 'Unauthorized: Only HR, PM, and Admins can upload onboarding courses' });
+  }
   const {
     title, description, category, deadline,
     assignedTo, assigned_to,
@@ -8367,15 +9089,27 @@ app.post('/api/newjoinee-courses', memoryUpload.fields([{ name: 'pdf', maxCount:
 });
 
 // PUT: Update joinee course metadata or status (Migrated to Google Drive)
-app.put('/api/newjoinee-courses/:id', memoryUpload.fields([{ name: 'pdf', maxCount: 1 }, { name: 'video', maxCount: 1 }]), async (req, res) => {
+app.put('/api/newjoinee-courses/:id', verifyToken, memoryUpload.fields([{ name: 'pdf', maxCount: 1 }, { name: 'video', maxCount: 1 }]), async (req, res) => {
   const { id } = req.params;
   const { title, description, category, completed, deadline, pdf_url, video_url, joineeId, status } = req.body || {};
+
+  const role = (req.user?.role || '').toLowerCase();
+  const isAuthorized = role.includes('hr') ||
+    role.includes('human resource') ||
+    role.includes('project manager') ||
+    role.includes('pm') ||
+    role.includes('admin') ||
+    role.includes('ceo') ||
+    role.includes('superadmin');
 
   try {
     const pool = await getPool();
 
     // 1. Admin Metadata Update (if fields provided)
-    if (title || description || category || deadline || req.files) {
+    if (title || description || category || deadline || req.files || pdf_url || video_url) {
+      if (!isAuthorized) {
+        return res.status(403).json({ error: 'Unauthorized: Only HR, PM, and Admins can update course metadata' });
+      }
       let query = 'UPDATE newjoinee_courses SET updated_at = DATEADD(MINUTE, 330, GETUTCDATE())';
       const request = pool.request().input('id', sql.Int, id);
 
@@ -8461,12 +9195,7 @@ app.put('/api/newjoinee-courses/:id', memoryUpload.fields([{ name: 'pdf', maxCou
             const { course_name, user_name, user_email } = infoResult.recordset[0];
 
             if (user_email) {
-              await sendAppEmail({
-                to: user_email,
-                subject: `🎓 Certificate of Completion: ${course_name}`,
-                html: generateCertificateHtml(user_name, course_name),
-                text: `Congratulations ${user_name}! You have officially completed "${course_name}" on NBT Hub.`
-              });
+              await sendCertificateEmail(user_email, user_name, course_name);
               console.log(`[SMTP] Joinee course completion email sent to ${user_email} for "${course_name}"`);
             }
           }
@@ -8494,7 +9223,20 @@ app.put('/api/newjoinee-courses/:id', memoryUpload.fields([{ name: 'pdf', maxCou
 });
 
 // DELETE: Remove joinee course
-app.delete('/api/newjoinee-courses/:id', async (req, res) => {
+app.delete('/api/newjoinee-courses/:id', verifyToken, async (req, res) => {
+  const role = (req.user?.role || '').toLowerCase();
+  const isAuthorized = role.includes('hr') ||
+    role.includes('human resource') ||
+    role.includes('project manager') ||
+    role.includes('pm') ||
+    role.includes('admin') ||
+    role.includes('ceo') ||
+    role.includes('superadmin');
+
+  if (!isAuthorized) {
+    return res.status(403).json({ error: 'Unauthorized: Only HR, PM, and Admins can delete onboarding courses' });
+  }
+
   const { id } = req.params;
   try {
     const pool = await getPool();
@@ -8973,7 +9715,7 @@ const masterLeaveListHandler = async (req, res) => {
 };
 
 app.get('/api/leaves/all', verifyToken, masterLeaveListHandler);
-app.get(['/api/admin/leaves', '/api/admin/leave-requests', '/api/admin/leave-request'], verifyToken, masterLeaveListHandler);
+app.get(['/api/admin/leaves', '/api/admin/leave-requests', '/api/admin/leave-request', '/api/admin/all-leaves', '/api/admin/all_leaves'], verifyToken, masterLeaveListHandler);
 app.get(['/api/admin/leaves/all', '/api/leaves/admin/all'], verifyToken, masterLeaveListHandler);
 app.get(['/api/leaves/team', '/api/leave/team'], verifyToken, masterLeaveListHandler);
 app.get('/api/leaves/comprehensive', verifyToken, masterLeaveListHandler);
@@ -9851,17 +10593,17 @@ cron.schedule('0 10 * * *', async () => {
   try {
     const pool = await getPool();
 
-    // 1. Fetch eligible candidates
+    // 1. Fetch eligible candidates (only those who haven't been sent the welcome email yet!)
     const joinees = await pool.request().query(`
-      SELECT name, email_id as email, joining_date, duration, 'New Joinee' as type
+      SELECT id, name, email_id as email, joining_date, duration, 'New Joinee' as type
       FROM new_joinees WITH (NOLOCK)
-      WHERE DATEDIFF(DAY, joining_date, GETDATE()) >= 10
+      WHERE DATEDIFF(DAY, joining_date, GETDATE()) >= 10 AND (welcome_sent IS NULL OR welcome_sent = 0)
     `);
 
     const interns = await pool.request().query(`
-      SELECT name, email, joining_date, duration_months as duration, 'Intern' as type
+      SELECT id, name, email, joining_date, duration_months as duration, 'Intern' as type
       FROM interns WITH (NOLOCK)
-      WHERE DATEDIFF(MONTH, joining_date, GETDATE()) >= duration_months
+      WHERE DATEDIFF(MONTH, joining_date, GETDATE()) >= duration_months AND (welcome_sent IS NULL OR welcome_sent = 0)
     `);
 
     const candidates = [...joinees.recordset, ...interns.recordset];
@@ -9871,7 +10613,32 @@ cron.schedule('0 10 * * *', async () => {
       return;
     }
 
-    // 2. Fetch HR and Admin emails
+    // 2. Send welcome emails in parallel to the individuals
+    const { getWelcomeOnboardingHtml } = require('./templates/welcomeEmailTemplate');
+    for (const candidate of candidates) {
+      if (candidate.email) {
+        try {
+          await sendAppEmail({
+            to: candidate.email,
+            subject: `🌟 Onboarding Complete - Congratulations, ${candidate.name}!`,
+            html: getWelcomeOnboardingHtml(candidate.name, candidate.type),
+            text: `Congratulations ${candidate.name}! You have successfully completed your ${candidate.type === 'Intern' ? 'Internship' : 'Onboarding'} duration. Welcome to the next chapter at Navabharath Technologies!`
+          });
+
+          // Mark as welcome_sent in DB
+          const table = candidate.type === 'Intern' ? 'interns' : 'new_joinees';
+          await pool.request()
+            .input('id', sql.Int, candidate.id)
+            .query(`UPDATE ${table} SET welcome_sent = 1 WHERE id = @id`);
+
+          Log.success('SMTP', `Sent duration completion welcome email to ${candidate.name} (${candidate.email})`);
+        } catch (mailErr) {
+          console.error(`[SMTP ERROR] Failed to send welcome email to ${candidate.name}:`, mailErr.message);
+        }
+      }
+    }
+
+    // 3. Fetch HR and Admin emails
     const admins = await pool.request().query(`
       SELECT email FROM users WITH (NOLOCK) 
       WHERE LOWER(role) LIKE '%hr%' OR LOWER(role) LIKE '%admin%' OR LOWER(role) LIKE '%ceo%'
@@ -9882,7 +10649,7 @@ cron.schedule('0 10 * * *', async () => {
     if (adminEmails.length > 0) {
       await sendAppEmail({
         to: adminEmails.join(','),
-        subject: `?? Onboarding Alert: ${candidates.length} Promotions Pending`,
+        subject: `📋 Onboarding Alert: ${candidates.length} Promotions Pending`,
         html: getPromotionReminderHtml(candidates),
         text: `Daily Alert: There are ${candidates.length} team members eligible for promotion to full-time status.`
       });
@@ -10016,7 +10783,7 @@ app.post(['/api/admin/pay-slips', '/api/admin/payslips', '/api/pay_slip', '/api/
     const totalIncentive = parseFloat(performance_incentive || 0) + parseFloat(yearly_incentive || 0);
     const earnings = parseFloat(basic_salary || 0) + parseFloat(hra || 0) + parseFloat(conveyance || 0) + parseFloat(special_allowance || 0);
     const deductions = parseFloat(pf_deduction || 0) + parseFloat(esi_deduction || 0) + parseFloat(pt_deduction || 0) + parseFloat(lwf || 0) + parseFloat(income_tax || 0) + calculatedLop;
-    
+
     // Enforce comprehensive dynamic netPayable calculation: Net Payable = Total Earnings + Total Incentives - Total Deductions
     const netPayable = Math.max(0, Math.round(earnings + totalIncentive - deductions));
 
@@ -10196,9 +10963,9 @@ app.get(['/api/admin/pay-slips/calculate-summary', '/api/admin/payslips/calculat
     if (existingSlipRes.recordset.length > 0) {
       const paySlip = existingSlipRes.recordset[0];
       console.log(`[API] Returning EXISTING saved payslip for ${employee_id} - ${monthName} ${targetYear}`);
-      return res.json({ 
-        ...paySlip, 
-        exists: true, 
+      return res.json({
+        ...paySlip,
+        exists: true,
         monthName,
         available_leaves: paySlip.available_leaves !== undefined ? paySlip.available_leaves : paySlip.total_leaves,
         available_leave_balance: paySlip.available_leave_balance !== undefined ? paySlip.available_leave_balance : paySlip.total_leaves
@@ -10239,7 +11006,7 @@ app.get(['/api/admin/pay-slips/calculate-summary', '/api/admin/payslips/calculat
       .input('lsMonth', sql.Int, targetMonth)
       .input('lsYear', sql.Int, targetYear)
       .query('SELECT ISNULL(LOP, 0) as LOP FROM leave_stats WHERE employee_id = @lsEmpId AND month = @lsMonth AND year = @lsYear');
-    
+
     let absentDays = 0;
     if (leaveStatsRes.recordset.length > 0) {
       absentDays = parseFloat(leaveStatsRes.recordset[0].LOP) || 0;
@@ -10577,9 +11344,9 @@ app.get(['/api/admin/pay-slips', '/api/admin/payslips', '/api/payslips'], verify
       if (existingSlipRes.recordset.length > 0) {
         const paySlip = existingSlipRes.recordset[0];
         console.log(`[LIST API] Returning EXISTING saved payslip for ${targetEmpId} - ${monthNames[targetMonth]} ${targetYear}`);
-        return res.json([{ 
-          ...paySlip, 
-          exists: true, 
+        return res.json([{
+          ...paySlip,
+          exists: true,
           monthName: monthNames[targetMonth] || 'Unknown',
           available_leaves: paySlip.available_leaves !== undefined ? paySlip.available_leaves : paySlip.total_leaves,
           available_leave_balance: paySlip.available_leave_balance !== undefined ? paySlip.available_leave_balance : paySlip.total_leaves
@@ -10618,7 +11385,7 @@ app.get(['/api/admin/pay-slips', '/api/admin/payslips', '/api/payslips'], verify
         .input('lsMonth', sql.Int, targetMonth)
         .input('lsYear', sql.Int, targetYear)
         .query('SELECT ISNULL(LOP, 0) as LOP FROM leave_stats WHERE employee_id = @lsEmpId AND month = @lsMonth AND year = @lsYear');
-      
+
       let absentDays = 0;
       if (leaveStatsRes.recordset.length > 0) {
         absentDays = parseFloat(leaveStatsRes.recordset[0].LOP) || 0;
@@ -10679,7 +11446,7 @@ app.get(['/api/admin/pay-slips', '/api/admin/payslips', '/api/payslips'], verify
       request.input('empId', sql.Int, targetEmpId);
     }
 
-    if (month) { 
+    if (month) {
       let targetMonth = 0;
       const monthNames = ["", "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
       if (/^\d+$/.test(String(month).trim())) {
@@ -10689,8 +11456,8 @@ app.get(['/api/admin/pay-slips', '/api/admin/payslips', '/api/payslips'], verify
         const idx = monthNames.findIndex(m => m.toLowerCase() === mStr);
         if (idx > 0) targetMonth = idx;
       }
-      query += ' AND ps.month = @month'; 
-      request.input('month', sql.Int, targetMonth); 
+      query += ' AND ps.month = @month';
+      request.input('month', sql.Int, targetMonth);
     }
     if (year) { query += ' AND ps.year = @year'; request.input('year', sql.Int, year); }
     if (team) { query += ' AND u.team = @team'; request.input('team', sql.NVarChar, team); }
@@ -10756,12 +11523,12 @@ app.put(['/api/admin/pay-slips/:id', '/api/admin/payslips/:id', '/api/payslips/:
 
   try {
     const pool = await getPool();
-    
+
     // Check if the record exists
     const checkRes = await pool.request()
       .input('id', sql.Int, id)
       .query('SELECT employee_id FROM pay_slips WHERE id = @id');
-      
+
     if (checkRes.recordset.length === 0) {
       return res.status(404).json({ error: 'Pay slip record not found' });
     }
@@ -10854,12 +11621,12 @@ app.delete(['/api/admin/pay-slips/:id', '/api/admin/payslips/:id', '/api/payslip
 
   try {
     const pool = await getPool();
-    
+
     // Check if the record exists
     const checkRes = await pool.request()
       .input('id', sql.Int, id)
       .query('SELECT employee_id FROM pay_slips WHERE id = @id');
-      
+
     if (checkRes.recordset.length === 0) {
       return res.status(404).json({ error: 'Pay slip record not found' });
     }
@@ -10897,8 +11664,8 @@ app.get('/api/rewards/points/:employee_id', verifyToken, async (req, res) => {
     const quizPoints = result.recordset[0]?.total_quiz_points || 0;
     const totalPoints = rewardPoints + quizPoints;
 
-    res.json({ 
-      employee_id, 
+    res.json({
+      employee_id,
       totalPoints: formatINR(totalPoints),
       rewardPoints: formatINR(rewardPoints),
       quizPoints: formatINR(quizPoints),
@@ -11219,7 +11986,7 @@ app.get('/api/rewards/given', verifyToken, async (req, res) => {
  * 48. Global Reward History (Admin/HR Management View)
  * Shows who gave which reward to whom.
  */
-app.get('/api/admin/rewards/history', verifyToken, async (req, res) => {
+app.get(['/api/admin/rewards/history', '/api/admin/reward/history'], verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
   const isLeadership = role.includes('hr') || role.includes('human resource') || role.includes('manager') || role.includes('lead') || role.includes('ceo') || role.includes('admin');
 
@@ -11230,6 +11997,13 @@ app.get('/api/admin/rewards/history', verifyToken, async (req, res) => {
   try {
     const pool = await getPool();
     const result = await pool.request().query(`
+      WITH AllParticipants AS (
+        SELECT id, name, role FROM users WITH (NOLOCK)
+        UNION ALL
+        SELECT id, name, 'New Joinee' as role FROM new_joinees WITH (NOLOCK)
+        UNION ALL
+        SELECT id, name, 'Intern' as role FROM interns WITH (NOLOCK)
+      )
       SELECT 
         r.id as id,
         r.reward_name,
@@ -11239,11 +12013,12 @@ app.get('/api/admin/rewards/history', verifyToken, async (req, res) => {
         r.created_at,
         u_rec.name as employee_name,
         u_rec.id as employee_id,
+        u_rec.role as employee_role,
         u_giv.name as given_by,
         u_giv.id as granted_by
       FROM employee_rewards r
-      JOIN users u_rec ON r.employee_id = u_rec.id
-      JOIN users u_giv ON r.granted_by = u_giv.id
+      LEFT JOIN AllParticipants u_rec ON r.employee_id = u_rec.id
+      LEFT JOIN AllParticipants u_giv ON r.granted_by = u_giv.id
       ORDER BY r.created_at DESC
     `);
 
@@ -11263,7 +12038,7 @@ app.get('/api/admin/rewards/history', verifyToken, async (req, res) => {
 /**
  * 46. Global Leaderboard
  */
-app.get(['/api/rewards/leaderboard', '/api/quizzes/leaderboard'], verifyToken, async (req, res) => {
+app.get(['/api/rewards/leaderboard', '/api/quizzes/leaderboard', '/api/admin/rewards/leaderboard', '/api/admin/reward/leaderboard'], verifyToken, async (req, res) => {
   try {
     const pool = await getPool();
     const result = await pool.request().query(`
@@ -11412,19 +12187,26 @@ app.get('/api/employees/leaderboard/all', verifyToken, async (req, res) => {
     const pool = await getPool();
     const result = await pool.request().query(`
       WITH CombinedPoints AS (
-        SELECT employee_id, points, 1 as is_award FROM employee_rewards
+        SELECT employee_id, points, 1 as is_award FROM employee_rewards WITH (NOLOCK)
         UNION ALL
-        SELECT employee_id, total_points as points, 0 as is_award FROM quiz_completions
+        SELECT employee_id, total_points as points, 0 as is_award FROM quiz_completions WITH (NOLOCK)
+      ),
+      AllParticipants AS (
+        SELECT id, name, role, team, profile_picture FROM users WITH (NOLOCK)
+        UNION ALL
+        SELECT id, name, role, 'New Joinee' as team, profile_picture FROM new_joinees WITH (NOLOCK)
+        UNION ALL
+        SELECT id, name, role, 'Intern' as team, profile_picture FROM interns WITH (NOLOCK)
       )
       SELECT 
-        u.id, u.name, u.role, u.team, u.profile_picture,
+        ap.id, ap.name, ap.role, ap.team, ap.profile_picture,
         ISNULL(SUM(cp.points), 0) as total_rep,
         ISNULL(SUM(cp.is_award), 0) as total_awards,
         DENSE_RANK() OVER (ORDER BY ISNULL(SUM(cp.points), 0) DESC) as rank
-      FROM users u WITH (NOLOCK)
-      LEFT JOIN CombinedPoints cp WITH (NOLOCK) ON u.id = cp.employee_id
-      GROUP BY u.id, u.name, u.role, u.team, u.profile_picture
-      ORDER BY total_rep DESC, u.name ASC
+      FROM AllParticipants ap
+      LEFT JOIN CombinedPoints cp ON ap.id = cp.employee_id
+      GROUP BY ap.id, ap.name, ap.role, ap.team, ap.profile_picture
+      ORDER BY total_rep DESC, ap.name ASC
     `);
 
     const formatted = result.recordset.map(row => ({
@@ -11488,7 +12270,7 @@ app.get('/api/public/employees/leaderboard/all', async (req, res) => {
         const medalIcon = index === 0 ? '👑' : index === 1 ? '🥈' : '🥉';
         const rankLabel = index === 0 ? '1st' : index === 1 ? '2nd' : '3rd';
         const initials = emp.name ? emp.name.split(' ').map(n => n[0]).join('').substring(0, 2).toUpperCase() : 'EE';
-        
+
         return `
           <div class="podium-card rank-${index + 1}" style="border-top: 4px solid ${medalColor}">
             <div class="podium-badge" style="background: ${medalColor}">${rankLabel} ${medalIcon}</div>
@@ -12124,7 +12906,7 @@ app.post(['/api/quizzes/:id/answer', '/api/fun-quizzes/submit-answer'], verifyTo
     if (isCorrect === 1) {
       const today = new Date().toISOString().split('T')[0];
       const points = quizData.points_reward || 0;
-      
+
       const transaction = new sql.Transaction(pool);
       await transaction.begin();
       try {
@@ -13076,7 +13858,7 @@ app.get('/api/employee-profile/my', verifyToken, async (req, res) => {
       .query(`
         SELECT u.id as user_id, u.name as base_name, u.email as base_email, u.role as base_role, u.joining_date,
                u.phone_number, u.profile_picture, u.date_of_birth, u.about_me, u.team, u.reporting_manager_id,
-               m.name AS reporting_manager_name,
+               CASE WHEN m.role LIKE '%CEO%' OR m.role LIKE '%Founder%' THEN 'Founder' ELSE m.name END AS reporting_manager_name,
                e.emp_id, e.designation as base_designation, e.team_name as base_team,
                p.* 
         FROM users u
@@ -13123,7 +13905,8 @@ app.get('/api/admin/employee-profiles', verifyToken, async (req, res) => {
     const pool = await getPool();
     const result = await pool.request().query(`
       SELECT u.id as user_id, u.name as base_name, u.email as base_email, u.role as base_role, u.profile_picture,
-             u.reporting_manager_id, m.name as reporting_manager_name,
+             u.reporting_manager_id, 
+             CASE WHEN m.role LIKE '%CEO%' OR m.role LIKE '%Founder%' THEN 'Founder' ELSE m.name END as reporting_manager_name,
              e.emp_id, e.designation as base_designation, e.team_name as base_team,
              p.* 
       FROM users u
@@ -13163,7 +13946,7 @@ app.get('/api/employee-profile/:id', verifyToken, async (req, res) => {
       .query(`
         SELECT u.id as user_id, u.name as base_name, u.email as base_email, u.role as base_role, u.joining_date,
                u.phone_number, u.profile_picture, u.date_of_birth, u.about_me, u.team, u.reporting_manager_id,
-               m.name AS reporting_manager_name,
+               CASE WHEN m.role LIKE '%CEO%' OR m.role LIKE '%Founder%' THEN 'Founder' ELSE m.name END AS reporting_manager_name,
                e.emp_id, e.designation as base_designation, e.team_name as base_team,
                p.* 
         FROM users u
@@ -13218,7 +14001,8 @@ app.get('/api/employee-profiles', verifyToken, async (req, res) => {
     const pool = await getPool();
     const result = await pool.request().query(`
       SELECT u.id as user_id, u.name as base_name, u.email as base_email, u.role as base_role, u.profile_picture,
-             u.reporting_manager_id, m.name as reporting_manager_name,
+             u.reporting_manager_id, 
+             CASE WHEN m.role LIKE '%CEO%' OR m.role LIKE '%Founder%' THEN 'Founder' ELSE m.name END as reporting_manager_name,
              e.emp_id, e.designation as base_designation, e.team_name as base_team,
              p.* 
       FROM users u
@@ -13276,7 +14060,8 @@ app.get('/api/admin/master-data', verifyToken, async (req, res) => {
     // 1. Fetch all profiles
     const profilesRes = await pool.request().query(`
       SELECT u.id as user_id, u.name as base_name, u.email as base_email, u.role as base_role,
-             u.reporting_manager_id, m.name as reporting_manager_name,
+             u.reporting_manager_id, 
+             CASE WHEN m.role LIKE '%CEO%' OR m.role LIKE '%Founder%' THEN 'Founder' ELSE m.name END as reporting_manager_name,
              e.emp_id, e.designation as base_designation,
              p.* 
       FROM users u
@@ -13755,14 +14540,14 @@ app.get('/api/assets-stock', verifyToken, async (req, res) => {
 
   // ── SQL condition fragments per UI tab ──────────────────────────────────────
   const TAB_CONDITIONS = {
-    laptops:     `(laptop_details IS NOT NULL AND laptop_details <> '')`,
-    keyboards:   `keyboard = 'Yes'`,
-    mice:        `mouse = 'Yes'`,
-    mobiles:     `mobile = 'Yes'`,
+    laptops: `(laptop_details IS NOT NULL AND laptop_details <> '')`,
+    keyboards: `keyboard = 'Yes'`,
+    mice: `mouse = 'Yes'`,
+    mobiles: `mobile = 'Yes'`,
     // Accessories = any peripheral that is NOT a laptop
     accessories: `(laptop_stand = 'Yes' OR ruf_pad = 'Yes' OR pendrive = 'Yes' OR camera = 'Yes' OR earphone_headphone = 'Yes' OR tablet = 'Yes')`,
     // Others = rows where nothing at all is recorded
-    others:      `(
+    others: `(
                     (laptop_details IS NULL OR laptop_details = '') AND
                     ISNULL(mouse,            'No') <> 'Yes' AND
                     ISNULL(keyboard,         'No') <> 'Yes' AND
@@ -13780,12 +14565,12 @@ app.get('/api/assets-stock', verifyToken, async (req, res) => {
   const normaliseFilter = (raw) => {
     const f = (raw || '').trim().toLowerCase();
     if (!f || f === 'all') return 'all';
-    if (f === 'laptop')      return 'laptops';
-    if (f === 'keyboard')    return 'keyboards';
-    if (f === 'mouse')       return 'mice';
-    if (f === 'mobile')      return 'mobiles';
-    if (f === 'accessory')   return 'accessories';
-    if (f === 'other')       return 'others';
+    if (f === 'laptop') return 'laptops';
+    if (f === 'keyboard') return 'keyboards';
+    if (f === 'mouse') return 'mice';
+    if (f === 'mobile') return 'mobiles';
+    if (f === 'accessory') return 'accessories';
+    if (f === 'other') return 'others';
     return f; // already plural / exact
   };
 
@@ -13832,13 +14617,13 @@ app.get('/api/assets-stock', verifyToken, async (req, res) => {
       data: dataResult.recordset.map(mapAssetStockRow),
       // Counts for every tab — use these as badge numbers on the filter pills
       counts: {
-        all:         c.total,
-        laptops:     c.laptops,
-        keyboards:   c.keyboards,
-        mice:        c.mice,
-        mobiles:     c.mobiles,
+        all: c.total,
+        laptops: c.laptops,
+        keyboards: c.keyboards,
+        mice: c.mice,
+        mobiles: c.mobiles,
         accessories: c.accessories,
-        others:      c.others,
+        others: c.others,
       }
     });
   } catch (err) {
@@ -13848,6 +14633,109 @@ app.get('/api/assets-stock', verifyToken, async (req, res) => {
 });
 
 // GET: /api/assets-stock/summary  — lightweight alias (just the counts, no row data)
+/**
+ * Helper to dynamically count detailed assets from a table.
+ */
+const countAssetsInTable = async (pool, tableName) => {
+  const result = await pool.request().query(`
+    SELECT laptop_details, mouse, keyboard, laptop_stand, ruf_pad, pendrive, mobile, camera, earphone_headphone, tablet 
+    FROM ${tableName}
+  `);
+
+  const rows = result.recordset;
+
+  const counts = {
+    totalRows: rows.length,
+    mouse: 0,
+    keyboard: 0,
+    laptop_stand: 0,
+    ruf_pad: 0,
+    pendrive: 0,
+    mobile: 0,
+    camera: 0,
+    earphone_headphone: 0,
+    tablet: 0,
+    laptops: {
+      total: 0,
+      lenovo: 0,
+      hp: 0,
+      dell: 0,
+      asus: 0,
+      redmi: 0,
+      macbook: 0,
+      acer: 0,
+      other: 0
+    }
+  };
+
+  for (const row of rows) {
+    if (row.mouse === 'Yes') counts.mouse++;
+    if (row.keyboard === 'Yes') counts.keyboard++;
+    if (row.laptop_stand === 'Yes') counts.laptop_stand++;
+    if (row.ruf_pad === 'Yes') counts.ruf_pad++;
+    if (row.pendrive === 'Yes') counts.pendrive++;
+    if (row.mobile === 'Yes') counts.mobile++;
+    if (row.camera === 'Yes') counts.camera++;
+    if (row.earphone_headphone === 'Yes') counts.earphone_headphone++;
+    if (row.tablet === 'Yes') counts.tablet++;
+
+    if (row.laptop_details && row.laptop_details.trim() !== '') {
+      counts.laptops.total++;
+      const details = row.laptop_details.toLowerCase();
+
+      if (details.includes('lenovo')) {
+        counts.laptops.lenovo++;
+      } else if (details.includes('hp')) {
+        counts.laptops.hp++;
+      } else if (details.includes('dell')) {
+        counts.laptops.dell++;
+      } else if (details.includes('asus')) {
+        counts.laptops.asus++;
+      } else if (details.includes('redmi') || details.includes('xiaomi') || details.includes('redmibook')) {
+        counts.laptops.redmi++;
+      } else if (details.includes('apple') || details.includes('macbook') || details.includes('mac ')) {
+        counts.laptops.macbook++;
+      } else if (details.includes('acer')) {
+        counts.laptops.acer++;
+      } else {
+        counts.laptops.other++;
+      }
+    }
+  }
+
+  return counts;
+};
+
+/**
+ * Combines stock and assigned assets for absolute grand totals.
+ */
+const getCombinedBreakdown = (stock, assigned) => {
+  return {
+    totalAssets: stock.totalRows + assigned.totalRows,
+    mouse: stock.mouse + assigned.mouse,
+    keyboard: stock.keyboard + assigned.keyboard,
+    laptop_stand: stock.laptop_stand + assigned.laptop_stand,
+    ruf_pad: stock.ruf_pad + assigned.ruf_pad,
+    pendrive: stock.pendrive + assigned.pendrive,
+    mobile: stock.mobile + assigned.mobile,
+    camera: stock.camera + assigned.camera,
+    earphone_headphone: stock.earphone_headphone + assigned.earphone_headphone,
+    tablet: stock.tablet + assigned.tablet,
+    laptops: {
+      total: stock.laptops.total + assigned.laptops.total,
+      lenovo: stock.laptops.lenovo + assigned.laptops.lenovo,
+      hp: stock.laptops.hp + assigned.laptops.hp,
+      dell: stock.laptops.dell + assigned.laptops.dell,
+      asus: stock.laptops.asus + assigned.laptops.asus,
+      redmi: stock.laptops.redmi + assigned.laptops.redmi,
+      macbook: stock.laptops.macbook + assigned.laptops.macbook,
+      acer: stock.laptops.acer + assigned.laptops.acer,
+      other: stock.laptops.other + assigned.laptops.other
+    }
+  };
+};
+
+// GET: /api/assets-stock/summary  — lightweight alias (returns complete detailed asset counts breakdown)
 app.get('/api/assets-stock/summary', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
   const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
@@ -13855,28 +14743,34 @@ app.get('/api/assets-stock/summary', verifyToken, async (req, res) => {
 
   try {
     const pool = await getPool();
-    const result = await pool.request().query(`
-      SELECT
-        COUNT(*)  AS total,
-        SUM(CASE WHEN laptop_details IS NOT NULL AND laptop_details <> '' THEN 1 ELSE 0 END) AS laptops,
-        SUM(CASE WHEN keyboard         = 'Yes' THEN 1 ELSE 0 END) AS keyboards,
-        SUM(CASE WHEN mouse            = 'Yes' THEN 1 ELSE 0 END) AS mice,
-        SUM(CASE WHEN mobile           = 'Yes' THEN 1 ELSE 0 END) AS mobiles,
-        SUM(CASE WHEN laptop_stand = 'Yes' OR ruf_pad = 'Yes' OR pendrive = 'Yes'
-                   OR camera = 'Yes' OR earphone_headphone = 'Yes' OR tablet = 'Yes'
-                THEN 1 ELSE 0 END) AS accessories,
-        SUM(CASE WHEN (laptop_details IS NULL OR laptop_details = '')
-                   AND ISNULL(mouse,'No') <> 'Yes' AND ISNULL(keyboard,'No') <> 'Yes'
-                   AND ISNULL(mobile,'No') <> 'Yes' AND ISNULL(laptop_stand,'No') <> 'Yes'
-                   AND ISNULL(ruf_pad,'No') <> 'Yes' AND ISNULL(pendrive,'No') <> 'Yes'
-                   AND ISNULL(camera,'No') <> 'Yes' AND ISNULL(earphone_headphone,'No') <> 'Yes'
-                   AND ISNULL(tablet,'No') <> 'Yes'
-                THEN 1 ELSE 0 END) AS others
-      FROM assets_stock
-    `);
 
-    const c = result.recordset[0];
-    res.json({ all: c.total, laptops: c.laptops, keyboards: c.keyboards, mice: c.mice, mobiles: c.mobiles, accessories: c.accessories, others: c.others });
+    // 1. Calculate detailed counts for stock assets
+    const stockCounts = await countAssetsInTable(pool, 'assets_stock');
+
+    // 2. Calculate detailed counts for assigned assets
+    const assignedCounts = await countAssetsInTable(pool, 'assets');
+
+    // 3. Combined Grand Totals
+    const grandTotals = getCombinedBreakdown(stockCounts, assignedCounts);
+
+    // 4. Return extremely clean, structured response
+    res.json({
+      // Legacy counts structure for frontend backward compatibility
+      all: stockCounts.totalRows,
+      laptops: stockCounts.laptops.total,
+      keyboards: stockCounts.keyboard,
+      mice: stockCounts.mouse,
+      mobiles: stockCounts.mobile,
+      accessories: stockCounts.laptop_stand + stockCounts.ruf_pad + stockCounts.pendrive + stockCounts.camera + stockCounts.earphone_headphone + stockCounts.tablet,
+      others: stockCounts.totalRows - (stockCounts.laptops.total + stockCounts.keyboard + stockCounts.mouse + stockCounts.mobile),
+
+      // New complete and detailed breakdowns
+      breakdown: {
+        stock: stockCounts,
+        assigned: assignedCounts,
+        grandTotals: grandTotals
+      }
+    });
   } catch (err) {
     console.error('[ASSETS STOCK SUMMARY ERROR]:', err);
     res.status(500).json({ error: 'Failed to fetch stock summary' });
@@ -13900,9 +14794,13 @@ app.post('/api/assets-stock', verifyToken, async (req, res) => {
       'pendrive', 'mobile', 'camera', 'earphone_headphone', 'tablet'
     ];
 
+    let laptopDetailsVal = null;
     columns.forEach(col => {
       let val = getAssetValue(data, col);
       request.input(col, sql.NVarChar, val ? String(val) : null);
+      if (col === 'laptop_details') {
+        laptopDetailsVal = val ? String(val) : null;
+      }
     });
 
     // Optional: who returned/donated this asset (for manually entered stock)
@@ -13920,6 +14818,27 @@ app.post('/api/assets-stock', verifyToken, async (req, res) => {
     request.input('returned_by_name', sql.NVarChar, returnedByName || null);
     request.input('returned_by_designation', sql.NVarChar, returnedByDesignation || null);
 
+    // Dynamic model classification and stock counting
+    let primaryModelName = 'Unknown Laptop';
+    let existingCount = 0;
+    let isFreshModel = true;
+
+    if (laptopDetailsVal && laptopDetailsVal.trim() !== '') {
+      // Extract model name (e.g., from first line or before first comma)
+      const firstLine = laptopDetailsVal.split('\n')[0].split(',')[0].trim();
+      if (firstLine) {
+        primaryModelName = firstLine;
+
+        // Count existing laptops with this model name in stock
+        const countQuery = await pool.request()
+          .input('modelPattern', sql.NVarChar, `%${primaryModelName}%`)
+          .query('SELECT COUNT(*) as count FROM assets_stock WHERE laptop_details LIKE @modelPattern');
+
+        existingCount = countQuery.recordset[0].count || 0;
+        isFreshModel = existingCount === 0;
+      }
+    }
+
     const query = `
       INSERT INTO assets_stock (
         ${columns.join(', ')},
@@ -13934,9 +14853,18 @@ app.post('/api/assets-stock', verifyToken, async (req, res) => {
     `;
 
     await request.query(query);
+
+    const newTotalCount = existingCount + 1;
+    const responseMsg = isFreshModel
+      ? `Fresh asset model detected! Added '${primaryModelName}' to stock. This is the first entry (Count: 1).`
+      : `Asset added successfully to existing model stock! Total count for '${primaryModelName}' in stock is now ${newTotalCount}.`;
+
     res.status(201).json({
       success: true,
-      message: 'Asset added to stock successfully'
+      message: responseMsg,
+      modelName: primaryModelName,
+      isFreshModel,
+      currentStockCount: newTotalCount
     });
   } catch (err) {
     console.error('[ASSET STOCK CREATE ERROR]:', err);
@@ -14432,6 +15360,142 @@ app.put('/api/service-certificates/:id', verifyToken, async (req, res) => {
   }
 });
 
+// --- JOB APPLICATIONS ENDPOINT (Frontend Direct Submission) --- //
+const upload = multer({ storage: multer.memoryStorage() });
+
+app.post('/api/job-applications', upload.single('resume'), async (req, res) => {
+  try {
+    const {
+      candidate_name, candidateName, name,
+      email,
+      phone,
+      job_title, jobTitle,
+      internal_job_id, atsJobId,
+      resume_url, resumeUrl, resume,
+      cover_letter, coverLetter,
+      location,
+      department,
+      experience
+    } = req.body || {};
+
+    const finalName = candidate_name || candidateName || name || 'Unknown';
+    const finalTitle = job_title || jobTitle || 'General Application';
+    const finalEmail = email || 'no-email@provided.com';
+    let finalResumeUrl = resume_url || resumeUrl || resume || '';
+
+    // If a file was uploaded directly via multipart
+    if (req.file) {
+      try {
+        finalResumeUrl = await safeUploadToDrive(req.file);
+      } catch (e) {
+        console.error('Failed to upload resume to drive', e);
+      }
+    } else if (finalResumeUrl && typeof finalResumeUrl === 'string' && finalResumeUrl.startsWith('http')) {
+      // If a resume URL is provided, download and save it securely to Google Drive
+      try {
+        console.log(`[RESUME URL DOWNLOAD] Fetching resume from URL: ${finalResumeUrl}`);
+        const downloadFileFromUrl = (url) => {
+          return new Promise((resolve, reject) => {
+            const protocol = url.startsWith('https') ? require('https') : require('http');
+            protocol.get(url, (response) => {
+              if (response.statusCode === 301 || response.statusCode === 302) {
+                const redirectUrl = response.headers.location;
+                if (redirectUrl) {
+                  downloadFileFromUrl(redirectUrl).then(resolve).catch(reject);
+                  return;
+                }
+              }
+              if (response.statusCode !== 200) {
+                reject(new Error(`Failed to download resume, status code: ${response.statusCode}`));
+                return;
+              }
+              const chunks = [];
+              response.on('data', (chunk) => chunks.push(chunk));
+              response.on('end', () => resolve(Buffer.concat(chunks)));
+            }).on('error', reject);
+          });
+        };
+
+        const bufferData = await downloadFileFromUrl(finalResumeUrl);
+
+        let filename = 'resume.pdf';
+        const urlParts = finalResumeUrl.split('?')[0].split('/');
+        const lastPart = urlParts[urlParts.length - 1];
+        if (lastPart && lastPart.toLowerCase().endsWith('.pdf')) {
+          filename = lastPart;
+        } else {
+          filename = `${finalName.replace(/\s+/g, '_')}_Resume.pdf`;
+        }
+
+        const mockFile = {
+          originalname: filename,
+          mimetype: 'application/pdf',
+          buffer: bufferData
+        };
+
+        const driveUrl = await safeUploadToDrive(mockFile);
+        if (driveUrl) {
+          console.log(`[RESUME URL DOWNLOAD] Successfully downloaded and saved resume to Drive: ${driveUrl}`);
+          finalResumeUrl = driveUrl;
+        }
+      } catch (downloadErr) {
+        console.error(`[RESUME URL DOWNLOAD ERROR] Failed to download/save resume URL:`, downloadErr.message);
+        // Fallback to the original URL if download fails
+      }
+    } else if (finalResumeUrl && typeof finalResumeUrl === 'string' && (finalResumeUrl.startsWith('data:application/pdf;base64,') || finalResumeUrl.startsWith('JVBERi'))) {
+      // If a base64 encoded PDF is provided, decode and save it securely to Google Drive
+      try {
+        console.log(`[RESUME BASE64 DECODE] Decoding base64 PDF for candidate: ${finalName}`);
+        let base64Data = finalResumeUrl;
+        if (finalResumeUrl.startsWith('data:application/pdf;base64,')) {
+          base64Data = finalResumeUrl.split(';base64,').pop();
+        }
+        const bufferData = Buffer.from(base64Data, 'base64');
+
+        const filename = `${finalName.replace(/\s+/g, '_')}_Resume.pdf`;
+        const mockFile = {
+          originalname: filename,
+          mimetype: 'application/pdf',
+          buffer: bufferData
+        };
+
+        const driveUrl = await safeUploadToDrive(mockFile);
+        if (driveUrl) {
+          console.log(`[RESUME BASE64 DECODE] Successfully decoded and saved base64 resume to Drive: ${driveUrl}`);
+          finalResumeUrl = driveUrl;
+        }
+      } catch (base64Err) {
+        console.error(`[RESUME BASE64 DECODE ERROR] Failed to decode/save base64 resume:`, base64Err.message);
+      }
+    }
+
+    const pool = await getPool();
+    await pool.request()
+      .input('name', sql.NVarChar, finalName)
+      .input('email', sql.NVarChar, finalEmail)
+      .input('phone', sql.NVarChar, phone || '')
+      .input('title', sql.NVarChar, finalTitle)
+      .input('jobId', sql.Int, internal_job_id || atsJobId || null)
+      .input('webAppId', sql.NVarChar, null)
+      .input('resume', sql.NVarChar, finalResumeUrl)
+      .input('cover', sql.NVarChar, cover_letter || coverLetter || '')
+      .input('applied', sql.DateTime, new Date())
+      .input('loc', sql.NVarChar, location || '')
+      .input('dept', sql.NVarChar, department || '')
+      .input('exp', sql.NVarChar, experience || '')
+      .query(`
+        INSERT INTO job_applications (candidate_name, email, phone, job_title, internal_job_id, website_application_id, resume_url, cover_letter, status, applied_at, location, department, experience)
+        VALUES (@name, @email, @phone, @title, @jobId, @webAppId, @resume, @cover, 'APPLIED', @applied, @loc, @dept, @exp)
+      `);
+
+    Log.success('Careers', `New application received directly from ${finalName} for ${finalTitle}`);
+    res.status(201).json({ success: true, message: 'Application submitted successfully' });
+  } catch (err) {
+    console.error('Error saving job application:', err);
+    res.status(500).json({ error: 'Failed to save application' });
+  }
+});
+
 // --- GLOBAL API 404 HANDLER (JSON-ONLY) --- //
 app.use('/api', (req, res) => {
   const clientIP = req.headers['x-forwarded-for']?.split(',')[0].trim() || req.ip;
@@ -14556,6 +15620,7 @@ const initializeProfilesTable = async (providedPool) => {
           puc_percentage NVARCHAR(50),
           ug_pg_percentage NVARCHAR(50),
           ug_pg_markscard NVARCHAR(MAX),
+          resume NVARCHAR(MAX),
           created_at DATETIME DEFAULT GETUTCDATE(),
           updated_at DATETIME DEFAULT GETUTCDATE()
         );
@@ -14590,6 +15655,8 @@ const initializeProfilesTable = async (providedPool) => {
           ALTER TABLE employee_profiles ADD ug_pg_percentage NVARCHAR(50);
         IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('employee_profiles') AND name = 'ug_pg_markscard')
           ALTER TABLE employee_profiles ADD ug_pg_markscard NVARCHAR(MAX);
+        IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('employee_profiles') AND name = 'resume')
+          ALTER TABLE employee_profiles ADD resume NVARCHAR(MAX);
       END
     `);
     Log.success('Database', 'Employee Profiles table ensures/ready');
@@ -14814,7 +15881,22 @@ const initializeDatabaseIndexes = async (providedPool) => {
   } catch (err) {
     Log.error('Database', 'Failed to initialize database indexes', err.message);
   }
+};// Migration: Ensure new_joinees and interns have the welcome_sent column
+const ensureWelcomeSentColumns = async (providedPool) => {
+  try {
+    const pool = providedPool || await getPool();
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('new_joinees') AND name = 'welcome_sent')
+        ALTER TABLE new_joinees ADD welcome_sent BIT DEFAULT 0;
+      IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('interns') AND name = 'welcome_sent')
+        ALTER TABLE interns ADD welcome_sent BIT DEFAULT 0;
+    `);
+    console.log('✅ Database: welcome_sent columns verified for new_joinees and interns');
+  } catch (err) {
+    console.error('❌ Failed to ensure welcome_sent columns:', err.message);
+  }
 };
+
 
 // Initialize server ONLY after database is ready
 getPool().then(async (pool) => {
@@ -14834,6 +15916,7 @@ getPool().then(async (pool) => {
   await runMigration('Attendance', initializeAttendanceTable);
   await runMigration('Threads', initializeThreadCommentsTable);
   await runMigration('Reactions', initializeThreadReactionsTable);
+  await runMigration('WelcomeColumns', ensureWelcomeSentColumns);
   await runMigration('Indexes', initializeDatabaseIndexes);
   app.listen(PORT, '0.0.0.0', () => {
     Log.ready(`System operational on port ${PORT}`);

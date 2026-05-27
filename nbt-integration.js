@@ -173,6 +173,65 @@ incomingRouter.get('/test', (req, res) => {
 
 
 
+const driveService = require('./google-drive-service');
+
+const downloadAndSaveResumeToDrive = async (resumeUrl, candidateName) => {
+  if (!resumeUrl || typeof resumeUrl !== 'string' || !resumeUrl.startsWith('http')) {
+    return resumeUrl;
+  }
+  
+  // If it's already a Google Drive link, no need to download
+  if (resumeUrl.includes('drive.google.com')) {
+    return resumeUrl;
+  }
+
+  try {
+    console.log(`[DRIVE SYNC] Attempting to download candidate resume from URL: ${resumeUrl}`);
+    const downloadFileFromUrl = (url) => {
+      return new Promise((resolve, reject) => {
+        const protocol = url.startsWith('https') ? require('https') : require('http');
+        protocol.get(url, (response) => {
+          if (response.statusCode === 301 || response.statusCode === 302) {
+            const redirectUrl = response.headers.location;
+            if (redirectUrl) {
+              downloadFileFromUrl(redirectUrl).then(resolve).catch(reject);
+              return;
+            }
+          }
+          if (response.statusCode !== 200) {
+            reject(new Error(`Failed to download resume, status code: ${response.statusCode}`));
+            return;
+          }
+          const chunks = [];
+          response.on('data', (chunk) => chunks.push(chunk));
+          response.on('end', () => resolve(Buffer.concat(chunks)));
+        }).on('error', reject);
+      });
+    };
+
+    const bufferData = await downloadFileFromUrl(resumeUrl);
+    
+    let filename = 'resume.pdf';
+    const urlParts = resumeUrl.split('?')[0].split('/');
+    const lastPart = urlParts[urlParts.length - 1];
+    if (lastPart && lastPart.toLowerCase().endsWith('.pdf')) {
+      filename = lastPart;
+    } else {
+      filename = `${(candidateName || 'Candidate').replace(/\s+/g, '_')}_Resume.pdf`;
+    }
+
+    console.log(`[DRIVE SYNC] Uploading downloaded file to Google Drive: ${filename}`);
+    const driveUrl = await driveService.uploadFileToDrive(bufferData, Date.now() + '-' + filename.replace(/\s+/g, '-'), 'application/pdf');
+    if (driveUrl) {
+      console.log(`[DRIVE SYNC] Resume successfully saved to Drive: ${driveUrl}`);
+      return driveUrl;
+    }
+  } catch (err) {
+    console.error(`[DRIVE SYNC ERROR] Failed to download or save resume to Drive:`, err.message);
+  }
+  return resumeUrl; // Fallback to original URL
+};
+
 // ── 2A. Receive new application from careers website ─────────────────
 incomingRouter.post('/application', async (req, res) => {
   try {
@@ -211,6 +270,9 @@ incomingRouter.post('/application', async (req, res) => {
 
     console.log(`📩 New application received: ${candidateName} → ${jobTitle} (ATS ID: ${atsJobId})`);
 
+    // Proactively download the resume from the external website's server and upload to Google Drive
+    const finalResumeUrl = await downloadAndSaveResumeToDrive(resumeUrl, candidateName);
+
     // ──────────────────────────────────────────────────────────────
     const { sql, getPool } = require('./db');
     const pool = await getPool();
@@ -235,7 +297,7 @@ incomingRouter.post('/application', async (req, res) => {
       .input('title', sql.NVarChar, jobTitle || 'General Application')
       .input('jobId', sql.Int, sanitizedJobId)
       .input('webAppId', sql.NVarChar, websiteApplicationId || null)
-      .input('resume', sql.NVarChar, resumeUrl || '')
+      .input('resume', sql.NVarChar, finalResumeUrl || '')
       .input('cover', sql.NVarChar, coverLetter || '')
       .input('applied', sql.DateTime, finalAppliedAt)
       .input('loc', sql.NVarChar, location || '')
@@ -293,6 +355,9 @@ async function syncApplications() {
         let finalAppliedAt = app.submittedAt ? new Date(app.submittedAt) : new Date();
         if (isNaN(finalAppliedAt.getTime())) finalAppliedAt = new Date();
 
+        // Proactively download the resume from the external website and upload to Google Drive
+        const finalResumeUrl = await downloadAndSaveResumeToDrive(app.resumeUrl, app.candidate?.name);
+
         await pool.request()
           .input('name', sql.NVarChar, app.candidate?.name || 'Unknown')
           .input('email', sql.NVarChar, app.candidate?.email || 'no-email@provided.com')
@@ -300,7 +365,7 @@ async function syncApplications() {
           .input('title', sql.NVarChar, app.job?.title || 'General Application')
           .input('jobId', sql.Int, sanitizedJobId)
           .input('webAppId', sql.NVarChar, app.id)
-          .input('resume', sql.NVarChar, app.resumeUrl || '')
+          .input('resume', sql.NVarChar, finalResumeUrl || '')
           .input('cover', sql.NVarChar, app.coverLetter || '')
           .input('applied', sql.DateTime, finalAppliedAt)
           .input('loc', sql.NVarChar, app.location || '')
