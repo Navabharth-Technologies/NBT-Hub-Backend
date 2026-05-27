@@ -13244,7 +13244,12 @@ app.get(['/api/fun-quizzes/leaderboard', '/api/quizzes/leaderboard/daily'], veri
 /**
  * 46.5 Get My Quiz Completion History
  */
-app.get(['/api/quizzes/completions', '/api/quizzes/completions/my'], verifyToken, async (req, res) => {
+app.get([
+  '/api/quizzes/completions', 
+  '/api/quizzes/completions/my', 
+  '/api/quizzes/my-completions', 
+  '/api/quizzes/my_completions'
+], verifyToken, async (req, res) => {
   const userId = req.user.id;
   try {
     const pool = await getPool();
