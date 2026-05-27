@@ -5475,6 +5475,122 @@ app.get(['/api/admin/tasks/team-status', '/api/tasks/team-status'], verifyToken,
   }
 });
 
+// 12.10 GET Running Tasks for Admin (Grouped by Team and including flat tasks list)
+app.get('/api/admin/tasks/running', verifyToken, async (req, res) => {
+  if (!isHRRole(req.user.role)) {
+    return res.status(403).json({ error: 'Access denied. Admin privileges required.' });
+  }
+
+  try {
+    let pool = await getPool();
+    if (!pool || typeof pool.request !== 'function') {
+      return res.status(503).json({ error: 'Database is currently offline' });
+    }
+
+    const result = await pool.request().query(`
+      SELECT 
+        at.id, 
+        at.title as task_name,
+        at.description,
+        at.status, 
+        at.progress, 
+        at.deadline,
+        at.created_at,
+        at.updated_at,
+        COALESCE(u_owner.name, 'System/Admin') as assigner_name,
+        COALESCE(u_assignee.name, j_assignee.name, 'Unassigned') as assignee_name,
+        ISNULL(COALESCE(u_assignee.team, CASE WHEN j_assignee.id IS NOT NULL THEN 'New Joinee' ELSE NULL END), 'No Team') as assignee_team,
+        COALESCE(u_assignee.role, j_assignee.role, 'Employee') as assignee_role
+      FROM master_tasks at WITH (NOLOCK)
+      LEFT JOIN users u_owner WITH (NOLOCK) ON at.owner_id = u_owner.id
+      LEFT JOIN users u_assignee WITH (NOLOCK) ON at.assignee_id = u_assignee.id
+      LEFT JOIN new_joinees j_assignee WITH (NOLOCK) ON at.assignee_id = j_assignee.id
+      WHERE at.type = 'TASK' 
+        AND (at.status IS NULL OR at.status NOT IN ('Completed', 'Verified'))
+        AND (at.progress IS NULL OR at.progress < 100)
+      ORDER BY assignee_team ASC, at.created_at DESC
+    `);
+
+    const grouped = {};
+    result.recordset.forEach(task => {
+      const team = task.assignee_team || 'No Team';
+      if (!grouped[team]) {
+        grouped[team] = [];
+      }
+      grouped[team].push(task);
+    });
+
+    res.json({
+      success: true,
+      total_tasks: result.recordset.length,
+      teams_count: Object.keys(grouped).length,
+      data: grouped,
+      tasks: result.recordset
+    });
+  } catch (err) {
+    console.error('❌ SQL ERROR in admin/tasks/running:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 12.11 GET Completed Tasks for Admin (Grouped by Team and including flat tasks list)
+app.get('/api/admin/tasks/completed', verifyToken, async (req, res) => {
+  if (!isHRRole(req.user.role)) {
+    return res.status(403).json({ error: 'Access denied. Admin privileges required.' });
+  }
+
+  try {
+    let pool = await getPool();
+    if (!pool || typeof pool.request !== 'function') {
+      return res.status(503).json({ error: 'Database is currently offline' });
+    }
+
+    const result = await pool.request().query(`
+      SELECT 
+        at.id, 
+        at.title as task_name,
+        at.description,
+        at.status, 
+        at.progress, 
+        at.deadline,
+        at.created_at,
+        at.updated_at,
+        COALESCE(u_owner.name, 'System/Admin') as assigner_name,
+        COALESCE(u_assignee.name, j_assignee.name, 'Unassigned') as assignee_name,
+        ISNULL(COALESCE(u_assignee.team, CASE WHEN j_assignee.id IS NOT NULL THEN 'New Joinee' ELSE NULL END), 'No Team') as assignee_team,
+        COALESCE(u_assignee.role, j_assignee.role, 'Employee') as assignee_role
+      FROM master_tasks at WITH (NOLOCK)
+      LEFT JOIN users u_owner WITH (NOLOCK) ON at.owner_id = u_owner.id
+      LEFT JOIN users u_assignee WITH (NOLOCK) ON at.assignee_id = u_assignee.id
+      LEFT JOIN new_joinees j_assignee WITH (NOLOCK) ON at.assignee_id = j_assignee.id
+      WHERE at.type = 'TASK' 
+        AND (at.status IN ('Completed', 'Verified') OR at.progress = 100)
+      ORDER BY assignee_team ASC, at.created_at DESC
+    `);
+
+    const grouped = {};
+    result.recordset.forEach(task => {
+      const team = task.assignee_team || 'No Team';
+      if (!grouped[team]) {
+        grouped[team] = [];
+      }
+      grouped[team].push(task);
+    });
+
+    res.json({
+      success: true,
+      total_tasks: result.recordset.length,
+      teams_count: Object.keys(grouped).length,
+      data: grouped,
+      tasks: result.recordset
+    });
+  } catch (err) {
+    console.error('❌ SQL ERROR in admin/tasks/completed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
 // 13. Get ALL Assigned Tasks (Global Management View)
 app.get('/api/tasks/all-assigned', async (req, res) => {
   // Disable caching to prevent browser-side ERR_CACHE_WRITE_FAILURE (common with large task payloads)
