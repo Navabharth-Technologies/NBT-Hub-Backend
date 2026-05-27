@@ -1594,7 +1594,15 @@ app.post(['/api/password/verify-otp', '/api/auth/verify-otp'], async (req, res) 
   if (!email || !otp) return res.status(400).json({ error: 'Email and OTP required' });
 
   const record = otps.get(email);
-  if (!record || record.otp !== otp || Date.now() > record.expires) {
+  if (!record || Date.now() > record.expires) {
+    return res.status(400).json({ error: 'Invalid or expired OTP' });
+  }
+
+  const correctOtp = String(record.otp).trim();
+  const submittedOtp = String(otp).trim();
+
+  if (correctOtp !== submittedOtp) {
+    Log.error('Auth', `Failed OTP verification attempt for ${email}. Submitted: "${submittedOtp}", Expected: "${correctOtp}"`);
     return res.status(400).json({ error: 'Invalid or expired OTP' });
   }
 
@@ -1609,9 +1617,18 @@ app.post(['/api/password/reset-with-otp', '/api/auth/reset-with-otp'], async (re
   if (!email || !otp || !newPassword) return res.status(400).json({ error: 'All fields are required' });
 
   const record = otps.get(email);
-  if (!record || record.otp !== otp || Date.now() > record.expires) {
+  if (!record || Date.now() > record.expires) {
     return res.status(400).json({ error: 'Invalid or expired OTP' });
   }
+
+  const correctOtp = String(record.otp).trim();
+  const submittedOtp = String(otp).trim();
+
+  if (correctOtp !== submittedOtp) {
+    Log.error('Auth', `Failed password reset attempt (invalid OTP) for ${email}`);
+    return res.status(400).json({ error: 'Invalid or expired OTP' });
+  }
+
 
   try {
     const pool = await getPool();
