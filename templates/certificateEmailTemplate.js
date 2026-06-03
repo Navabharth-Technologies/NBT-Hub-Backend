@@ -94,7 +94,7 @@ const generateCertificateImage = async (userName, courseName) => {
   };
 
   // 1. Draw Employee Name (Capitalized, Stylish Font, Custom Color, with auto-fit logic for long names)
-  const baseFontSize = 115;
+  const baseFontSize = 85;
   let fontSize = baseFontSize;
   ctx.font = `italic bold ${fontSize}px "Georgia", "Times New Roman", serif`;
   ctx.fillStyle = '#000000ff';
@@ -105,10 +105,10 @@ const generateCertificateImage = async (userName, courseName) => {
   const nameToDraw = formatNameWithInitials(userName).toUpperCase();
 
   while (ctx.measureText(nameToDraw).width > maxNameWidth && fontSize > 40) {
-    fontSize -= 5;
+    fontSize -= 4;
     ctx.font = `italic bold ${fontSize}px "Georgia", "Times New Roman", serif`;
   }
-  ctx.fillText(nameToDraw, image.width / 2, 725);
+  ctx.fillText(nameToDraw, image.width / 2, 705);
 
   // 2. Draw Course Name (Clean, Professional Serif Font, with auto-fit logic for long course titles)
   const baseCourseFontSize = 50;

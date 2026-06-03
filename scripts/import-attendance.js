@@ -122,7 +122,25 @@ async function importAttendance() {
                     if (!isMissing(log.INTime) && isMissing(log.OUTTime)) {
                         // User has punched in but not out
                         if (isToday) {
-                            finalStatus = log.INTime > '10:15' ? 'Half Day' : 'In Office';
+                            let completedShift = false;
+                            try {
+                                const now = new Date();
+                                const ist = new Date(now.getTime() + (330 * 60 * 1000));
+                                const [inH, inM] = log.INTime.split(':').map(Number);
+                                const curH = ist.getUTCHours();
+                                const curM = ist.getUTCMinutes();
+                                let elapsedMins = (curH * 60 + curM) - (inH * 60 + inM);
+                                if (elapsedMins < 0) elapsedMins += 1440;
+                                if (elapsedMins >= 480) { // 8 hours
+                                    completedShift = true;
+                                }
+                            } catch (e) {}
+
+                            if (completedShift) {
+                                finalStatus = 'P';
+                            } else {
+                                finalStatus = log.INTime > '10:15' ? 'Half Day' : 'In Office';
+                            }
                         } else {
                             // If it was a past day and they never punched out, it's Absent
                             finalStatus = 'A';

@@ -11,7 +11,7 @@ const crypto = require('crypto');
 // ─────────────────────────────────────────────────────────────────────
 // CONFIGURATION — set these as env variables in YOUR HR tool
 // ─────────────────────────────────────────────────────────────────────
-const CAREERS_BACKEND = 'https://company-website-backend-91ia.onrender.com';
+const CAREERS_BACKEND = 'https://navabharathtechnologies-website-backend.onrender.com';
 const ADMIN_API_KEY = process.env.NBT_ADMIN_KEY || '3bec00ca0c3b71053899c9de96085aaba8124dba7fd1efa903b47e23be80a746';
 const WEBHOOK_SECRET = process.env.NBT_WEBHOOK_SECRET; // Must match ATS_WEBHOOK_SECRET on Render
 
@@ -185,12 +185,18 @@ const downloadAndSaveResumeToDrive = async (resumeUrl, candidateName) => {
     return resumeUrl;
   }
 
+  // Rewrite legacy Render domain to the new migrated Render domain
+  let targetUrl = resumeUrl;
+  if (resumeUrl.includes('company-website-backend-91ia.onrender.com')) {
+    targetUrl = resumeUrl.replace('company-website-backend-91ia.onrender.com', 'navabharathtechnologies-website-backend.onrender.com');
+  }
+
   try {
-    console.log(`[DRIVE SYNC] Attempting to download candidate resume from URL: ${resumeUrl}`);
+    console.log(`[DRIVE SYNC] Attempting to download candidate resume from URL: ${targetUrl}`);
     const downloadFileFromUrl = (url) => {
       return new Promise((resolve, reject) => {
         const protocol = url.startsWith('https') ? require('https') : require('http');
-        protocol.get(url, (response) => {
+        const req = protocol.get(url, (response) => {
           if (response.statusCode === 301 || response.statusCode === 302) {
             const redirectUrl = response.headers.location;
             if (redirectUrl) {
@@ -205,14 +211,23 @@ const downloadAndSaveResumeToDrive = async (resumeUrl, candidateName) => {
           const chunks = [];
           response.on('data', (chunk) => chunks.push(chunk));
           response.on('end', () => resolve(Buffer.concat(chunks)));
-        }).on('error', reject);
+        });
+
+        req.on('error', reject);
+        // Timeout covers both connection-level and response-level hangs
+        req.setTimeout(5000, () => { req.destroy(); reject(new Error('Request timeout (5s)')); });
       });
     };
 
-    const bufferData = await downloadFileFromUrl(resumeUrl);
+    // Wrap with a hard deadline using Promise.race to kill socket-level hangs
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('Hard timeout (8s) — host unreachable')), 8000)
+    );
+
+    const bufferData = await Promise.race([downloadFileFromUrl(targetUrl), timeoutPromise]);
     
     let filename = 'resume.pdf';
-    const urlParts = resumeUrl.split('?')[0].split('/');
+    const urlParts = targetUrl.split('?')[0].split('/');
     const lastPart = urlParts[urlParts.length - 1];
     if (lastPart && lastPart.toLowerCase().endsWith('.pdf')) {
       filename = lastPart;
@@ -229,7 +244,7 @@ const downloadAndSaveResumeToDrive = async (resumeUrl, candidateName) => {
   } catch (err) {
     console.error(`[DRIVE SYNC ERROR] Failed to download or save resume to Drive:`, err.message);
   }
-  return resumeUrl; // Fallback to original URL
+  return targetUrl; // Fallback to the target URL (rewritten or original)
 };
 
 // ── 2A. Receive new application from careers website ─────────────────
@@ -327,11 +342,12 @@ async function syncApplications() {
     const pool = await getPool();
 
     console.log(`[SYNC] Querying external Careers website at ${CAREERS_BACKEND}/api/admin/applications...`);
+    const fetchController = new AbortController();
+    const fetchTimeout = setTimeout(() => fetchController.abort(), 15000);
     const resWeb = await fetch(`${CAREERS_BACKEND}/api/admin/applications`, {
-      headers: {
-        'x-admin-key': ADMIN_API_KEY
-      }
-    });
+      headers: { 'x-admin-key': ADMIN_API_KEY },
+      signal: fetchController.signal,
+    }).finally(() => clearTimeout(fetchTimeout));
 
     if (!resWeb.ok) {
       throw new Error(`External API responded with status ${resWeb.status}`);

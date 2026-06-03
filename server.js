@@ -426,8 +426,8 @@ const normalizeResumeUrl = (url, req = null) => {
     }
   }
 
-  // If it's an old Render link, rewrite to our local uploads proxy route
-  if (val.includes('company-website-backend-91ia.onrender.com/uploads/')) {
+  // If it's a Render link, rewrite to our local uploads proxy route
+  if (val.includes('company-website-backend-91ia.onrender.com/uploads/') || val.includes('navabharathtechnologies-website-backend.onrender.com/uploads/')) {
     const parts = val.split('/uploads/');
     if (parts.length > 1) {
       return `/uploads/${parts[1]}`;
@@ -1187,6 +1187,7 @@ app.get('/api/job-applications', verifyToken, async (req, res) => {
         jl.job_type as official_job_type
       FROM job_applications ja
       LEFT JOIN job_postings jl ON ja.internal_job_id = jl.id
+      WHERE ja.is_deleted = 0 OR ja.is_deleted IS NULL
       ORDER BY ja.applied_at DESC
     `);
 
@@ -1266,6 +1267,32 @@ app.put('/api/job-applications/:id', verifyToken, async (req, res) => {
   } catch (err) {
     Log.error('Job Applications', 'Failed to update status', err.message);
     res.status(500).json({ error: 'Failed to update application status' });
+  }
+});
+
+// DELETE: Soft delete a job application
+app.delete('/api/job-applications/:id', verifyToken, async (req, res) => {
+  const { id } = req.params;
+  const isAuthorized = isHRRole(req.user.role);
+
+  if (!isAuthorized) {
+    return res.status(403).json({ error: 'Unauthorized: Only HR/Admin can delete job applications.' });
+  }
+
+  try {
+    const pool = await getPool();
+    const result = await pool.request()
+      .input('id', sql.Int, id)
+      .query('UPDATE job_applications SET is_deleted = 1, updated_at = DATEADD(MINUTE, 330, GETUTCDATE()) WHERE id = @id');
+
+    if (result.rowsAffected[0] === 0) {
+      return res.status(404).json({ error: 'Job application not found' });
+    }
+
+    res.json({ success: true, message: 'Job application soft deleted successfully' });
+  } catch (err) {
+    Log.error('Job Applications Delete', 'Failed to delete application', err.message);
+    res.status(500).json({ error: 'Failed to delete job application' });
   }
 });
 
@@ -1612,7 +1639,7 @@ app.post(['/api/password/verify-otp', '/api/auth/verify-otp'], async (req, res) 
 /**
  * 2.E Reset Password with OTP
  */
-app.post(['/api/password/reset-with-otp', '/api/auth/reset-with-otp'], async (req, res) => {
+app.post(['/api/password/reset-with-otp', '/api/auth/reset-with-otp', '/api/auth/reset-password', '/api/password/reset-password'], async (req, res) => {
   const { email, otp, newPassword } = req.body;
   if (!email || !otp || !newPassword) return res.status(400).json({ error: 'All fields are required' });
 
@@ -3374,6 +3401,31 @@ app.post(['/api/leaves', '/api/leave'], verifyToken, async (req, res) => {
 
     console.log(`[LEAVE POST SUCCESS] Leave ID ${insertResult.recordset[0].id} generated for User ${userId}`);
 
+    // 3. Automated Notifications (Reporting Manager + Project Manager + HR/Admin/CEO by default)
+    try {
+      const authResult = await pool.request().query(`
+        SELECT id FROM users 
+        WHERE role LIKE '%HR%' 
+           OR role LIKE '%Human Resource%' 
+           OR role LIKE '%CEO%' 
+           OR role LIKE '%Founder%' 
+           OR role LIKE '%Admin%'
+           OR role LIKE '%Super%'
+      `);
+      const ccIds = authResult.recordset.map(u => u.id);
+
+      const allNotifierIds = Array.from(new Set([reporting_manager_id, project_manager_id, ...ccIds])).filter(id => id && id !== userId);
+
+      for (const notifierId of allNotifierIds) {
+        await pool.request()
+          .input('targetId', sql.Int, notifierId)
+          .input('msg', sql.NVarChar, `New Leave Request from ${name} (${leave_type}): ${start_date} to ${end_date}`)
+          .query('INSERT INTO notifications (target_user_id, message, is_read, created_at) VALUES (@targetId, @msg, 0, DATEADD(MINUTE, 330, GETUTCDATE()))');
+      }
+    } catch (notifErr) {
+      console.error('[LEAVE NOTIFICATION WARNING]:', notifErr.message);
+    }
+
     res.status(201).json({
       success: true,
       message: 'Leave request submitted to management matrix successfully!',
@@ -3522,7 +3574,23 @@ app.get(['/api/attendance', '/api/attendance ', '/api/attendance%20'], verifyTok
 
       if (!isMissing(apiLog.INTime) && isMissing(apiLog.OUTTime)) {
         if (isToday) {
-          finalStatus = 'In Office';
+          let completedShift = false;
+          try {
+            const [inH, inM] = apiLog.INTime.split(':').map(Number);
+            const curH = istTime.getUTCHours();
+            const curM = istTime.getUTCMinutes();
+            let elapsedMins = (curH * 60 + curM) - (inH * 60 + inM);
+            if (elapsedMins < 0) elapsedMins += 1440;
+            if (elapsedMins >= 480) { // 8 hours
+              completedShift = true;
+            }
+          } catch (e) { }
+
+          if (completedShift) {
+            finalStatus = 'P';
+          } else {
+            finalStatus = 'In Office';
+          }
         } else {
           finalStatus = 'A';
         }
@@ -3581,6 +3649,7 @@ app.get(['/api/attendance', '/api/attendance ', '/api/attendance%20'], verifyTok
     }
 
     const cleanTime = (t) => (!t || t === '--:--' || t === '00:00' || String(t).trim() === '') ? null : t;
+    const mappedStatus = finalStatus === 'P' ? 'Present' : (finalStatus === 'A' ? 'Absent' : finalStatus);
     res.json({
       success: true,
       date: formattedDate,
@@ -3589,7 +3658,7 @@ app.get(['/api/attendance', '/api/attendance ', '/api/attendance%20'], verifyTok
         inTime: cleanTime(apiLog.INTime),
         outTime: cleanTime(apiLog.OUTTime),
         workTime: cleanTime(manualWorkTime),
-        status: finalStatus,
+        status: mappedStatus,
         remark: finalRemark
       } : null
     });
@@ -3611,6 +3680,7 @@ app.get(['/api/attendance', '/api/attendance ', '/api/attendance%20'], verifyTok
       if (cachedRes.recordset.length > 0) {
         const cachedLog = cachedRes.recordset[0];
         const cleanTime = (t) => (!t || t === '--:--' || t === '00:00' || String(t).trim() === '') ? null : t;
+        const mappedStatus = cachedLog.status === 'P' ? 'Present' : (cachedLog.status === 'A' ? 'Absent' : cachedLog.status);
         return res.json({
           success: true,
           cached: true,
@@ -3618,7 +3688,7 @@ app.get(['/api/attendance', '/api/attendance ', '/api/attendance%20'], verifyTok
             inTime: cleanTime(cachedLog.inTime),
             outTime: cleanTime(cachedLog.outTime),
             workTime: cleanTime(cachedLog.workTime),
-            status: cachedLog.status,
+            status: mappedStatus,
             remark: cachedLog.remark
           }
         });
@@ -3722,6 +3792,9 @@ app.get(['/api/attendance_logs', '/api/attendance logs', '/api/attendance%20logs
       const workT = cleanTime(log.work_time);
       const empCodeStr = log.user_id ? log.user_id.toString() : '';
 
+      const rawStatus = String(log.status || 'A').trim().toUpperCase();
+      const mappedStatus = rawStatus === 'P' || rawStatus === 'PRESENT' ? 'Present' : (rawStatus === 'A' || rawStatus === 'ABSENT' ? 'Absent' : log.status);
+
       return {
         id: log.id,
         user_id: log.user_id,
@@ -3731,7 +3804,7 @@ app.get(['/api/attendance_logs', '/api/attendance logs', '/api/attendance%20logs
         in_time: inT,
         out_time: outT,
         work_time: workT,
-        status: log.status,
+        status: mappedStatus,
         remark: log.remark,
         // Legacy Support
         Empcode: empCodeStr,
@@ -3740,7 +3813,7 @@ app.get(['/api/attendance_logs', '/api/attendance logs', '/api/attendance%20logs
         INTime: inT,
         OUTTime: outT,
         WorkTime: workT,
-        Status: log.status || 'A',
+        Status: mappedStatus,
         Remark: log.remark || '--'
       };
     }).filter(x => x !== null);
@@ -4016,7 +4089,8 @@ app.post('/api/attendance_logs/punch', verifyToken, async (req, res) => {
           `);
       }
 
-      return res.json({ success: true, action: 'PUNCH_IN', time: currentTimeString, status: determinedStatus, message: 'Punched In successfully via Web Application.' });
+      const mappedInStatus = determinedStatus === 'P' ? 'Present' : (determinedStatus === 'A' ? 'Absent' : determinedStatus);
+      return res.json({ success: true, action: 'PUNCH_IN', time: currentTimeString, status: mappedInStatus, message: 'Punched In successfully via Web Application.' });
     } else {
       // RECORD FOUND AND HAS IN_TIME: THIS IS A PUNCH OUT (or an overwrite punch out)
       const inTimeStr = existing.in_time;
@@ -4067,7 +4141,8 @@ app.post('/api/attendance_logs/punch', verifyToken, async (req, res) => {
           WHERE user_id = @userId AND punch_date = @punchDate
         `);
 
-      return res.json({ success: true, action: 'PUNCH_OUT', time: currentTimeString, workTime: workTimeStr, status: status, message: 'Punched Out successfully via Web Application.' });
+      const mappedOutStatus = status === 'P' ? 'Present' : (status === 'A' ? 'Absent' : status);
+      return res.json({ success: true, action: 'PUNCH_OUT', time: currentTimeString, workTime: workTimeStr, status: mappedOutStatus, message: 'Punched Out successfully via Web Application.' });
     }
   } catch (err) {
     console.error('[MANUAL PUNCH ERROR]:', err.message);
@@ -4143,20 +4218,25 @@ app.get('/api/manager/attendance', verifyToken, async (req, res) => {
       cached: true,
       date: date || istDateOnly,
       count: result.recordset.length,
-      data: result.recordset.map(log => ({
-        ...log,
-        empCode: log.Empcode,
-        name: log.Name,
-        punchDate: log.PunchDate,
-        inTime: cleanTime(log.INTime),
-        outTime: cleanTime(log.OUTTime),
-        workTime: cleanTime(log.WorkTime),
-        INTime: cleanTime(log.INTime),
-        OUTTime: cleanTime(log.OUTTime),
-        WorkTime: cleanTime(log.WorkTime),
-        status: log.Status,
-        remark: log.Remark
-      }))
+      data: result.recordset.map(log => {
+        const rawStatus = String(log.Status || 'A').trim().toUpperCase();
+        const mappedStatus = rawStatus === 'P' || rawStatus === 'PRESENT' ? 'Present' : (rawStatus === 'A' || rawStatus === 'ABSENT' ? 'Absent' : log.Status);
+        return {
+          ...log,
+          empCode: log.Empcode,
+          name: log.Name,
+          punchDate: log.PunchDate,
+          inTime: cleanTime(log.INTime),
+          outTime: cleanTime(log.OUTTime),
+          workTime: cleanTime(log.WorkTime),
+          INTime: cleanTime(log.INTime),
+          OUTTime: cleanTime(log.OUTTime),
+          WorkTime: cleanTime(log.WorkTime),
+          status: mappedStatus,
+          Status: mappedStatus,
+          remark: log.Remark
+        };
+      })
     });
 
   } catch (err) {
@@ -4835,13 +4915,7 @@ const fetchBirthdaysAsJSON = async (req, res) => {
       ORDER BY daysUntil ASC
     `);
 
-    const normalizeImage = (img) => {
-      if (!img) return null;
-      if (typeof img !== 'string') return img;
-      if (img.startsWith('data:') || img.startsWith('http') || img.startsWith('/')) return img;
-      if (img.startsWith('GgoAAAANSUhEUg')) return `data:image/png;base64,iVBORw0KGgo${img}`;
-      return `data:image/png;base64,${img}`;
-    };
+
 
     const today = new Date();
     today.setHours(0, 0, 0, 0);
@@ -5377,6 +5451,260 @@ const deleteTeamHandler = async (req, res) => {
 app.delete(['/api/admin/teams/delete', '/api/admin/teams/:teamName'], verifyToken, deleteTeamHandler);
 app.post('/api/admin/teams/delete', verifyToken, deleteTeamHandler);
 
+// Helper: Check for duplicate notification sent within the last 5 seconds
+const isDuplicateNotification = async (pool, targetUserId, message) => {
+  try {
+    const checkQuery = await pool.request()
+      .input('targetUserId', sql.Int, targetUserId)
+      .input('message', sql.NVarChar, message)
+      .query(`
+        SELECT COUNT(*) as count 
+        FROM notifications WITH (NOLOCK)
+        WHERE target_user_id = @targetUserId 
+          AND message = @message 
+          AND created_at >= DATEADD(SECOND, -5, DATEADD(MINUTE, 330, GETUTCDATE()))
+      `);
+    return checkQuery.recordset[0].count > 0;
+  } catch (err) {
+    console.error('[DEDUPLICATION CHECK ERROR]:', err);
+    return false;
+  }
+};
+
+// Helper: Notify team on Task Assignment
+const notifyTaskAssignment = async (pool, assignerId, assigneeId, taskName) => {
+  try {
+    const parsedAssignerId = parseInt(assignerId);
+    const parsedAssigneeId = parseInt(assigneeId);
+
+    console.log(`[NOTIFICATION DEBUG] notifyTaskAssignment called for assignerId: ${parsedAssignerId}, assigneeId: ${parsedAssigneeId}, taskName: ${taskName}`);
+
+    const userQuery = await pool.request()
+      .input('assignerId', sql.Int, parsedAssignerId)
+      .input('assigneeId', sql.Int, parsedAssigneeId)
+      .query(`
+        SELECT 
+          COALESCE(
+            (SELECT name FROM users WITH (NOLOCK) WHERE id = @assignerId),
+            (SELECT name FROM new_joinees WITH (NOLOCK) WHERE id = @assignerId)
+          ) as assignerName,
+          COALESCE(
+            (SELECT role FROM users WITH (NOLOCK) WHERE id = @assignerId),
+            (SELECT role FROM new_joinees WITH (NOLOCK) WHERE id = @assignerId)
+          ) as assignerRole,
+          COALESCE(
+            (SELECT name FROM users WITH (NOLOCK) WHERE id = @assigneeId),
+            (SELECT name FROM new_joinees WITH (NOLOCK) WHERE id = @assigneeId)
+          ) as assigneeName,
+          COALESCE(
+            (SELECT team FROM users WITH (NOLOCK) WHERE id = @assigneeId),
+            'New Joinee'
+          ) as assigneeTeam
+      `);
+
+    if (userQuery.recordset.length === 0) return;
+    const { assignerName, assignerRole, assigneeName, assigneeTeam } = userQuery.recordset[0];
+
+    // Check if the assigner is a manager/lead/CEO/founder/admin
+    const isManager = assignerRole && (
+      assignerRole.toLowerCase().includes('manager') ||
+      assignerRole.toLowerCase().includes('lead') ||
+      assignerRole.toLowerCase().includes('founder') ||
+      assignerRole.toLowerCase().includes('ceo') ||
+      assignerRole.toLowerCase().includes('admin') ||
+      assignerRole.toLowerCase().includes('hr') ||
+      assignerRole.toLowerCase().includes('director') ||
+      assignerRole.toLowerCase().includes('president')
+    );
+
+    if (!isManager) {
+      console.log(`[NOTIFICATION SKIP] Task assigned by non-manager: ${assignerName} (${assignerRole})`);
+      return;
+    }
+
+    const recipientIds = new Set();
+    if (assigneeTeam && assigneeTeam !== 'New Joinee') {
+      const teamMembersQuery = await pool.request()
+        .input('teamName', sql.NVarChar, assigneeTeam)
+        .query('SELECT id FROM users WITH (NOLOCK) WHERE team = @teamName');
+      for (const row of teamMembersQuery.recordset) {
+        recipientIds.add(row.id);
+      }
+    }
+
+    // Remove assignee from team recipients to handle separately
+    recipientIds.delete(parsedAssigneeId);
+
+    // Also remove the assigner/manager so they don't receive notification about their own action
+    recipientIds.delete(parsedAssignerId);
+
+    // 1. Notify Assignee: "Task assigned to you: [Task Name] by [Manager Name]"
+    const assigneeAlert = `Task assigned to you: ${taskName} by ${assignerName || 'Manager'}`;
+    const assigneeDup = await isDuplicateNotification(pool, parsedAssigneeId, assigneeAlert);
+    if (!assigneeDup) {
+      await pool.request()
+        .input('assigneeId', sql.Int, parsedAssigneeId)
+        .input('msg', sql.NVarChar, assigneeAlert)
+        .query("INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@assigneeId, @msg, 'TASK', 0, DATEADD(MINUTE, 330, GETUTCDATE()))");
+    }
+
+    // 2. Notify other team members
+    if (recipientIds.size > 0) {
+      const alertMessage = `Task assigned to ${assigneeName || 'Employee'}: ${taskName} by ${assignerName || 'Manager'}`;
+      const filteredRecipients = [];
+      for (const rid of recipientIds) {
+        const isDup = await isDuplicateNotification(pool, rid, alertMessage);
+        if (!isDup) filteredRecipients.push(rid);
+      }
+      if (filteredRecipients.length > 0) {
+        const valuesClauses = filteredRecipients.map((_, i) => `(@uid${i}, @msg, 'TASK', 0, DATEADD(MINUTE, 330, GETUTCDATE()))`);
+        const batchRequest = pool.request().input('msg', sql.NVarChar, alertMessage);
+        filteredRecipients.forEach((rid, i) => batchRequest.input(`uid${i}`, sql.Int, rid));
+        await batchRequest.query(`INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES ${valuesClauses.join(', ')}`);
+        console.log(`[NOTIFICATION] Task assignment notification sent to team ${assigneeTeam || 'None'} (${filteredRecipients.length} recipients)`);
+      }
+    }
+  } catch (err) {
+    console.error('[NOTIFICATION ASSIGNMENT ERROR]:', err);
+  }
+};
+
+// Helper: Notify manager on Task Completion
+const notifyTaskCompletion = async (pool, taskId) => {
+  try {
+    const parsedTaskId = parseInt(taskId);
+    console.log(`[NOTIFICATION DEBUG] notifyTaskCompletion called for taskId: ${parsedTaskId}`);
+
+    const taskQuery = await pool.request()
+      .input('taskId', sql.Int, parsedTaskId)
+      .query(`
+        SELECT 
+          t.title as taskName,
+          t.owner_id as assignerId,
+          t.assignee_id as assigneeId,
+          COALESCE(u_assignee.name, j_assignee.name) as assigneeName,
+          COALESCE(u_assignee.reporting_manager_id, j_assignee.hired_by) as reportingManagerId
+        FROM master_tasks t WITH (NOLOCK)
+        LEFT JOIN users u_assignee WITH (NOLOCK) ON t.assignee_id = u_assignee.id
+        LEFT JOIN new_joinees j_assignee WITH (NOLOCK) ON t.assignee_id = j_assignee.id
+        WHERE t.id = @taskId
+      `);
+
+    if (taskQuery.recordset.length === 0) return;
+    const { taskName, assignerId, assigneeName, reportingManagerId } = taskQuery.recordset[0];
+
+    const managersToNotify = new Set();
+    if (assignerId) managersToNotify.add(assignerId);
+    if (reportingManagerId) managersToNotify.add(reportingManagerId);
+
+    if (managersToNotify.size > 0) {
+      const alertMessage = `Task has been completed: ${taskName} (Completed by ${assigneeName || 'Employee'})`;
+      const filteredManagers = [];
+      for (const rid of managersToNotify) {
+        const isDup = await isDuplicateNotification(pool, rid, alertMessage);
+        if (!isDup) filteredManagers.push(rid);
+      }
+      if (filteredManagers.length > 0) {
+        const valuesClauses = filteredManagers.map((_, i) => `(@uid${i}, @msg, 'TASK', 0, DATEADD(MINUTE, 330, GETUTCDATE()))`);
+        const batchRequest = pool.request().input('msg', sql.NVarChar, alertMessage);
+        filteredManagers.forEach((rid, i) => batchRequest.input(`uid${i}`, sql.Int, rid));
+        await batchRequest.query(`INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES ${valuesClauses.join(', ')}`);
+        console.log(`[NOTIFICATION] Task completion notification sent to manager(s) for task ${parsedTaskId} (${filteredManagers.length} recipients)`);
+      }
+    }
+  } catch (err) {
+    console.error('[NOTIFICATION COMPLETION ERROR]:', err);
+  }
+};
+
+// Helper: Notify team on Task Approval or Ejection
+const notifyTaskReview = async (pool, taskId, verifyStatus) => {
+  try {
+    const parsedTaskId = parseInt(taskId);
+    console.log(`[NOTIFICATION DEBUG] notifyTaskReview called for taskId: ${parsedTaskId}, verifyStatus: ${verifyStatus}`);
+
+    if (!verifyStatus) return;
+    const cleanStatus = verifyStatus.trim().toLowerCase();
+    const isApproved = ['approved', 'approve', 'verified', 'completed', 'active'].some(s => cleanStatus.includes(s));
+    const isRejected = ['rejected', 'reject', 'ejected', 'eject', 'declined', 'failed'].some(s => cleanStatus.includes(s));
+
+    if (!isApproved && !isRejected) {
+      console.log(`[NOTIFICATION DEBUG] notifyTaskReview skipped for status: ${cleanStatus}`);
+      return;
+    }
+
+    const taskQuery = await pool.request()
+      .input('taskId', sql.Int, parsedTaskId)
+      .query(`
+        SELECT 
+          t.title as taskName,
+          t.assignee_id as assigneeId,
+          t.owner_id as ownerId,
+          COALESCE(u_assignee.name, j_assignee.name) as assigneeName,
+          COALESCE(u_assignee.team, 'New Joinee') as assigneeTeam,
+          COALESCE(u_assignee.reporting_manager_id, j_assignee.hired_by) as reportingManagerId,
+          COALESCE(u_owner.name, j_owner.name) as ownerName
+        FROM master_tasks t WITH (NOLOCK)
+        LEFT JOIN users u_assignee WITH (NOLOCK) ON t.assignee_id = u_assignee.id
+        LEFT JOIN new_joinees j_assignee WITH (NOLOCK) ON t.assignee_id = j_assignee.id
+        LEFT JOIN users u_owner WITH (NOLOCK) ON t.owner_id = u_owner.id
+        LEFT JOIN new_joinees j_owner WITH (NOLOCK) ON t.owner_id = j_owner.id
+        WHERE t.id = @taskId
+      `);
+
+    if (taskQuery.recordset.length === 0) {
+      console.log(`[NOTIFICATION DEBUG] notifyTaskReview: Task ${parsedTaskId} not found in database`);
+      return;
+    }
+    const { taskName, assigneeId, ownerId, assigneeName, assigneeTeam, reportingManagerId, ownerName } = taskQuery.recordset[0];
+
+    const recipientIds = new Set();
+    if (assigneeId) recipientIds.add(assigneeId);
+    if (reportingManagerId) recipientIds.add(reportingManagerId); // Direct Team Lead/Reporting Manager
+
+    if (assigneeTeam && assigneeTeam !== 'New Joinee') {
+      const teamMembersQuery = await pool.request()
+        .input('teamName', sql.NVarChar, assigneeTeam)
+        .query('SELECT id FROM users WITH (NOLOCK) WHERE team = @teamName');
+      for (const row of teamMembersQuery.recordset) {
+        recipientIds.add(row.id);
+      }
+    }
+
+    // Exclude the owner/creator (who performed the review) from receiving notifications about their own review
+    if (ownerId) {
+      recipientIds.delete(ownerId);
+    }
+
+    if (recipientIds.size > 0) {
+      let alertMessage = '';
+      if (isApproved) {
+        alertMessage = `Task '${taskName}' has been approved by ${ownerName || 'Manager'}`;
+      } else {
+        alertMessage = `Task '${taskName}' has been rejected by ${ownerName || 'Manager'}`;
+      }
+
+      const filteredRecipients = [];
+      for (const rid of recipientIds) {
+        const isDup = await isDuplicateNotification(pool, rid, alertMessage);
+        if (!isDup) filteredRecipients.push(rid);
+      }
+
+      if (filteredRecipients.length > 0) {
+        const valuesClauses = filteredRecipients.map((_, i) => `(@uid${i}, @msg, 'TASK', 0, DATEADD(MINUTE, 330, GETUTCDATE()))`);
+        const batchRequest = pool.request().input('msg', sql.NVarChar, alertMessage);
+        filteredRecipients.forEach((rid, i) => batchRequest.input(`uid${i}`, sql.Int, rid));
+        await batchRequest.query(`INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES ${valuesClauses.join(', ')}`);
+        console.log(`[NOTIFICATION] Task review (${cleanStatus}) notification sent to team ${assigneeTeam || 'None'} (${filteredRecipients.length} recipients)`);
+      }
+    } else {
+      console.log(`[NOTIFICATION DEBUG] notifyTaskReview: No recipients to notify for task ${parsedTaskId}`);
+    }
+  } catch (err) {
+    console.error('[NOTIFICATION REVIEW ERROR]:', err);
+  }
+};
+
 // --- DYNAMIC TASK DELEGATION SYSTEM --- //
 
 app.post(['/api/assign-task', '/api/tasks', '/api/master-task'], async (req, res) => {
@@ -5427,6 +5755,9 @@ app.post(['/api/assign-task', '/api/tasks', '/api/master-task'], async (req, res
       `);
 
     console.log('âœ… Task Stored in Database (ID Migration Bridge Applied)!');
+    notifyTaskAssignment(pool, finalAssignerId, finalAssigneeId, finalTaskName).catch(err => {
+      console.error('[NOTIFICATION ASSIGNMENT EXCEPTION]:', err);
+    });
     res.json({ success: true, message: 'Saved successfully!' });
   } catch (err) {
 
@@ -5610,11 +5941,11 @@ app.get('/api/admin/tasks/completed', verifyToken, async (req, res) => {
 
 // 13. Get ALL Assigned Tasks (Global Management View)
 app.get([
-  '/api/tasks/all-assigned', 
-  '/api/admin/master-tasks', 
-  '/api/admin/master-task', 
-  '/api/admin/tasks', 
-  '/api/master-tasks', 
+  '/api/tasks/all-assigned',
+  '/api/admin/master-tasks',
+  '/api/admin/master-task',
+  '/api/admin/tasks',
+  '/api/master-tasks',
   '/api/master-task'
 ], verifyToken, async (req, res) => {
   // Disable caching to prevent browser-side ERR_CACHE_WRITE_FAILURE (common with large task payloads)
@@ -5673,7 +6004,21 @@ app.get(['/api/master-task/:id', '/api/master-task/review/:id', '/api/assign-tas
       return res.status(503).json({ error: 'Database is currently offline' });
     }
 
-    // --- STEP 1: Attempt to find in task_updates (The most common source of 404s for IDs 20-29+) ---
+    // --- STEP 1: Query master_tasks table first ---
+    const masterRes = await pool.request()
+      .input('id', sql.Int, id)
+      .query(`
+        SELECT t.*, u.name as assigner_name, u.profile_picture as assigner_picture
+        FROM master_tasks t WITH (NOLOCK)
+        LEFT JOIN users u WITH (NOLOCK) ON t.owner_id = u.id
+        WHERE t.id = @id
+      `);
+
+    if (masterRes.recordset.length > 0) {
+      return res.json(masterRes.recordset[0]);
+    }
+
+    // --- STEP 2: Fallback to task_updates (The most common source of 404s for IDs 20-29+) ---
     const updateRes = await pool.request()
       .input('id', sql.Int, id)
       .query(`
@@ -5706,21 +6051,7 @@ app.get(['/api/master-task/:id', '/api/master-task/review/:id', '/api/assign-tas
       });
     }
 
-    // --- STEP 2: Fallback to master_tasks table ---
-    const masterRes = await pool.request()
-      .input('id', sql.Int, id)
-      .query(`
-        SELECT t.*, u.name as assigner_name, u.profile_picture as assigner_picture
-        FROM master_tasks t WITH (NOLOCK)
-        LEFT JOIN users u WITH (NOLOCK) ON t.owner_id = u.id
-        WHERE t.id = @id
-      `);
-
-    if (masterRes.recordset.length === 0) {
-      return res.status(404).json({ error: 'Task not found' });
-    }
-
-    res.json(masterRes.recordset[0]);
+    return res.status(404).json({ error: 'Task not found' });
   } catch (err) {
     console.error(`[MASTER TASK ERROR] ID ${id}:`, err.message);
     res.status(500).json({ error: 'Failed to extract specific objective details' });
@@ -5810,6 +6141,11 @@ app.put(['/api/assign-task/review/:id', '/api/assigned-task/review/:id', '/api/m
     }
 
     console.log(`âœ… [TASK REVIEW] Successfully updated task ${id}`);
+    if (finalVerify !== undefined) {
+      notifyTaskReview(pool, id, finalVerify).catch(err => {
+        console.error('[NOTIFICATION REVIEW EXCEPTION]:', err);
+      });
+    }
     res.json({ success: true, message: 'Review successfully submitted! âœ…' });
   } catch (err) {
     console.error('[TASK REVIEW UPDATE ERROR]:', err);
@@ -5950,7 +6286,24 @@ app.put(['/api/tasks/:id', '/api/tasks/status/:taskId', '/api/task-updates/:id',
     }
 
     query += ' WHERE id = @taskId';
-    await request.query(query);
+    const result = await request.query(query);
+
+    if (result.rowsAffected && result.rowsAffected[0] > 0) {
+      if (status !== undefined || progress !== undefined) {
+        const isCompletedStatus = status && status.toLowerCase() === 'completed';
+        const isCompletedProgress = progress !== undefined && parseInt(progress) === 100;
+        if (isCompletedStatus || isCompletedProgress) {
+          notifyTaskCompletion(pool, taskId).catch(err => {
+            console.error('[NOTIFICATION COMPLETION EXCEPTION]:', err);
+          });
+        }
+      }
+      if (verify !== undefined) {
+        notifyTaskReview(pool, taskId, verify).catch(err => {
+          console.error('[NOTIFICATION REVIEW EXCEPTION]:', err);
+        });
+      }
+    }
 
     res.json({ success: true, message: 'Task synchronization successful' });
   } catch (err) {
@@ -6075,13 +6428,25 @@ app.get('/api/threads', async (req, res) => {
     let query = `
       WITH PagedThreads AS (
         SELECT t.id, t.user_id, t.employee_name, t.role, t.tagline, t.content, t.media_type, t.created_at,
-               t.likes_count as likes, t.heart_count as heartCount, t.thumbsup_count as thumbsupCount, 
-               t.shocked_count as shockedCount, t.laugh_count as laughCount, t.fire_count as fireCount, 
-               t.clap_count as clapCount, t.cake_count as cakeCount, t.comments_count as comments,
+               rx.likes, rx.heartCount, rx.thumbsupCount, rx.shockedCount, rx.laughCount, rx.fireCount, rx.clapCount, rx.cakeCount,
+               t.comments_count as comments,
                u.name as uName, u.role as uRole,
                CASE WHEN t.media_url IS NOT NULL AND t.media_url <> '' THEN 1 ELSE 0 END as hasMedia
         FROM threads t WITH (NOLOCK)
         JOIN users u WITH (NOLOCK) ON t.user_id = u.id
+        OUTER APPLY (
+          SELECT 
+            COUNT(CASE WHEN r.reaction_type = 'like' THEN 1 END) as likes,
+            COUNT(CASE WHEN r.reaction_type = 'heart' THEN 1 END) as heartCount,
+            COUNT(CASE WHEN r.reaction_type = 'thumbsup' THEN 1 END) as thumbsupCount,
+            COUNT(CASE WHEN r.reaction_type = 'shocked' THEN 1 END) as shockedCount,
+            COUNT(CASE WHEN r.reaction_type = 'laugh' THEN 1 END) as laughCount,
+            COUNT(CASE WHEN r.reaction_type = 'fire' THEN 1 END) as fireCount,
+            COUNT(CASE WHEN r.reaction_type = 'clap' THEN 1 END) as clapCount,
+            COUNT(CASE WHEN r.reaction_type = 'cake' THEN 1 END) as cakeCount
+          FROM post_reactions r WITH (NOLOCK)
+          WHERE r.post_id = t.id
+        ) rx
         ORDER BY t.created_at DESC
         OFFSET @offset ROWS
         FETCH NEXT @limit ROWS ONLY
@@ -6089,11 +6454,11 @@ app.get('/api/threads', async (req, res) => {
       SELECT pt.*,
              ISNULL(pt.employee_name, pt.uName) as authorName, 
              ISNULL(pt.role, pt.uRole) as authorRole,
-             (SELECT STRING_AGG(employee_name, ', ') FROM (SELECT TOP 3 employee_name FROM thread_reactions WITH (NOLOCK) WHERE thread_id = pt.id ORDER BY created_at DESC) as r) as recentReactors
+             (SELECT STRING_AGG(employee_name, ', ') FROM (SELECT TOP 3 employee_name FROM post_reactions WITH (NOLOCK) WHERE post_id = pt.id ORDER BY created_at DESC) as r) as recentReactors
     `;
 
     if (viewerId) {
-      query += `, (SELECT STRING_AGG(reaction_type, ',') FROM thread_reactions WITH (NOLOCK) WHERE thread_id = pt.id AND user_id = @viewerId) as userReactionTypes `;
+      query += `, (SELECT STRING_AGG(reaction_type, ',') FROM post_reactions WITH (NOLOCK) WHERE post_id = pt.id AND user_id = @viewerId) as userReactionTypes `;
       request.input('viewerId', sql.Int, viewerId);
     }
 
@@ -6191,30 +6556,10 @@ app.get('/api/threads', async (req, res) => {
 });
 
 
-// 3. React to a Thread (Switch or Toggle Reaction)
-const handleReaction = async (req, res) => {
-  const { id } = req.params;
-  const payload = req.body;
-
-  // 1. Robust User ID Extraction (Payload -> Query -> JWT Token)
-  const authHeader = req.headers['authorization'];
-  let tokenUserId = null;
-  if (authHeader && authHeader.startsWith('Bearer ')) {
-    const token = authHeader.split(' ')[1];
-    const { user: decoded } = await getVerifiedUser(token);
-    if (decoded) {
-      tokenUserId = decoded.id;
-    }
-  }
-
-  const userId = payload.userId || payload.user_id || payload.employeeId || payload.employee_id || req.query.userId || tokenUserId;
-
-  // 2. Normalizing Reaction Type (Emoji to Text Mapping)
-  const rawType = payload.reactionType || payload.reaction_type || payload.type || payload.reaction || payload.icon || payload.label || req.query.reactionType;
-
-  console.log(`[REACTIONS DEBUG] Thread: ${id}, User: ${userId}, RawType: ${rawType}`);
-
-  if (!userId) return res.status(400).json({ error: 'User ID required for social interaction' });
+// 3. Unified Concurrency-Safe Post/Thread Reaction System (Facebook-Style, single-source of truth)
+const handlePostReaction = async (req, res) => {
+  const postId = req.params.postId || req.params.id;
+  const { reactionType } = req.body;
 
   // Map literal emojis OR common names to standardized database strings
   const reactionMap = {
@@ -6224,149 +6569,224 @@ const handleReaction = async (req, res) => {
     '😂': 'laugh', 'laugh': 'laugh', 'haha': 'laugh',
     '🔥': 'fire', 'fire': 'fire', 'lit': 'fire',
     '👏': 'clap', 'clap': 'clap', 'clapping': 'clap',
-    '🎂': 'cake', 'cake': 'cake', 'birthday': 'cake'
+    '🎂': 'cake', 'cake': 'cake', 'birthday': 'cake',
+    'like': 'like'
   };
 
-  const rType = reactionMap[rawType] || rawType || 'heart';
+  const normalizedReaction = reactionMap[reactionType] || reactionType;
 
-  // Map standardized reaction types to their respective database column names
-  const columnMap = {
-    heart: 'heart_count',
-    like: 'likes_count',
-    thumbsup: 'thumbsup_count',
-    shocked: 'shocked_count',
-    laugh: 'laugh_count',
-    fire: 'fire_count',
-    clap: 'clap_count',
-    cake: 'cake_count'
-  };
+  // 1. Supported reaction types validation
+  const supportedReactions = ['like', 'heart', 'thumbsup', 'shocked', 'laugh', 'fire', 'clap', 'cake'];
+  if (!normalizedReaction || !supportedReactions.includes(normalizedReaction)) {
+    return res.status(400).json({
+      error: 'Invalid or missing reactionType',
+      supportedTypes: supportedReactions
+    });
+  }
 
-  const targetColumn = columnMap[rType];
+  // 2. Validate Post ID is integer
+  const numericPostId = parseInt(postId, 10);
+  if (isNaN(numericPostId)) {
+    return res.status(400).json({ error: 'Post ID must be an integer' });
+  }
 
+  // 3. Robust User ID Extraction (JWT token first, then payload/query/session)
+  const authHeader = req.headers['authorization'];
+  let tokenUserId = null;
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    try {
+      const token = authHeader.split(' ')[1];
+      const { user: decoded } = await getVerifiedUser(token);
+      if (decoded) {
+        tokenUserId = decoded.id;
+      }
+    } catch (err) {
+      console.warn('[POST REACTION] Token verification failed:', err.message);
+    }
+  }
+
+  const userId = req.body.userId || req.body.user_id || req.query.userId || req.user?.id || tokenUserId;
+  if (!userId) {
+    return res.status(401).json({ error: 'Authentication required to react' });
+  }
+
+  const numericUserId = parseInt(userId, 10);
+  if (isNaN(numericUserId)) {
+    return res.status(400).json({ error: 'User ID must be an integer' });
+  }
+
+  // Fetch reacting user's metadata (name and role) to store in the reaction record
+  let employeeName = 'Unknown User';
+  let userRole = 'employee';
   try {
     const pool = await getPool();
 
-    // FETCH THE REACTOR'S METADATA (checking both tables)
-    let employeeName = 'Unknown User';
-    let userRole = 'employee';
-
+    // Check main users table
     const userResult = await pool.request()
-      .input('uId', sql.Int, userId)
+      .input('uId', sql.Int, numericUserId)
       .query('SELECT name, role FROM users WHERE id = @uId');
 
     if (userResult.recordset.length > 0) {
       employeeName = userResult.recordset[0].name;
       userRole = userResult.recordset[0].role;
     } else {
+      // Fallback: Check new_joinees table
       const joineeResult = await pool.request()
-        .input('uId', sql.Int, userId)
+        .input('uId', sql.Int, numericUserId)
         .query('SELECT name, role FROM new_joinees WHERE id = @uId');
+
       if (joineeResult.recordset.length > 0) {
         employeeName = joineeResult.recordset[0].name;
         userRole = joineeResult.recordset[0].role;
+      } else {
+        // Fallback: Check interns table
+        const internResult = await pool.request()
+          .input('uId', sql.Int, numericUserId)
+          .query('SELECT name, role FROM interns WHERE id = @uId');
+
+        if (internResult.recordset.length > 0) {
+          employeeName = internResult.recordset[0].name;
+          userRole = internResult.recordset[0].role;
+        }
       }
-    }
-
-    // 1. Check if user already has THIS EXACT reaction on this thread
-    const check = await pool.request()
-      .input('threadId', sql.Int, id)
-      .input('userId', sql.Int, userId)
-      .input('type', sql.NVarChar(50), rType)
-      .query('SELECT id FROM thread_reactions WHERE thread_id = @threadId AND user_id = @userId AND reaction_type = @type');
-
-    if (check.recordset.length > 0) {
-      // Toggle Off
-      await pool.request()
-        .input('threadId', sql.Int, id)
-        .input('userId', sql.Int, userId)
-        .input('type', sql.NVarChar(50), rType)
-        .query('DELETE FROM thread_reactions WHERE thread_id = @threadId AND user_id = @userId AND reaction_type = @type');
-
-      if (targetColumn) {
-        await pool.request()
-          .input('threadId', sql.Int, id)
-          .query(`UPDATE threads SET ${targetColumn} = CASE WHEN ${targetColumn} > 0 THEN ${targetColumn} - 1 ELSE 0 END WHERE id = @threadId`);
-      }
-
-      const countRes = await pool.request()
-        .input('threadId', sql.Int, id)
-        .input('type', sql.NVarChar(50), rType)
-        .query('SELECT COUNT(*) as count FROM thread_reactions WHERE thread_id = @threadId AND reaction_type = @type');
-
-      const threadRes = await pool.request()
-        .input('tid', sql.Int, id)
-        .query('SELECT likes_count, heart_count, thumbsup_count, shocked_count, laugh_count, fire_count, clap_count, cake_count FROM threads WHERE id = @tid');
-
-      const t = threadRes.recordset[0];
-      const newTotal = (t.likes_count || 0) + (t.heart_count || 0) + (t.thumbsup_count || 0) + (t.shocked_count || 0) + (t.laugh_count || 0) + (t.fire_count || 0) + (t.clap_count || 0) + (t.cake_count || 0);
-
-      console.log(`[REACTION] User ${userId} unliked ${rType} on thread ${id}`);
-      return res.json({
-        message: 'Reaction removed',
-        type: 'removed',
-        reactionType: rType,
-        count: countRes.recordset[0].count,
-        totalCount: newTotal,
-        userHasLiked: false
-      });
-    } else {
-      // Toggle On
-      await pool.request()
-        .input('threadId', sql.Int, id)
-        .input('userId', sql.Int, userId)
-        .input('name', sql.NVarChar, employeeName)
-        .input('role', sql.NVarChar, userRole)
-        .input('type', sql.NVarChar(50), rType)
-        .query('INSERT INTO thread_reactions (thread_id, user_id, employee_name, role, reaction_type, created_at) VALUES (@threadId, @userId, @name, @role, @type, DATEADD(MINUTE, 330, GETUTCDATE()))');
-
-      if (targetColumn) {
-        await pool.request()
-          .input('threadId', sql.Int, id)
-          .query(`UPDATE threads SET ${targetColumn} = ${targetColumn} + 1 WHERE id = @threadId`);
-      }
-
-      const countRes = await pool.request()
-        .input('threadId', sql.Int, id)
-        .input('type', sql.NVarChar(50), rType)
-        .query('SELECT COUNT(*) as count FROM thread_reactions WHERE thread_id = @threadId AND reaction_type = @type');
-
-      const threadRes = await pool.request()
-        .input('tid', sql.Int, id)
-        .query('SELECT likes_count, heart_count, thumbsup_count, shocked_count, laugh_count, fire_count, clap_count, cake_count FROM threads WHERE id = @tid');
-
-      const t = threadRes.recordset[0];
-      const newTotal = (t.likes_count || 0) + (t.heart_count || 0) + (t.thumbsup_count || 0) + (t.shocked_count || 0) + (t.laugh_count || 0) + (t.fire_count || 0) + (t.clap_count || 0) + (t.cake_count || 0);
-
-      console.log(`[REACTION] User ${userId} reacted with ${rType} on thread ${id}`);
-      return res.json({
-        message: 'Thread reacted',
-        type: rType,
-        reactionType: rType,
-        count: countRes.recordset[0].count,
-        totalCount: newTotal,
-        userHasLiked: true
-      });
     }
   } catch (err) {
-    console.error('Social reaction failure:', err);
-    res.status(500).json({ error: 'Failed to process community interaction' });
+    console.warn('[POST REACTION] Failed to pre-fetch user metadata:', err.message);
+  }
+
+  let pool;
+  let transaction;
+  try {
+    pool = await getPool();
+    transaction = new sql.Transaction(pool);
+    await transaction.begin();
+
+    // 4. Fetch user's existing reaction on this post
+    const reactionRes = await transaction.request()
+      .input('postId', sql.Int, numericPostId)
+      .input('userId', sql.Int, numericUserId)
+      .query('SELECT reaction_type FROM post_reactions WITH (UPDLOCK, ROWLOCK) WHERE post_id = @postId AND user_id = @userId');
+
+    let action = 'added';
+    let userHasLiked = true;
+
+    if (reactionRes.recordset.length > 0) {
+      const oldReaction = reactionRes.recordset[0].reaction_type;
+
+      if (oldReaction === normalizedReaction) {
+        // CASE 4: User clicks the same reaction again => Remove their reaction
+        action = 'removed';
+        userHasLiked = false;
+
+        await transaction.request()
+          .input('postId', sql.Int, numericPostId)
+          .input('userId', sql.Int, numericUserId)
+          .query('DELETE FROM post_reactions WHERE post_id = @postId AND user_id = @userId');
+      } else {
+        // CASE 3: User changes their reaction
+        action = 'changed';
+
+        await transaction.request()
+          .input('postId', sql.Int, numericPostId)
+          .input('userId', sql.Int, numericUserId)
+          .input('type', sql.NVarChar(50), normalizedReaction)
+          .input('userName', sql.NVarChar(255), employeeName)
+          .input('empName', sql.NVarChar(255), employeeName)
+          .input('role', sql.NVarChar(50), userRole)
+          .query('UPDATE post_reactions SET reaction_type = @type, user_name = @userName, employee_name = @empName, role = @role, created_at = GETDATE() WHERE post_id = @postId AND user_id = @userId');
+      }
+    } else {
+      // CASE 2: User reacts for the first time
+      action = 'added';
+
+      await transaction.request()
+        .input('postId', sql.Int, numericPostId)
+        .input('userId', sql.Int, numericUserId)
+        .input('type', sql.NVarChar(50), normalizedReaction)
+        .input('userName', sql.NVarChar(255), employeeName)
+        .input('empName', sql.NVarChar(255), employeeName)
+        .input('role', sql.NVarChar(50), userRole)
+        .query(`
+          IF NOT EXISTS (SELECT 1 FROM post_reactions WHERE post_id = @postId AND user_id = @userId)
+          BEGIN
+            INSERT INTO post_reactions (post_id, user_id, reaction_type, user_name, employee_name, role, created_at)
+            VALUES (@postId, @userId, @type, @userName, @empName, @role, GETDATE())
+          END
+        `);
+    }
+
+    // 5. Fetch updated counts dynamically inside transaction to guarantee consistency
+    const countsRes = await transaction.request()
+      .input('postId', sql.Int, numericPostId)
+      .query(`
+        SELECT 
+          (SELECT COUNT(*) FROM post_reactions WITH (NOLOCK) WHERE post_id = @postId AND reaction_type = 'like') as likes_count,
+          (SELECT COUNT(*) FROM post_reactions WITH (NOLOCK) WHERE post_id = @postId AND reaction_type = 'heart') as heart_count,
+          (SELECT COUNT(*) FROM post_reactions WITH (NOLOCK) WHERE post_id = @postId AND reaction_type = 'thumbsup') as thumbsup_count,
+          (SELECT COUNT(*) FROM post_reactions WITH (NOLOCK) WHERE post_id = @postId AND reaction_type = 'shocked') as shocked_count,
+          (SELECT COUNT(*) FROM post_reactions WITH (NOLOCK) WHERE post_id = @postId AND reaction_type = 'laugh') as laugh_count,
+          (SELECT COUNT(*) FROM post_reactions WITH (NOLOCK) WHERE post_id = @postId AND reaction_type = 'fire') as fire_count,
+          (SELECT COUNT(*) FROM post_reactions WITH (NOLOCK) WHERE post_id = @postId AND reaction_type = 'clap') as clap_count,
+          (SELECT COUNT(*) FROM post_reactions WITH (NOLOCK) WHERE post_id = @postId AND reaction_type = 'cake') as cake_count
+      `);
+
+    await transaction.commit();
+
+    const counts = countsRes.recordset[0] || {};
+    const totalReactions = (counts.likes_count || 0) + (counts.heart_count || 0) + (counts.thumbsup_count || 0) +
+      (counts.shocked_count || 0) + (counts.laugh_count || 0) + (counts.fire_count || 0) +
+      (counts.clap_count || 0) + (counts.cake_count || 0);
+
+    res.json({
+      success: true,
+      action: action,
+      message: action === 'removed' ? 'Reaction removed' : 'Thread reacted',
+      type: normalizedReaction,
+      reactionType: normalizedReaction,
+      count: counts[`${normalizedReaction}_count`] || 0,
+      totalCount: totalReactions,
+      userHasLiked: userHasLiked,
+      counts: {
+        likes_count: counts.likes_count || 0,
+        heart_count: counts.heart_count || 0,
+        thumbsup_count: counts.thumbsup_count || 0,
+        shocked_count: counts.shocked_count || 0,
+        laugh_count: counts.laugh_count || 0,
+        fire_count: counts.fire_count || 0,
+        clap_count: counts.clap_count || 0,
+        cake_count: counts.cake_count || 0
+      }
+    });
+
+  } catch (err) {
+    if (transaction) {
+      try {
+        await transaction.rollback();
+      } catch (rollbackErr) {
+        console.error('[POST REACTION ROLLBACK ERROR]:', rollbackErr.message);
+      }
+    }
+    console.error('[POST REACTION ERROR]:', err);
+    res.status(500).json({ error: 'Internal server error processing post reaction' });
   }
 };
 
-
+const handleReaction = handlePostReaction;
 
 app.post('/api/threads/:id/react', handleReaction);
 app.put('/api/threads/:id/react', handleReaction);
 app.post('/api/threads/:id/like', handleReaction);
 app.put('/api/threads/:id/like', handleReaction);
 
+app.post('/api/posts/:postId/react', handlePostReaction);
+
 // 4. Add Comment to a Thread
 app.post('/api/threads/:id/comment', async (req, res) => {
   const { id } = req.params;
   const userId = req.body.userId || req.body.user_id;
-  const commentText = req.body.comment || req.body.text || req.body.content;
-
-  if (!userId || !commentText) return res.status(400).json({ error: 'User ID and comment text are required' });
+  const rawComment = req.body.comment || req.body.text || req.body.content;
+  if (!userId || !rawComment) return res.status(400).json({ error: 'User ID and comment text are required' });
+  const commentText = String(rawComment);
 
   try {
     const pool = await getPool();
@@ -6597,25 +7017,31 @@ app.get('/api/threads/:id', async (req, res) => {
                ISNULL(t.employee_name, u.name) as authorName, 
                ISNULL(t.role, u.role) as authorRole,
                u.role as dbRole,
-               t.likes_count as likes, 
-               t.heart_count as heartCount, 
-               t.thumbsup_count as thumbsupCount, 
-               t.shocked_count as shockedCount, 
-               t.laugh_count as laughCount, 
-               t.fire_count as fireCount, 
-               t.clap_count as clapCount, 
-               t.cake_count as cakeCount,
+               rx.likes, rx.heartCount, rx.thumbsupCount, rx.shockedCount, rx.laughCount, rx.fireCount, rx.clapCount, rx.cakeCount,
                t.comments_count as comments
     `;
 
     if (viewerId) {
-      query += `, (SELECT STRING_AGG(reaction_type, ',') FROM thread_reactions WHERE thread_id = t.id AND user_id = @viewerId) as userReactionTypes `;
+      query += `, (SELECT STRING_AGG(reaction_type, ',') FROM post_reactions WITH (NOLOCK) WHERE post_id = t.id AND user_id = @viewerId) as userReactionTypes `;
       request.input('viewerId', sql.Int, viewerId);
     }
 
     query += `
-        FROM threads t
-        JOIN users u ON t.user_id = u.id
+        FROM threads t WITH (NOLOCK)
+        JOIN users u WITH (NOLOCK) ON t.user_id = u.id
+        OUTER APPLY (
+          SELECT 
+            COUNT(CASE WHEN r.reaction_type = 'like' THEN 1 END) as likes,
+            COUNT(CASE WHEN r.reaction_type = 'heart' THEN 1 END) as heartCount,
+            COUNT(CASE WHEN r.reaction_type = 'thumbsup' THEN 1 END) as thumbsupCount,
+            COUNT(CASE WHEN r.reaction_type = 'shocked' THEN 1 END) as shockedCount,
+            COUNT(CASE WHEN r.reaction_type = 'laugh' THEN 1 END) as laughCount,
+            COUNT(CASE WHEN r.reaction_type = 'fire' THEN 1 END) as fireCount,
+            COUNT(CASE WHEN r.reaction_type = 'clap' THEN 1 END) as clapCount,
+            COUNT(CASE WHEN r.reaction_type = 'cake' THEN 1 END) as cakeCount
+          FROM post_reactions r WITH (NOLOCK)
+          WHERE r.post_id = t.id
+        ) rx
         WHERE t.id = @threadId
     `;
 
@@ -6628,8 +7054,8 @@ app.get('/api/threads/:id', async (req, res) => {
       .input('threadId', sql.Int, id)
       .query(`
         SELECT DISTINCT user_id, employee_name as name, role, reaction_type as type 
-        FROM thread_reactions 
-        WHERE thread_id = @threadId 
+        FROM post_reactions 
+        WHERE post_id = @threadId 
         ORDER BY name ASC
       `);
 
@@ -6741,9 +7167,9 @@ app.get('/api/threads/:id/reactors', async (req, res) => {
 
     let query = `
       SELECT DISTINCT u.id, u.name, u.role, u.profile_picture
-      FROM thread_reactions r
+      FROM post_reactions r
       JOIN users u ON r.user_id = u.id
-      WHERE r.thread_id = @threadId
+      WHERE r.post_id = @threadId
     `;
 
     if (normalizedType) {
@@ -6755,13 +7181,7 @@ app.get('/api/threads/:id/reactors', async (req, res) => {
 
     const result = await request.query(query);
 
-    const normalizeImage = (img) => {
-      if (!img) return null;
-      if (typeof img !== 'string') return img;
-      if (img.startsWith('data:') || img.startsWith('http') || img.startsWith('/')) return img;
-      if (img.startsWith('GgoAAAANSUhEUg')) return `data:image/png;base64,iVBORw0KGgo${img}`;
-      return `data:image/png;base64,${img}`;
-    };
+
 
     const formattedReactors = result.recordset.map(r => ({
       id: r.id,
@@ -6794,25 +7214,31 @@ app.get('/api/threads/user/:userId', async (req, res) => {
                ISNULL(t.employee_name, u.name) as authorName, 
                ISNULL(t.role, u.role) as authorRole,
                u.profile_picture as authorPicture,
-               (SELECT COUNT(*) FROM thread_reactions WHERE thread_id = t.id AND reaction_type = 'like') as likes,
-               (SELECT COUNT(*) FROM thread_reactions WHERE thread_id = t.id AND reaction_type = 'heart') as heartCount,
-               (SELECT COUNT(*) FROM thread_reactions WHERE thread_id = t.id AND reaction_type = 'thumbsup') as thumbsupCount,
-               (SELECT COUNT(*) FROM thread_reactions WHERE thread_id = t.id AND reaction_type = 'shocked') as shockedCount,
-               (SELECT COUNT(*) FROM thread_reactions WHERE thread_id = t.id AND reaction_type = 'laugh') as laughCount,
-               (SELECT COUNT(*) FROM thread_reactions WHERE thread_id = t.id AND reaction_type = 'fire') as fireCount,
-               (SELECT COUNT(*) FROM thread_reactions WHERE thread_id = t.id AND reaction_type = 'clap') as clapCount,
-               (SELECT COUNT(*) FROM thread_reactions WHERE thread_id = t.id AND reaction_type = 'cake') as cakeCount,
-               (SELECT COUNT(*) FROM thread_comments WHERE thread_id = t.id) as comments
+               rx.likes, rx.heartCount, rx.thumbsupCount, rx.shockedCount, rx.laughCount, rx.fireCount, rx.clapCount, rx.cakeCount,
+               t.comments_count as comments
     `;
 
     if (viewerId) {
-      query += `, (SELECT STRING_AGG(reaction_type, ',') FROM thread_reactions WHERE thread_id = t.id AND user_id = @viewerId) as userReactionTypes `;
+      query += `, (SELECT STRING_AGG(reaction_type, ',') FROM post_reactions WITH (NOLOCK) WHERE post_id = t.id AND user_id = @viewerId) as userReactionTypes `;
       request.input('viewerId', sql.Int, viewerId);
     }
 
     query += `
-        FROM threads t
-        JOIN users u ON t.user_id = u.id
+        FROM threads t WITH (NOLOCK)
+        JOIN users u WITH (NOLOCK) ON t.user_id = u.id
+        OUTER APPLY (
+          SELECT 
+            COUNT(CASE WHEN r.reaction_type = 'like' THEN 1 END) as likes,
+            COUNT(CASE WHEN r.reaction_type = 'heart' THEN 1 END) as heartCount,
+            COUNT(CASE WHEN r.reaction_type = 'thumbsup' THEN 1 END) as thumbsupCount,
+            COUNT(CASE WHEN r.reaction_type = 'shocked' THEN 1 END) as shockedCount,
+            COUNT(CASE WHEN r.reaction_type = 'laugh' THEN 1 END) as laughCount,
+            COUNT(CASE WHEN r.reaction_type = 'fire' THEN 1 END) as fireCount,
+            COUNT(CASE WHEN r.reaction_type = 'clap' THEN 1 END) as clapCount,
+            COUNT(CASE WHEN r.reaction_type = 'cake' THEN 1 END) as cakeCount
+          FROM post_reactions r WITH (NOLOCK)
+          WHERE r.post_id = t.id
+        ) rx
         WHERE t.user_id = @userId
         ORDER BY t.created_at DESC
     `;
@@ -6928,7 +7354,7 @@ app.put('/api/threads/:id', memoryUpload.single('media'), async (req, res) => {
 // 8. Delete a Thread (Self-management)
 app.delete('/api/threads/:id', async (req, res) => {
   const { id } = req.params;
-  const userId = req.body.userId || req.body.user_id || req.query.userId || req.query.user_id;
+  const userId = (req.body ? (req.body.userId || req.body.user_id) : null) || req.query.userId || req.query.user_id;
 
   if (!userId) return res.status(400).json({ error: 'User ID is required to verify ownership before deletion' });
 
@@ -7295,16 +7721,59 @@ app.get(['/api/notifications', '/api/notifications/:userId'], verifyToken, async
   }
 });
 
-// PUT: Mark notification as read
-app.put('/api/notifications/:id/read', async (req, res) => {
-  const { id } = req.params;
+// PUT: Mark all notifications as read for a user
+app.put(['/api/notifications/read-all', '/api/notifications/read-all/:userId'], verifyToken, async (req, res) => {
+  const userId = sanitizeNumericId(req.params.userId || req.query.userId || req.query.user_id || req.user.id);
+  if (!userId) return res.status(400).json({ error: 'User ID required' });
+
+  // Authorization: Only the user themselves or an Admin can modify these alerts
+  if (req.user.role !== 'Admin' && req.user.id !== userId) {
+    return res.status(403).json({ error: 'Access denied to these alerts' });
+  }
+
   try {
     const pool = await getPool();
     await pool.request()
-      .input('id', sql.Int, id)
-      .query('UPDATE notifications SET is_read = 1 WHERE id = @id');
-    res.json({ success: true });
+      .input('uid', sql.Int, userId)
+      .query('UPDATE notifications SET is_read = 1 WHERE target_user_id = @uid AND is_read = 0');
+
+    res.json({ success: true, message: 'All notifications marked as read' });
   } catch (err) {
+    console.error('[NOTIFICATIONS MARK-ALL-READ PUT ERROR]', err);
+    res.status(500).json({ error: 'Failed to update notifications' });
+  }
+});
+
+// PUT: Mark notification as read (supports /:id/read, /:id, or body params)
+app.put(['/api/notifications/:id/read', '/api/notifications/:id'], verifyToken, async (req, res) => {
+  const { id } = req.params;
+  const parsedId = parseInt(id);
+  if (isNaN(parsedId)) return res.status(400).json({ error: 'Invalid notification ID' });
+
+  try {
+    const pool = await getPool();
+
+    // First fetch the notification to verify ownership/existence
+    const findRes = await pool.request()
+      .input('id', sql.Int, parsedId)
+      .query('SELECT target_user_id FROM notifications WITH (NOLOCK) WHERE id = @id');
+
+    if (findRes.recordset.length === 0) {
+      return res.status(404).json({ error: 'Notification not found' });
+    }
+
+    // Authorization: Only the target user themselves or an Admin can mark it as read
+    if (req.user.role !== 'Admin' && req.user.id !== findRes.recordset[0].target_user_id) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    await pool.request()
+      .input('id', sql.Int, parsedId)
+      .query('UPDATE notifications SET is_read = 1 WHERE id = @id');
+
+    res.json({ success: true, message: 'Notification marked as read' });
+  } catch (err) {
+    console.error('[SINGLE NOTIFICATION READ PUT ERROR]', err);
     res.status(500).json({ error: 'Failed to update notification' });
   }
 });
@@ -7794,11 +8263,30 @@ app.post('/api/admin/onboarding/promote', verifyToken, async (req, res) => {
       const newUserId = userResult.recordset[0].id;
 
       // 3. Create Employee Record
+      let targetEmpId = parseInt(emp_id, 10);
+      if (isNaN(targetEmpId) || !targetEmpId) {
+        const currentYear = new Date().getFullYear();
+        const prefix = `${currentYear}`;
+        const maxIdRes = await transaction.request()
+          .input('prefix', sql.NVarChar, prefix + '%')
+          .query(`
+            SELECT MAX(emp_id) as maxId 
+            FROM employee 
+            WHERE CAST(emp_id AS VARCHAR) LIKE @prefix
+          `);
+        const maxId = maxIdRes.recordset[0]?.maxId;
+        if (maxId) {
+          targetEmpId = parseInt(maxId, 10) + 1;
+        } else {
+          targetEmpId = parseInt(prefix + '01', 10);
+        }
+      }
+
       await transaction.request()
         .input('userId', sql.Int, newUserId)
         .input('empName', sql.NVarChar, person.name)
         .input('designation', sql.NVarChar, newRole || person.role)
-        .input('empId', sql.Int, emp_id || Math.floor(10000 + Math.random() * 90000))
+        .input('empId', sql.Int, targetEmpId)
         .input('team', sql.NVarChar, team_name || person.team || 'General')
         .query(`
           INSERT INTO employee (user_id, emp_name, designation, emp_id, team_name)
@@ -7816,11 +8304,11 @@ app.post('/api/admin/onboarding/promote', verifyToken, async (req, res) => {
       await transaction.request().input('id', sql.Int, id).query(`DELETE FROM ${table} WHERE id = @id`);
 
       await transaction.commit();
-      Log.success('HR', `Successfully promoted ${person.name} (${type}) to Full-time Employee.`);
+      Log.success('HR', `Successfully promoted ${person.name} (${type}) to Full-time Employee with ID ${targetEmpId}.`);
 
       // 6. Send Employment Confirmation Email to the newly promoted employee
       const finalEmail = person.email || person.email_id;
-      const finalEmpId = emp_id || Math.floor(10000 + Math.random() * 90000);
+      const finalEmpId = targetEmpId;
       const finalDesignation = newRole || person.role || 'Employee';
       const finalTeam = team_name || person.team || 'General';
 
@@ -8068,6 +8556,47 @@ app.post('/api/support-tickets', async (req, res) => {
       `);
 
     const ticket = result.recordset[0];
+
+    // 4. Send Notifications based on selected department
+    try {
+      const selectedDept = (department || '').trim().toLowerCase();
+      const ticketNum = ticket.ticket_number || ticket.id;
+
+      if (selectedDept === 'hr' || selectedDept === 'infrastructure') {
+        // Send notification to all HR users
+        const hrResult = await pool.request().query(`
+          SELECT id FROM users 
+          WHERE role LIKE '%HR%' 
+             OR role LIKE '%Human Resource%'
+        `);
+        const hrIds = hrResult.recordset.map(u => u.id).filter(id => id && id !== userId);
+
+        for (const hrId of hrIds) {
+          await pool.request()
+            .input('targetId', sql.Int, hrId)
+            .input('msg', sql.NVarChar, `New Support Ticket #${ticketNum} (${routingDept}) from ${creatorName || 'Anonymous'}: ${subject}`)
+            .query('INSERT INTO notifications (target_user_id, message, is_read, created_at) VALUES (@targetId, @msg, 0, DATEADD(MINUTE, 330, GETUTCDATE()))');
+        }
+      } else if (selectedDept === 'technical' || selectedDept === 'tichnical') {
+        // Send notification to the user's reporting manager
+        if (userId) {
+          const userMgrResult = await pool.request()
+            .input('uid', sql.Int, userId)
+            .query('SELECT reporting_manager_id FROM users WHERE id = @uid');
+
+          const managerId = userMgrResult.recordset.length > 0 ? userMgrResult.recordset[0].reporting_manager_id : null;
+          if (managerId && managerId !== userId) {
+            await pool.request()
+              .input('targetId', sql.Int, managerId)
+              .input('msg', sql.NVarChar, `New Technical Support Ticket #${ticketNum} from ${creatorName || 'Anonymous'}: ${subject}`)
+              .query('INSERT INTO notifications (target_user_id, message, is_read, created_at) VALUES (@targetId, @msg, 0, DATEADD(MINUTE, 330, GETUTCDATE()))');
+          }
+        }
+      }
+    } catch (notifErr) {
+      console.error('[TICKET CREATION NOTIFICATION ERROR]:', notifErr.message);
+    }
+
     res.status(201).json({ message: 'Ticket submitted successfully and routed to ' + routingDept, ticket });
   } catch (err) {
     console.error('Ticket submission failed:', err);
@@ -8083,6 +8612,17 @@ app.put('/api/support-tickets/:id', async (req, res) => {
 
   try {
     const pool = await getPool();
+
+    // 1. Fetch current ticket details for target identification and filtering
+    const ticketRes = await pool.request()
+      .input('ticketId', sql.Int, id)
+      .query('SELECT user_id, ticket_number, subject, status FROM support_tickets WHERE id = @ticketId');
+
+    if (ticketRes.recordset.length === 0) {
+      return res.status(404).json({ error: 'Ticket not found' });
+    }
+    const ticketInfo = ticketRes.recordset[0];
+
     let query = 'UPDATE support_tickets SET updated_at = DATEADD(MINUTE, 330, GETUTCDATE())';
     const request = pool.request().input('id', sql.Int, id);
 
@@ -8111,6 +8651,20 @@ app.put('/api/support-tickets/:id', async (req, res) => {
 
     query += ' WHERE id = @id';
     await request.query(query);
+
+    // 2. Dispatch Dynamic Ticket Notification on status change to the targeted user
+    if (status && status !== ticketInfo.status && ticketInfo.user_id) {
+      try {
+        const ticketNum = ticketInfo.ticket_number || id;
+        await pool.request()
+          .input('uid', sql.Int, ticketInfo.user_id)
+          .input('msg', sql.NVarChar, `Your ticket #${ticketNum} ("${ticketInfo.subject}") status has been updated to "${status}".`)
+          .query('INSERT INTO notifications (target_user_id, message, is_read, created_at) VALUES (@uid, @msg, 0, DATEADD(MINUTE, 330, GETUTCDATE()))');
+      } catch (notifErr) {
+        console.error('[TICKET NOTIFICATION WARNING]:', notifErr.message);
+      }
+    }
+
     res.json({ message: 'Ticket updated successfully' });
   } catch (err) {
     console.error('Ticket update failed:', err);
@@ -8836,19 +9390,50 @@ app.post('/api/courses/:courseId/complete', verifyToken, async (req, res) => {
   }
 });
 
-// POST: Sync/Update Course Progress (Used by frontend to mark completion or update state)
+// POST: Sync/Update Course Progress (Used by frontend to mark completion or update state - handles General & Joinee courses)
 app.post('/api/courses/progress', verifyToken, async (req, res) => {
-  const { courseId, completed } = req.body;
+  const { id, courseId, completed, status } = req.body;
+  const finalCourseId = id || courseId;
   const userId = req.user.id;
 
-  if (!courseId) return res.status(400).json({ error: 'courseId is required' });
+  if (!finalCourseId) return res.status(400).json({ error: 'courseId is required' });
 
   try {
     const pool = await getPool();
+    const isComp = (completed === true || completed === 1 || completed === 'true' || status === 'Completed');
 
-    // 1. Fetch metadata needed for progress tracking
+    // 1. Check if it is a Joinee Course
+    const joineeCourse = await pool.request()
+      .input('cid', sql.Int, finalCourseId)
+      .query('SELECT id, title FROM newjoinee_courses WITH (NOLOCK) WHERE id = @cid');
+
+    if (joineeCourse.recordset.length > 0) {
+      const course = joineeCourse.recordset[0];
+      await pool.request()
+        .input('jid', sql.Int, userId)
+        .input('cid', sql.Int, finalCourseId)
+        .input('comp', sql.Bit, isComp ? 1 : 0)
+        .input('status', sql.NVarChar, isComp ? 'Completed' : 'In Progress')
+        .query(`
+          IF EXISTS (SELECT 1 FROM joinee_course_progress WHERE joinee_id = @jid AND course_id = @cid)
+            UPDATE joinee_course_progress SET is_completed = @comp, status = @status, updated_at = DATEADD(MINUTE, 330, GETUTCDATE()) WHERE joinee_id = @jid AND course_id = @cid
+          ELSE
+            INSERT INTO joinee_course_progress (joinee_id, course_id, is_completed, status) VALUES (@jid, @cid, @comp, @status)
+        `);
+
+      if (isComp) {
+        const joineeResult = await pool.request().input('jid', sql.Int, userId).query('SELECT name, email_id FROM new_joinees WITH (NOLOCK) WHERE id = @jid');
+        if (joineeResult.recordset.length > 0) {
+          const user = joineeResult.recordset[0];
+          await sendCertificateEmail(user.email_id, user.name, course.title);
+        }
+      }
+      return res.json({ success: true, message: 'Joinee course progress updated.', completed: isComp });
+    }
+
+    // 2. Default: Handle General Course (using user_courses junction table)
     const metaRes = await pool.request()
-      .input('cid', sql.Int, courseId)
+      .input('cid', sql.Int, finalCourseId)
       .input('uid', sql.Int, userId)
       .query(`
         SELECT c.title as courseTitle, u.email as userEmail, u.name as userName
@@ -8864,22 +9449,18 @@ app.post('/api/courses/progress', verifyToken, async (req, res) => {
     if (metaRes.recordset.length === 0) return res.status(404).json({ error: 'Course or User not found' });
     const { courseTitle, userEmail, userName } = metaRes.recordset[0];
 
-    const isComp = (completed === true || completed === 1 || completed === 'true');
-
-    // 2. Mark as complete in junction table
     const checkResult = await pool.request()
       .input('uid', sql.Int, userId)
-      .input('cid', sql.Int, courseId)
+      .input('cid', sql.Int, finalCourseId)
       .query('SELECT completed, email_sent FROM user_courses WITH (NOLOCK) WHERE user_id = @uid AND course_id = @cid');
 
     const record = checkResult.recordset[0];
-    const wasCompleted = record ? record.completed : false;
     const emailSent = record ? record.email_sent : false;
 
     await pool.request()
       .input('uid', sql.Int, userId)
       .input('email', sql.NVarChar, userEmail)
-      .input('cid', sql.Int, courseId)
+      .input('cid', sql.Int, finalCourseId)
       .input('title', sql.NVarChar, courseTitle)
       .input('comp', sql.Bit, isComp ? 1 : 0)
       .query(`
@@ -8896,14 +9477,14 @@ app.post('/api/courses/progress', verifyToken, async (req, res) => {
           VALUES (@uid, @email, @cid, @title, @comp, CASE WHEN @comp = 1 THEN DATEADD(MINUTE, 330, GETUTCDATE()) ELSE NULL END, DATEADD(MINUTE, 330, GETUTCDATE()))
       `);
 
-    // 3. Send Email if newly completed and not already sent
+    // Send Email if newly completed and not already sent
     if (isComp && !emailSent && userEmail) {
       try {
         await sendCertificateEmail(userEmail, userName, courseTitle);
 
         await pool.request()
           .input('uid', sql.Int, userId)
-          .input('cid', sql.Int, courseId)
+          .input('cid', sql.Int, finalCourseId)
           .query('UPDATE user_courses SET email_sent = 1, email_sent_at = DATEADD(MINUTE, 330, GETUTCDATE()) WHERE user_id = @uid AND course_id = @cid');
       } catch (e) { console.error('Progress email fail:', e); }
     }
@@ -8943,95 +9524,7 @@ app.get('/api/courses/progress', verifyToken, async (req, res) => {
   }
 });
 
-// POST: Update course progress (Redirects to new complete endpoint for General, or handles Joinee)
-app.post('/api/courses/progress', verifyToken, async (req, res) => {
-  const userId = req.user.id;
-  const { id, courseId, completed, status } = req.body;
-  const finalCourseId = id || courseId;
 
-  if (!finalCourseId) return res.status(400).json({ error: 'Course ID is required' });
-
-  try {
-    const pool = await getPool();
-    const isCompleted = (completed === true || completed === 1 || completed === 'true' || status === 'Completed');
-
-    // Check if it's a general course first
-    const generalCheck = await pool.request()
-      .input('cid', sql.Int, finalCourseId)
-      .query('SELECT 1 FROM courses WITH (NOLOCK) WHERE id = @cid');
-
-    if (generalCheck.recordset.length > 0) {
-      if (isCompleted) {
-        // Mark as complete and trigger certificate
-        const courseResult = await pool.request()
-          .input('cid', sql.Int, finalCourseId)
-          .query('SELECT title, completed, assigned_to, email_sent FROM courses WITH (NOLOCK) WHERE id = @cid');
-
-        const course = courseResult.recordset[0];
-        await pool.request()
-          .input('cid', sql.Int, finalCourseId)
-          .query('UPDATE courses SET completed = 1, updated_at = DATEADD(MINUTE, 330, GETUTCDATE()) WHERE id = @cid');
-
-        if (!course.completed && !course.email_sent && course.assigned_to) {
-          try {
-            const userResult = await pool.request()
-              .input('uid', sql.Int, course.assigned_to)
-              .query('SELECT name, email FROM users WITH (NOLOCK) WHERE id = @uid UNION SELECT name, email FROM interns WITH (NOLOCK) WHERE id = @uid');
-
-            if (userResult.recordset.length > 0) {
-              const user = userResult.recordset[0];
-              await sendCertificateEmail(user.email, user.name, course.title);
-
-              await pool.request()
-                .input('cid', sql.Int, finalCourseId)
-                .query('UPDATE courses SET email_sent = 1, email_sent_at = DATEADD(MINUTE, 330, GETUTCDATE()) WHERE id = @cid');
-            }
-          } catch (e) { console.error('Email fail in progress route:', e); }
-        }
-        return res.json({ success: true, message: 'Course marked as completed via progress sync.' });
-      } else {
-        await pool.request()
-          .input('cid', sql.Int, finalCourseId)
-          .query('UPDATE courses SET completed = 0, updated_at = DATEADD(MINUTE, 330, GETUTCDATE()) WHERE id = @cid');
-        return res.json({ success: true, message: 'Progress updated (General)' });
-      }
-    }
-
-    // Handle Joinee logic
-    const joineeCourse = await pool.request()
-      .input('cid', sql.Int, finalCourseId)
-      .query('SELECT id, title FROM newjoinee_courses WITH (NOLOCK) WHERE id = @cid');
-
-    if (joineeCourse.recordset.length > 0) {
-      const course = joineeCourse.recordset[0];
-      await pool.request()
-        .input('jid', sql.Int, userId)
-        .input('cid', sql.Int, finalCourseId)
-        .input('comp', sql.Bit, isCompleted ? 1 : 0)
-        .input('status', sql.NVarChar, isCompleted ? 'Completed' : 'In Progress')
-        .query(`
-          IF EXISTS (SELECT 1 FROM joinee_course_progress WHERE joinee_id = @jid AND course_id = @cid)
-            UPDATE joinee_course_progress SET is_completed = @comp, status = @status, updated_at = DATEADD(MINUTE, 330, GETUTCDATE()) WHERE joinee_id = @jid AND course_id = @cid
-          ELSE
-            INSERT INTO joinee_course_progress (joinee_id, course_id, is_completed, status) VALUES (@jid, @cid, @comp, @status)
-        `);
-
-      if (isCompleted) {
-        const joineeResult = await pool.request().input('jid', sql.Int, userId).query('SELECT name, email_id FROM new_joinees WITH (NOLOCK) WHERE id = @jid');
-        if (joineeResult.recordset.length > 0) {
-          const user = joineeResult.recordset[0];
-          await sendCertificateEmail(user.email_id, user.name, course.title);
-        }
-      }
-      return res.json({ success: true, message: 'Joinee progress updated' });
-    }
-
-    res.status(404).json({ error: 'Course not found' });
-  } catch (err) {
-    console.error('Progress sync error:', err);
-    res.status(500).json({ error: 'Internal server error during progress sync' });
-  }
-});
 
 // DELETE: Remove a course from the academic catalog
 app.delete('/api/courses/:id', verifyToken, async (req, res) => {
@@ -9613,12 +10106,19 @@ app.post('/api/leaves/request', verifyToken, async (req, res) => {
     const leaveId = leaveResult.recordset[0].id;
     console.log(`[LEAVE SUCCESS] User ${userId} successfully requested ${leaveType} (ID: ${leaveId})`);
 
-    // 3. Automated Notifications (Manager + HR + CEO)
-    // Find HR and CEO IDs
-    const authResult = await pool.request().query("SELECT id, role FROM users WHERE role IN ('HR', 'Founder & CEO')");
+    // 3. Automated Notifications (Reporting Manager + Project Manager + HR/Admin/CEO by default)
+    const authResult = await pool.request().query(`
+      SELECT id FROM users 
+      WHERE role LIKE '%HR%' 
+         OR role LIKE '%Human Resource%' 
+         OR role LIKE '%CEO%' 
+         OR role LIKE '%Founder%' 
+         OR role LIKE '%Admin%'
+         OR role LIKE '%Super%'
+    `);
     const ccIds = authResult.recordset.map(u => u.id);
 
-    const allNotifierIds = Array.from(new Set([managerId, ...ccIds])).filter(id => id && id !== userId);
+    const allNotifierIds = Array.from(new Set([managerId, projectManagerId, ...ccIds])).filter(id => id && id !== userId);
 
     for (const notifierId of allNotifierIds) {
       await pool.request()
@@ -11125,7 +11625,7 @@ app.get(['/api/admin/pay-slips/calculate-summary', '/api/admin/payslips/calculat
     const userResult = await pool.request()
       .input('empId', sql.Int, employee_id)
       .query(`
-        SELECT u.name, u.role, ep.department, ep.gross_salary_a, ep.salary, ep.pt
+        SELECT u.name, u.role, u.team, ep.department, ep.gross_salary_a, ep.salary, ep.pt
         FROM users u WITH (NOLOCK)
         LEFT JOIN employee_profiles ep WITH (NOLOCK) ON u.id = ep.employee_id
         WHERE u.id = @empId
@@ -11141,7 +11641,7 @@ app.get(['/api/admin/pay-slips/calculate-summary', '/api/admin/payslips/calculat
       const u = userResult.recordset[0];
       empName = u.name || '';
       designation = u.role || '';
-      department = u.department || '';
+      department = u.department || u.team || '';
       basicSalary = u.salary || 0;
       ptDeduction = u.pt || 0;
     }
@@ -11504,7 +12004,7 @@ app.get(['/api/admin/pay-slips', '/api/admin/payslips', '/api/payslips'], verify
       const userResult = await pool.request()
         .input('empId', sql.Int, targetEmpId)
         .query(`
-          SELECT u.name, u.role, ep.department, ep.gross_salary_a, ep.salary, ep.pt
+          SELECT u.name, u.role, u.team, ep.department, ep.gross_salary_a, ep.salary, ep.pt
           FROM users u WITH (NOLOCK)
           LEFT JOIN employee_profiles ep WITH (NOLOCK) ON u.id = ep.employee_id
           WHERE u.id = @empId
@@ -11520,7 +12020,7 @@ app.get(['/api/admin/pay-slips', '/api/admin/payslips', '/api/payslips'], verify
         const u = userResult.recordset[0];
         empName = u.name || '';
         designation = u.role || '';
-        department = u.department || '';
+        department = u.department || u.team || '';
         basicSalary = u.salary || 0;
         ptDeduction = u.pt || 0;
       }
@@ -12381,29 +12881,47 @@ app.get('/api/public/employees/leaderboard/all', async (req, res) => {
   try {
     const pool = await getPool();
     const result = await pool.request().query(`
-      WITH CombinedPoints AS (
-        SELECT employee_id, points, 1 as is_award FROM employee_rewards
-        UNION ALL
-        SELECT employee_id, total_points as points, 0 as is_award FROM quiz_completions
+      WITH QuizPoints AS (
+        SELECT employee_id, ISNULL(SUM(total_points), 0) as quiz_pts
+        FROM quiz_completions
+        GROUP BY employee_id
+      ),
+      RewardPoints AS (
+        SELECT employee_id, ISNULL(SUM(points), 0) as reward_pts
+        FROM employee_rewards
+        GROUP BY employee_id
+      ),
+      AwardCount AS (
+        SELECT employee_id, COUNT(*) as award_count
+        FROM employee_rewards
+        GROUP BY employee_id
       )
       SELECT 
         u.id, u.name, u.role, u.team, u.profile_picture,
-        ISNULL(SUM(cp.points), 0) as total_rep,
-        ISNULL(SUM(cp.is_award), 0) as total_awards,
-        DENSE_RANK() OVER (ORDER BY ISNULL(SUM(cp.points), 0) DESC) as rank
+        ISNULL(qp.quiz_pts, 0)   as quiz_points,
+        ISNULL(rp.reward_pts, 0) as reward_points,
+        ISNULL(qp.quiz_pts, 0) + ISNULL(rp.reward_pts, 0) as total_rep,
+        ISNULL(ac.award_count, 0) as total_awards,
+        DENSE_RANK() OVER (ORDER BY ISNULL(qp.quiz_pts, 0) + ISNULL(rp.reward_pts, 0) DESC) as rank
       FROM users u WITH (NOLOCK)
-      LEFT JOIN CombinedPoints cp WITH (NOLOCK) ON u.id = cp.employee_id
-      GROUP BY u.id, u.name, u.role, u.team, u.profile_picture
+      LEFT JOIN QuizPoints   qp WITH (NOLOCK) ON u.id = qp.employee_id
+      LEFT JOIN RewardPoints rp WITH (NOLOCK) ON u.id = rp.employee_id
+      LEFT JOIN AwardCount   ac WITH (NOLOCK) ON u.id = ac.employee_id
       ORDER BY total_rep DESC, u.name ASC
     `);
 
     const formatted = result.recordset.map(row => ({
       ...row,
-      total_rep: formatINR(row.total_rep),
+      quiz_points: row.quiz_points,
+      reward_points: row.reward_points,
+      total_rep: row.total_rep,
       totalRepNum: row.total_rep,
-      totalPoints: formatINR(row.total_rep),
-      total_points: formatINR(row.total_rep),
-      totalPointsNum: row.total_rep
+      totalPoints: row.total_rep,
+      total_points: row.total_rep,
+      totalPointsNum: row.total_rep,
+      quiz_points_fmt: formatINR(row.quiz_points),
+      reward_points_fmt: formatINR(row.reward_points),
+      total_points_fmt: formatINR(row.total_rep)
     }));
 
     // Auto-detect browser/HTML requests
@@ -12426,7 +12944,11 @@ app.get('/api/public/employees/leaderboard/all', async (req, res) => {
             </div>
             <div class="podium-name">${emp.name}</div>
             <div class="podium-role">${emp.role || 'Team Member'}</div>
-            <div class="podium-points">${emp.total_points} PTS</div>
+            <div class="podium-points">${emp.total_points_fmt} PTS</div>
+            <div class="podium-breakdown">
+              <span class="breakdown-pill quiz">🎯 Quiz: ${emp.quiz_points_fmt}</span>
+              <span class="breakdown-pill reward">🏅 Reward: ${emp.reward_points_fmt}</span>
+            </div>
           </div>
         `;
       }).join('');
@@ -12454,7 +12976,9 @@ app.get('/api/public/employees/leaderboard/all', async (req, res) => {
             <td class="table-cell">${emp.role || '----'}</td>
             <td class="table-cell"><span class="team-badge">${emp.team || '----'}</span></td>
             <td class="table-cell text-center">${emp.total_awards} 🏆</td>
-            <td class="table-cell points-col text-right">${emp.total_points} PTS</td>
+            <td class="table-cell points-col text-right quiz-pts">${emp.quiz_points_fmt}</td>
+            <td class="table-cell points-col text-right reward-pts">${emp.reward_points_fmt}</td>
+            <td class="table-cell points-col text-right total-pts">${emp.total_points_fmt}</td>
           </tr>
         `;
       }).join('');
@@ -12603,7 +13127,35 @@ app.get('/api/public/employees/leaderboard/all', async (req, res) => {
       font-size: 1.1rem;
       font-weight: 700;
       color: #a5b4fc;
+      margin-bottom: 1rem;
     }
+    .podium-breakdown {
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      align-items: center;
+      margin-top: 0.5rem;
+    }
+    .breakdown-pill {
+      display: inline-block;
+      padding: 0.3rem 1rem;
+      border-radius: 9999px;
+      font-size: 0.8rem;
+      font-weight: 600;
+    }
+    .breakdown-pill.quiz {
+      background: rgba(52, 211, 153, 0.1);
+      border: 1px solid rgba(52, 211, 153, 0.2);
+      color: #6ee7b7;
+    }
+    .breakdown-pill.reward {
+      background: rgba(251, 191, 36, 0.1);
+      border: 1px solid rgba(251, 191, 36, 0.2);
+      color: #fcd34d;
+    }
+    .quiz-pts  { color: #6ee7b7 !important; }
+    .reward-pts { color: #fcd34d !important; }
+    .total-pts  { color: #818cf8 !important; font-size: 1.1rem; }
     
     /* Table styling */
     .table-container {
@@ -12712,8 +13264,10 @@ app.get('/api/public/employees/leaderboard/all', async (req, res) => {
             <th class="header-cell">Employee</th>
             <th class="header-cell">Designation</th>
             <th class="header-cell">Team</th>
-            <th class="header-cell text-center">Awards Count</th>
-            <th class="header-cell text-right">Reputation Points</th>
+            <th class="header-cell text-center">Awards</th>
+            <th class="header-cell text-right" style="color:#6ee7b7">🎯 Quiz Pts</th>
+            <th class="header-cell text-right" style="color:#fcd34d">🏅 Reward Pts</th>
+            <th class="header-cell text-right" style="color:#818cf8">⭐ Total Pts</th>
           </tr>
         </thead>
         <tbody>
@@ -12824,6 +13378,7 @@ app.post(['/api/quizzes', '/api/fun-quizzes'], verifyToken, async (req, res) => 
   try {
     const pool = await getPool();
     const finalPoints = parseInt(points_reward, 10);
+    const quizPoints = isNaN(finalPoints) ? 10 : finalPoints;
 
     await pool.request()
       .input('question', sql.NVarChar(sql.MAX), question)
@@ -12832,12 +13387,31 @@ app.post(['/api/quizzes', '/api/fun-quizzes'], verifyToken, async (req, res) => 
       .input('option_c', sql.NVarChar(sql.MAX), option_c)
       .input('option_d', sql.NVarChar(sql.MAX), option_d)
       .input('correct_answer', sql.NVarChar(sql.MAX), finalCorrectAnswer)
-      .input('points_reward', sql.Int, isNaN(finalPoints) ? 10 : finalPoints)
+      .input('points_reward', sql.Int, quizPoints)
       .input('created_by', sql.Int, req.user.id)
       .query(`
         INSERT INTO fun_quizzes (question, option_a, option_b, option_c, option_d, correct_answer, points_reward, created_by)
         VALUES (@question, @option_a, @option_b, @option_c, @option_d, @correct_answer, @points_reward, @created_by)
       `);
+
+    // Notify all employees about the new quiz (except the creator)
+    try {
+      const displayQuestion = question.length > 60 ? question.substring(0, 60) + '...' : question;
+      const notificationMsg = `New Fun Quiz: "${displayQuestion}" is now live! Answer to earn ${quizPoints} points.`;
+
+      await pool.request()
+        .input('msg', sql.NVarChar, notificationMsg)
+        .input('creatorId', sql.Int, req.user.id)
+        .query(`
+          INSERT INTO notifications (target_user_id, message, type, is_read, created_at)
+          SELECT id, @msg, 'QUIZ', 0, DATEADD(MINUTE, 330, GETUTCDATE())
+          FROM users WITH (NOLOCK)
+          WHERE id <> @creatorId
+        `);
+      console.log(`[QUIZ NOTIFICATION] Sent new quiz notification to all employees.`);
+    } catch (notifErr) {
+      console.error('[QUIZ NOTIFICATION ERROR]: Failed to notify employees:', notifErr.message);
+    }
 
     res.status(201).json({ success: true, message: 'Quiz successfully created!' });
   } catch (err) {
@@ -13245,9 +13819,9 @@ app.get(['/api/fun-quizzes/leaderboard', '/api/quizzes/leaderboard/daily'], veri
  * 46.5 Get My Quiz Completion History
  */
 app.get([
-  '/api/quizzes/completions', 
-  '/api/quizzes/completions/my', 
-  '/api/quizzes/my-completions', 
+  '/api/quizzes/completions',
+  '/api/quizzes/completions/my',
+  '/api/quizzes/my-completions',
   '/api/quizzes/my_completions'
 ], verifyToken, async (req, res) => {
   const userId = req.user.id;
@@ -13270,6 +13844,47 @@ app.get([
   } catch (err) {
     console.error('[QUIZ HISTORY ERROR]:', err);
     res.status(500).json({ error: 'Failed to fetch quiz history' });
+  }
+});
+
+/**
+ * 46.6 Get Quiz Attempt History
+ */
+app.get(['/api/quizzes/attempts', '/api/quizzes/history'], verifyToken, async (req, res) => {
+  const queryUserId = req.query.userId || req.query.user_id || req.query.employeeId || req.query.employee_id;
+  const loggedInUserId = req.user.id;
+
+  // Default to logged-in user if no specific userId is requested
+  const targetUserId = queryUserId ? sanitizeNumericId(queryUserId) : loggedInUserId;
+
+  if (!targetUserId) {
+    return res.status(400).json({ error: 'Invalid or missing employee ID.' });
+  }
+
+  try {
+    const pool = await getPool();
+    const result = await pool.request()
+      .input('userId', sql.Int, targetUserId)
+      .query(`
+        SELECT 
+          qa.id,
+          qa.quiz_id,
+          qa.employee_id,
+          qa.selected_option,
+          qa.is_correct,
+          qa.is_submitted,
+          qa.created_at,
+          fq.question,
+          fq.points_reward
+        FROM quiz_attempts qa WITH (NOLOCK)
+        LEFT JOIN fun_quizzes fq WITH (NOLOCK) ON qa.quiz_id = fq.id
+        WHERE qa.employee_id = @userId
+        ORDER BY qa.created_at DESC
+      `);
+    res.json(result.recordset);
+  } catch (err) {
+    console.error('[QUIZ ATTEMPTS HISTORY ERROR]:', err);
+    res.status(500).json({ error: 'Failed to fetch quiz attempts history' });
   }
 });
 
@@ -15332,33 +15947,7 @@ app.get('/api/resignations', verifyToken, async (req, res) => {
   }
 });
 
-// POST: Submit a new resignation
-app.post('/api/resignations', verifyToken, async (req, res) => {
-  const { employeeId, resignationDate, lastWorkingDay, reason, letterContent } = req.body;
 
-  if (!employeeId || !resignationDate || !reason) {
-    return res.status(400).json({ error: 'Missing required fields: employeeId, resignationDate, and reason are mandatory.' });
-  }
-
-  try {
-    const pool = await getPool();
-    await pool.request()
-      .input('empId', sql.Int, employeeId)
-      .input('resDate', sql.Date, resignationDate)
-      .input('lwd', sql.Date, lastWorkingDay || null)
-      .input('reason', sql.NVarChar, reason)
-      .input('content', sql.NVarChar, letterContent || '')
-      .input('status', sql.NVarChar, 'Pending')
-      .query(`
-        INSERT INTO resignations (employee_id, resignation_date, last_working_day, reason, letter_content, status, created_at, updated_at)
-        VALUES (@empId, @resDate, @lwd, @reason, @content, @status, GETDATE(), GETDATE())
-      `);
-    res.status(201).json({ success: true, message: 'Resignation submitted successfully' });
-  } catch (err) {
-    Log.error('Resignations', 'Failed to submit resignation', err.message);
-    res.status(500).json({ error: 'Failed to submit resignation' });
-  }
-});
 
 // PUT: Update resignation status or remarks (Approval/Rejection)
 app.put('/api/resignations/:id', verifyToken, async (req, res) => {
@@ -15983,19 +16572,82 @@ const initializeThreadCommentsTable = async (providedPool) => {
   }
 };
 
-// DB Initialization for Thread Reactions (relax FK constraint)
-const initializeThreadReactionsTable = async (providedPool) => {
+// DB Initialization for Post Reactions table (Facebook-style)
+const initializePostReactionsTable = async (providedPool) => {
   try {
     const pool = providedPool || await getPool();
     await pool.request().query(`
-      IF EXISTS (SELECT * FROM sys.foreign_keys WHERE name = 'FK__thread_re__user___56E8E7AB')
+      -- Drop legacy thread_reactions table if it exists to keep schema fully clean
+      IF EXISTS (SELECT * FROM sys.tables WHERE name = 'thread_reactions')
       BEGIN
-        ALTER TABLE thread_reactions DROP CONSTRAINT FK__thread_re__user___56E8E7AB;
+        EXEC('DROP TABLE thread_reactions');
+      END
+
+      IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'post_reactions')
+      BEGIN
+        CREATE TABLE post_reactions (
+          reaction_id INT IDENTITY(1,1) PRIMARY KEY,
+          post_id INT NOT NULL,
+          user_id INT NOT NULL,
+          reaction_type NVARCHAR(50) NOT NULL,
+          user_name NVARCHAR(255) NULL,
+          employee_name NVARCHAR(255) NULL,
+          role NVARCHAR(50) NULL,
+          created_at DATETIME DEFAULT GETDATE(),
+          CONSTRAINT UQ_post_reactions_post_user UNIQUE (post_id, user_id)
+        );
+      END
+      ELSE
+      BEGIN
+        -- Add user_name column if it does not exist
+        IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('post_reactions') AND name = 'user_name')
+          ALTER TABLE post_reactions ADD user_name NVARCHAR(255) NULL;
+
+        -- Add employee_name column if it does not exist
+        IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('post_reactions') AND name = 'employee_name')
+          ALTER TABLE post_reactions ADD employee_name NVARCHAR(255) NULL;
+
+        -- Add role column if it does not exist
+        IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('post_reactions') AND name = 'role')
+          ALTER TABLE post_reactions ADD role NVARCHAR(50) NULL;
+
+        -- Clean up duplicate rows before adding the unique constraint
+        IF NOT EXISTS (SELECT * FROM sys.objects WHERE name = 'UQ_post_reactions_post_user' AND parent_object_id = OBJECT_ID('post_reactions'))
+        BEGIN
+          WITH cte AS (
+            SELECT *, ROW_NUMBER() OVER (PARTITION BY post_id, user_id ORDER BY created_at DESC) as rn
+            FROM post_reactions
+          )
+          DELETE FROM cte WHERE rn > 1;
+
+          ALTER TABLE post_reactions ADD CONSTRAINT UQ_post_reactions_post_user UNIQUE (post_id, user_id);
+        END
+      END
+
+      -- Drop legacy reaction counts columns from threads table if they exist to keep schema normalized
+      IF EXISTS (SELECT * FROM sys.tables WHERE name = 'threads')
+      BEGIN
+        IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('threads') AND name = 'likes_count')
+          EXEC('ALTER TABLE threads DROP COLUMN likes_count');
+        IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('threads') AND name = 'heart_count')
+          EXEC('ALTER TABLE threads DROP COLUMN heart_count');
+        IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('threads') AND name = 'thumbsup_count')
+          EXEC('ALTER TABLE threads DROP COLUMN thumbsup_count');
+        IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('threads') AND name = 'shocked_count')
+          EXEC('ALTER TABLE threads DROP COLUMN shocked_count');
+        IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('threads') AND name = 'laugh_count')
+          EXEC('ALTER TABLE threads DROP COLUMN laugh_count');
+        IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('threads') AND name = 'fire_count')
+          EXEC('ALTER TABLE threads DROP COLUMN fire_count');
+        IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('threads') AND name = 'clap_count')
+          EXEC('ALTER TABLE threads DROP COLUMN clap_count');
+        IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('threads') AND name = 'cake_count')
+          EXEC('ALTER TABLE threads DROP COLUMN cake_count');
       END
     `);
-    Log.success('Database', 'Thread reactions foreign key constraint relaxed');
+    Log.success('Database', 'Post reactions table ready with user tracking columns, unique constraint enforced, and threads counts healed');
   } catch (err) {
-    Log.error('Database', 'Failed to relax thread reactions constraint', err.message);
+    Log.error('Database', 'Failed to initialize Post Reactions table', err.message);
   }
 };
 
@@ -16032,7 +16684,9 @@ const initializeDatabaseIndexes = async (providedPool) => {
   } catch (err) {
     Log.error('Database', 'Failed to initialize database indexes', err.message);
   }
-};// Migration: Ensure new_joinees and interns have the welcome_sent column
+};
+
+// Migration: Ensure new_joinees and interns have the welcome_sent column
 const ensureWelcomeSentColumns = async (providedPool) => {
   try {
     const pool = providedPool || await getPool();
@@ -16045,6 +16699,20 @@ const ensureWelcomeSentColumns = async (providedPool) => {
     console.log('✅ Database: welcome_sent columns verified for new_joinees and interns');
   } catch (err) {
     console.error('❌ Failed to ensure welcome_sent columns:', err.message);
+  }
+};
+
+// Migration: Ensure job_applications has the is_deleted column
+const ensureJobApplicationsColumns = async (providedPool) => {
+  try {
+    const pool = providedPool || await getPool();
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('job_applications') AND name = 'is_deleted')
+        ALTER TABLE job_applications ADD is_deleted BIT DEFAULT 0;
+    `);
+    console.log('✅ Database: is_deleted column verified for job_applications');
+  } catch (err) {
+    console.error('❌ Failed to ensure is_deleted column for job_applications:', err.message);
   }
 };
 
@@ -16066,8 +16734,9 @@ getPool().then(async (pool) => {
   await runMigration('Docs', initializeDocumentsTable);
   await runMigration('Attendance', initializeAttendanceTable);
   await runMigration('Threads', initializeThreadCommentsTable);
-  await runMigration('Reactions', initializeThreadReactionsTable);
+  await runMigration('PostReactions', initializePostReactionsTable);
   await runMigration('WelcomeColumns', ensureWelcomeSentColumns);
+  await runMigration('JobApplicationsColumns', ensureJobApplicationsColumns);
   await runMigration('Indexes', initializeDatabaseIndexes);
   app.listen(PORT, '0.0.0.0', () => {
     Log.ready(`System operational on port ${PORT}`);
