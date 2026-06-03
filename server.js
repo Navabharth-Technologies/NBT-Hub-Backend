@@ -3219,6 +3219,29 @@ const handleAboutUpdate = async (req, res) => {
     res.status(500).json({ error: 'Database safely blocked the Status Update operation' });
   }
 };
+/**
+ * Count working days between two dates, excluding Sundays and public holidays.
+ * @param {string|Date} startDate
+ * @param {string|Date} endDate
+ * @param {Set<string>} holidayDates - Set of 'YYYY-MM-DD' strings from the holidays table
+ * @returns {number}
+ */
+const countWorkingDays = (startDate, endDate, holidayDates) => {
+  const start = new Date(startDate);
+  const end = new Date(endDate);
+  let count = 0;
+  const current = new Date(start);
+  while (current <= end) {
+    const dayOfWeek = current.getDay(); // 0 = Sunday
+    const dateStr = current.toISOString().split('T')[0];
+    if (dayOfWeek !== 0 && !holidayDates.has(dateStr)) {
+      count++;
+    }
+    current.setDate(current.getDate() + 1);
+  }
+  return count;
+};
+
 // --- LEAVE MANAGEMENT ROUTES --- //
 
 // 1. Post a new leave request
@@ -3303,6 +3326,10 @@ app.post(['/api/leaves', '/api/leave'], verifyToken, async (req, res) => {
     }
     // --------------------------------------------------------------
 
+    // Fetch all public holidays to exclude Sundays & holidays from leave day counts
+    const holidayRes = await pool.request().query('SELECT holiday_date FROM holidays');
+    const holidayDates = new Set(holidayRes.recordset.map(h => new Date(h.holiday_date).toISOString().split('T')[0]));
+
     // DUPLICATE CHECK: Prevent multiple active requests for the same user on the same date
     const duplicateCheck = await pool.request()
       .input('uId', sql.Int, userId)
@@ -3327,8 +3354,7 @@ app.post(['/api/leaves', '/api/leave'], verifyToken, async (req, res) => {
     let project_manager_id = isTL ? reporting_manager_id : (hierarchy_pm_id || 20251);
     if (isManager) project_manager_id = 20251;
 
-    let requestedDays = Math.ceil((new Date(end_date) - new Date(start_date)) / (1000 * 60 * 60 * 24)) + 1;
-    if (is_half_day) requestedDays = 0.5;
+    let requestedDays = is_half_day ? 0.5 : countWorkingDays(start_date, end_date, holidayDates);
     let rmStatus = 'Pending';
     let pmStatus = 'Pending';
 
@@ -3363,12 +3389,15 @@ app.post(['/api/leaves', '/api/leave'], verifyToken, async (req, res) => {
       const pendingRes = await pool.request()
         .input('uId', sql.Int, userId)
         .query(`
-          SELECT SUM(CASE WHEN is_half_day = 1 THEN 0.5 ELSE DATEDIFF(day, start_date, end_date) + 1 END) as pending_days
+          SELECT start_date, end_date, is_half_day
           FROM leaves 
           WHERE user_id = @uId AND leave_type = 'Casual Leave' AND hr_status = 'Pending' AND (rm_status <> 'Rejected' AND pm_status <> 'Rejected')
         `);
 
-      const pendingDays = pendingRes.recordset[0]?.pending_days || 0;
+      let pendingDays = 0;
+      for (const row of pendingRes.recordset) {
+        pendingDays += row.is_half_day ? 0.5 : countWorkingDays(row.start_date, row.end_date, holidayDates);
+      }
       const effectiveBalance = leave_balance - pendingDays;
 
       if (effectiveBalance < requestedDays) {
@@ -6427,7 +6456,7 @@ app.get('/api/threads', async (req, res) => {
 
     let query = `
       WITH PagedThreads AS (
-        SELECT t.id, t.user_id, t.employee_name, t.role, t.tagline, t.content, t.media_type, t.created_at,
+        SELECT t.id, t.user_id, t.employee_name, t.role, t.content, t.media_type, t.created_at,
                rx.likes, rx.heartCount, rx.thumbsupCount, rx.shockedCount, rx.laughCount, rx.fireCount, rx.clapCount, rx.cakeCount,
                t.comments_count as comments,
                u.name as uName, u.role as uRole,
@@ -6526,7 +6555,6 @@ app.get('/api/threads', async (req, res) => {
         profile_picture: pfp,
         profile_image: pfp,
         avatar: pfp,
-        tagline: row.tagline,
         reactions: { ...emojiReactions, total: totalReactions },
         user_reactions: emojiUserReactions,
         likeCount: row.likes || 0,
@@ -7114,7 +7142,6 @@ app.get('/api/threads/:id', async (req, res) => {
       profile_picture: pfp,
       profile_image: pfp,
       avatar: pfp,
-      tagline: thread.tagline,
       reactions: { ...emojiReactions, total: totalReactions },
       user_reactions: emojiUserReactions,
       likeCount: thread.likes || 0,
@@ -7210,7 +7237,7 @@ app.get('/api/threads/user/:userId', async (req, res) => {
 
     let query = `
         SELECT t.id, t.content, t.media_url, t.media_type, 
-               t.created_at as created_at, t.tagline,
+               t.created_at as created_at,
                ISNULL(t.employee_name, u.name) as authorName, 
                ISNULL(t.role, u.role) as authorRole,
                u.profile_picture as authorPicture,
@@ -7282,7 +7309,6 @@ app.get('/api/threads/user/:userId', async (req, res) => {
         profile_picture: pfp,
         profile_image: pfp,
         avatar: pfp,
-        tagline: row.tagline,
         likeCount: row.likes,
         userHasLiked: userTypes.includes('like'),
         userReaction: userTypes[0] || null,
@@ -7305,7 +7331,6 @@ app.put('/api/threads/:id', memoryUpload.single('media'), async (req, res) => {
   const { id } = req.params;
   const userId = req.body.userId || req.body.user_id || req.body.employeeId || req.body.employee_id;
   const content = req.body.content || req.body.text || req.body.description;
-  const tagline = req.body.tagline || '';
 
   if (!userId) return res.status(400).json({ error: 'User ID is required to verify ownership before editing' });
 
@@ -7339,10 +7364,9 @@ app.put('/api/threads/:id', memoryUpload.single('media'), async (req, res) => {
     await pool.request()
       .input('threadId', sql.Int, id)
       .input('content', sql.NVarChar(sql.MAX), content || '')
-      .input('tagline', sql.NVarChar, tagline)
       .input('mediaUrl', sql.NVarChar(sql.MAX), mediaUrl)
       .input('mediaType', sql.NVarChar(50), mediaType)
-      .query('UPDATE threads SET content = @content, tagline = @tagline, media_url = @mediaUrl, media_type = @mediaType WHERE id = @threadId');
+      .query('UPDATE threads SET content = @content, media_url = @mediaUrl, media_type = @mediaType WHERE id = @threadId');
 
     res.json({ success: true, message: 'Thread updated successfully', mediaUrl, mediaType });
   } catch (err) {
@@ -9994,8 +10018,11 @@ app.post('/api/leaves/request', verifyToken, async (req, res) => {
     }
     // --------------------------------------------------------------
 
-    // 1.5 Calculate requested days (handling half-day logic)
-    const requestedDays = isHalfDay ? 0.5 : (Math.ceil(Math.abs(new Date(endDate) - new Date(startDate)) / (1000 * 60 * 60 * 24)) + 1);
+    // 1.5 Fetch holidays & calculate requested working days (excluding Sundays & public holidays)
+    const holidayRes = await pool.request().query('SELECT holiday_date FROM holidays');
+    const holidayDates = new Set(holidayRes.recordset.map(h => new Date(h.holiday_date).toISOString().split('T')[0]));
+
+    const requestedDays = isHalfDay ? 0.5 : countWorkingDays(startDate, endDate, holidayDates);
 
     // 1.6 LEAVE BALANCE CHECK: Include PENDING casual leaves in the calculation
     if (leaveType === 'Casual Leave') {
@@ -10003,8 +10030,7 @@ app.post('/api/leaves/request', verifyToken, async (req, res) => {
       const pendingRes = await pool.request()
         .input('uId', sql.Int, userId)
         .query(`
-          SELECT 
-            SUM(CASE WHEN is_half_day = 1 THEN 0.5 ELSE DATEDIFF(day, start_date, end_date) + 1 END) as pending_days
+          SELECT start_date, end_date, is_half_day
           FROM leaves 
           WHERE user_id = @uId 
           AND leave_type = 'Casual Leave' 
@@ -10012,7 +10038,10 @@ app.post('/api/leaves/request', verifyToken, async (req, res) => {
           AND (rm_status <> 'Rejected' AND pm_status <> 'Rejected')
         `);
 
-      const pendingDays = pendingRes.recordset[0]?.pending_days || 0;
+      let pendingDays = 0;
+      for (const row of pendingRes.recordset) {
+        pendingDays += row.is_half_day ? 0.5 : countWorkingDays(row.start_date, row.end_date, holidayDates);
+      }
       const effectiveBalance = employee.leave_balance - pendingDays;
 
       if (effectiveBalance < requestedDays) {
