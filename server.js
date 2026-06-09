@@ -3110,7 +3110,7 @@ app.post('/api/sprint-updates', async (req, res) => {
           updated_at = DATEADD(MINUTE, 330, GETUTCDATE())
       WHEN NOT MATCHED THEN
         INSERT (type, title, assignee_id, status, progress, owner_id, updated_at)
-        VALUES ('TASK', source.src_title, source.src_assignee, @sprintStatus, @progressPercentage, 202501, DATEADD(MINUTE, 330, GETUTCDATE()));
+        VALUES ('TASK', source.src_title, source.src_assignee, @sprintStatus, @progressPercentage, 20251, DATEADD(MINUTE, 330, GETUTCDATE()));
     `);
 
     res.json({ success: true, message: 'Sprint progress updated successfully' });
@@ -3326,9 +3326,61 @@ app.post(['/api/leaves', '/api/leave'], verifyToken, async (req, res) => {
     }
     // --------------------------------------------------------------
 
-    // Fetch all public holidays to exclude Sundays & holidays from leave day counts
+    // 1.5 Fetch holidays & calculate requested working days (excluding Sundays & public holidays)
     const holidayRes = await pool.request().query('SELECT holiday_date FROM holidays');
     const holidayDates = new Set(holidayRes.recordset.map(h => new Date(h.holiday_date).toISOString().split('T')[0]));
+
+    const requestedDays = is_half_day ? 0.5 : countWorkingDays(start_date, end_date, holidayDates);
+
+    // Fetch CEO and PM dynamically by role/designation
+    const keyPersonnelResult = await pool.request().query(`
+      SELECT id, role 
+      FROM users WITH (NOLOCK)
+      WHERE role LIKE '%CEO%' 
+         OR role LIKE '%Founder%' 
+         OR role LIKE '%Project Manager%' 
+         OR role LIKE '%PM%'
+    `);
+
+    let ceoId = null;
+    let defaultPmId = null;
+
+    keyPersonnelResult.recordset.forEach(u => {
+      const r = (u.role || '').toLowerCase();
+      if (r.includes('ceo') || r.includes('founder')) ceoId = u.id;
+      if (r.includes('project manager') || r === 'pm') defaultPmId = u.id;
+    });
+
+    if (!ceoId || !defaultPmId) {
+      return res.status(500).json({ error: 'Organizational hierarchy error: CEO or Project Manager not found by role/designation' });
+    }
+
+    const normalizedRole = (role || '').toLowerCase();
+    const isTL = normalizedRole.includes('lead') || normalizedRole.includes('tl');
+    const isManager = normalizedRole.includes('manager');
+    const isHR = isHRRole(normalizedRole);
+
+    // HIERARCHY LOGIC: 
+    // If Manager or HR: Reports directly to CEO
+    // If Lead: PM is their direct RM
+    // If Member: PM is their RM's RM
+    let project_manager_id = isTL ? reporting_manager_id : (hierarchy_pm_id || defaultPmId);
+
+    if (isManager) {
+      project_manager_id = ceoId; // Set CEO as their direct PM/Approver
+    }
+    if (isHR) {
+      project_manager_id = reporting_manager_id || defaultPmId; // Set PM/Manager as their PM
+    }
+
+    let rmStatus = 'Pending';
+    let pmStatus = 'Pending';
+
+    // SPECIAL CASE: If TL, Manager, or HR: RM stage is skipped (N/A) because they report directly to PM/CEO
+    if (isTL || isManager || isHR || reporting_manager_id == project_manager_id) {
+      rmStatus = 'N/A';
+      pmStatus = 'Pending';
+    }
 
     // DUPLICATE CHECK: Prevent multiple active requests for the same user on the same date
     const duplicateCheck = await pool.request()
@@ -3341,27 +3393,6 @@ app.post(['/api/leaves', '/api/leave'], verifyToken, async (req, res) => {
         error: 'Duplicate Request',
         message: `You already have an active leave request starting on ${start_date}. Please check your history.`
       });
-    }
-
-    const normalizedRole = (role || '').toLowerCase();
-    const isTL = normalizedRole.includes('lead') || normalizedRole.includes('tl');
-    const isManager = normalizedRole.includes('manager');
-
-    // HIERARCHY LOGIC: 
-    // If Manager: Reports directly to CEO (20251)
-    // If Lead: PM is their direct RM
-    // If Member: PM is their RM's RM
-    let project_manager_id = isTL ? reporting_manager_id : (hierarchy_pm_id || 20251);
-    if (isManager) project_manager_id = 20251;
-
-    let requestedDays = is_half_day ? 0.5 : countWorkingDays(start_date, end_date, holidayDates);
-    let rmStatus = 'Pending';
-    let pmStatus = 'Pending';
-
-    // SPECIAL CASE: If TL or Manager: RM stage is skipped (N/A) because they report directly to PM/CEO
-    if (isTL || isManager || reporting_manager_id == project_manager_id) {
-      rmStatus = 'N/A';
-      pmStatus = 'Pending';
     }
 
     // --- PROBATION CHECK (90 Days) ---
@@ -3544,7 +3575,8 @@ app.get(['/api/attendance', '/api/attendance ', '/api/attendance%20'], verifyTok
       });
     }
 
-    const url = `${baseUrl}/DownloadInOutPunchData?Empcode=${empCode}&FromDate=${formattedDate}&ToDate=${formattedDate}`;
+    const company = process.env.TEAM_OFFICE_COMPANY || 'Navabharath Technologies';
+    const url = `${baseUrl}/DownloadInOutPunchData?Empcode=${empCode}&FromDate=${formattedDate}&ToDate=${formattedDate}&Company=${encodeURIComponent(company)}`;
 
     console.log(`[ATTENDANCE] Syncing logs for ${userResult.recordset[0].name} (ID: ${empCode})`);
 
@@ -3645,7 +3677,7 @@ app.get(['/api/attendance', '/api/attendance ', '/api/attendance%20'], verifyTok
       const dateKey = istTime.toISOString().split('T')[0];
       const holidayCheck = await pool.request()
         .input('dKey', sql.Date, istTime)
-        .query('SELECT holiday_name FROM holidays WHERE holiday_date = @dKey');
+        .query('SELECT name AS holiday_name FROM holidays WHERE holiday_date = @dKey');
 
       let finalRemark = apiLog.Remark;
       if (holidayCheck.recordset.length > 0) {
@@ -3901,7 +3933,7 @@ app.get('/api/admin/etime-logs', verifyToken, async (req, res) => {
   }
 
   const { fromDate, toDate, empCode } = req.query; // Expecting DD/MM/YYYY
-  if (!fromDate || !toDate) {
+      if (!fromDate || !toDate) {
     return res.status(400).json({ error: 'fromDate and toDate parameters are required (Format: DD/MM/YYYY)' });
   }
 
@@ -3910,7 +3942,8 @@ app.get('/api/admin/etime-logs', verifyToken, async (req, res) => {
     const authToken = process.env.TEAM_OFFICE_AUTH_TOKEN;
     const finalEmpCode = empCode || 'ALL';
 
-    const url = `${baseUrl}/DownloadInOutPunchData?Empcode=${finalEmpCode}&FromDate=${fromDate}&ToDate=${toDate}`;
+    const company = process.env.TEAM_OFFICE_COMPANY || 'Navabharath Technologies';
+    const url = `${baseUrl}/DownloadInOutPunchData?Empcode=${finalEmpCode}&FromDate=${fromDate}&ToDate=${toDate}&Company=${encodeURIComponent(company)}`;
 
     console.log(`[ETIME FETCH] Fetching from: ${url}`);
 
@@ -3921,17 +3954,371 @@ app.get('/api/admin/etime-logs', verifyToken, async (req, res) => {
     if (!response.ok) throw new Error(`External API Failure: ${response.status}`);
 
     const data = await response.json();
+    const rawLogs = data.InOutPunchData || [];
+
+    // --- SYNC TO DATABASE ---
+    const pool = await getPool();
+    const usersMap = await getUsersMap();
+
+    // Parse start and end dates to query holidays
+    const [fromD, fromM, fromY] = fromDate.split('/');
+    const [toD, toM, toY] = toDate.split('/');
+    const startSqlDate = `${fromY}-${fromM}-${fromD}`;
+    const endSqlDate = `${toY}-${toM}-${toD}`;
+
+    const holidaysRes = await pool.request()
+      .input('start', sql.Date, startSqlDate)
+      .input('end', sql.Date, endSqlDate)
+      .query('SELECT holiday_date, name AS holiday_name FROM holidays WHERE holiday_date >= @start AND holiday_date <= @end');
+
+    const holidayMap = new Map();
+    holidaysRes.recordset.forEach(h => {
+      try {
+        const dateStr = new Date(h.holiday_date).toISOString().split('T')[0];
+        holidayMap.set(dateStr, h.holiday_name);
+      } catch (e) {}
+    });
+
+    let syncCount = 0;
+
+    for (const log of rawLogs) {
+      if (!log.Empcode || !log.DateString) continue;
+
+      // Parse Empcode and auto‑correct 6‑digit IDs like 20250X → 2025X
+      let rawEmpId = String(log.Empcode).trim();
+      if (!rawEmpId) continue;
+      // Collapse 6‑digit codes starting with '20250' to proper 5‑digit IDs
+      if (rawEmpId.length === 6 && rawEmpId.startsWith('20250')) {
+        rawEmpId = rawEmpId.replace('20250', '2025');
+      }
+      const userId = parseInt(rawEmpId, 10);
+      if (isNaN(userId)) continue;
+
+      // Retrieve user info; if not present (e.g., newly added), create a minimal placeholder
+      const user = usersMap.get(userId) || { id: userId, joining_date: null, name: null };
+
+
+      // Parse DateString (DD/MM/YYYY)
+      const [d, m, y] = log.DateString.split('/');
+      const punchDateStr = `${y}-${m}-${d}`;
+      const punchDate = new Date(punchDateStr);
+
+      // Joining Date Filter
+      if (user.joining_date && punchDate < new Date(user.joining_date)) {
+        continue;
+      }
+
+      // Calculate WorkTime manually
+      const calcWorkTime = (inT, outT) => {
+        if (!inT || !outT || inT === '00:00' || outT === '00:00' || inT === '--:--' || outT === '--:--') return "00:00";
+        try {
+          const [inH, inM] = inT.split(':').map(Number);
+          const [outH, outM] = outT.split(':').map(Number);
+          if (isNaN(inH) || isNaN(inM) || isNaN(outH) || isNaN(outM)) return "00:00";
+          let diff = (outH * 60 + outM) - (inH * 60 + inM);
+          if (diff < 0) diff += 1440;
+          return `${String(Math.floor(diff / 60)).padStart(2, '0')}:${String(diff % 60).padStart(2, '0')}`;
+        } catch { return "00:00"; }
+      };
+
+      const manualWorkTime = calcWorkTime(log.INTime, log.OUTTime);
+
+      const isMissing = (time) => !time || time === '--:--' || time === '00:00';
+
+      let finalStatus = log.Status;
+      if (!isMissing(log.INTime) && isMissing(log.OUTTime)) {
+        const istOffset = 330;
+        const now = new Date();
+        const istTodayStr = new Date(now.getTime() + (istOffset * 60 * 1000)).toISOString().split('T')[0];
+        const isToday = punchDateStr === istTodayStr;
+
+        if (isToday) {
+          let completedShift = false;
+          try {
+            const [inH, inM] = log.INTime.split(':').map(Number);
+            const istTime = new Date(now.getTime() + (istOffset * 60 * 1000));
+            const curH = istTime.getUTCHours();
+            const curM = istTime.getUTCMinutes();
+            let elapsedMins = (curH * 60 + curM) - (inH * 60 + inM);
+            if (elapsedMins < 0) elapsedMins += 1440;
+            if (elapsedMins >= 480) {
+              completedShift = true;
+            }
+          } catch (e) {}
+
+          if (completedShift) {
+            finalStatus = 'P';
+          } else {
+            finalStatus = 'In Office';
+          }
+        } else {
+          finalStatus = 'A';
+        }
+      } else if (!isMissing(log.INTime) && !isMissing(log.OUTTime)) {
+        if (manualWorkTime && manualWorkTime.includes(':')) {
+          try {
+            const [h, m] = manualWorkTime.split(':').map(Number);
+            const totalHours = h + (m / 60);
+            if (totalHours >= 8) {
+              finalStatus = 'P';
+            } else if (totalHours >= 5 && totalHours < 8) {
+              finalStatus = 'Half Day';
+            } else {
+              finalStatus = 'A';
+            }
+          } catch { }
+        }
+      } else {
+        finalStatus = 'A';
+      }
+
+      // Check Holiday
+      let finalRemark = log.Remark || '--';
+      const holidayName = holidayMap.get(punchDateStr);
+      if (holidayName) {
+        finalStatus = 'H';
+        finalRemark = holidayName;
+      } else if (punchDate.getUTCDay() === 0 && finalStatus === 'A') {
+        finalStatus = 'WO';
+        finalRemark = 'Week Off';
+      }
+
+      // Upsert into database
+      await pool.request()
+        .input('userId', sql.Int, userId)
+        .input('punchDate', sql.Date, punchDateStr)
+        .input('inTime', sql.NVarChar, log.INTime || '--:--')
+        .input('outTime', sql.NVarChar, log.OUTTime || '--:--')
+        .input('workTime', sql.NVarChar, manualWorkTime)
+        .input('status', sql.NVarChar, finalStatus)
+        .input('remark', sql.NVarChar, finalRemark)
+        .query(`
+          MERGE INTO attendance_logs WITH (HOLDLOCK) AS target
+          USING (SELECT @userId AS user_id, @punchDate AS punch_date) AS source
+          ON (target.user_id = source.user_id AND target.punch_date = source.punch_date)
+          WHEN MATCHED THEN
+              UPDATE SET in_time = @inTime, out_time = @outTime, work_time = @workTime, status = @status, remark = @remark, last_sync = GETDATE()
+          WHEN NOT MATCHED THEN
+              INSERT (user_id, punch_date, in_time, out_time, work_time, status, remark)
+              VALUES (@userId, @punchDate, @inTime, @outTime, @workTime, @status, @remark);
+        `);
+
+      syncCount++;
+    }
+
     res.json({
       success: true,
       source: 'Etime Office',
       url: url,
-      data: data.InOutPunchData || []
+      data: rawLogs,
+      syncedCount: syncCount
     });
   } catch (err) {
     console.error('[ETIME LOG FETCH ERROR]:', err);
-    res.status(500).json({ error: 'Failed to fetch logs from Etime Office service.', details: err.message });
+    res.status(500).json({ error: 'Failed to fetch and sync logs from Etime Office service.', details: err.message });
   }
 });
+
+// POST: Sync attendance for a specific user (e.g., after adding new member)
+app.post('/api/admin/sync-user-attendance', verifyToken, async (req, res) => {
+  // Only HR/Admin can perform this sync
+  const role = (req.user.role || '').toLowerCase();
+  if (!role.includes('hr') && !role.includes('human resource') && !role.includes('admin')) {
+    return res.status(403).json({ error: 'Unauthorized: High-level clearance required for user attendance sync.' });
+  }
+
+  const { userId, fromDate, toDate } = req.body;
+  if (!userId || !fromDate || !toDate) {
+    return res.status(400).json({ error: 'userId, fromDate and toDate are required (Format: DD/MM/YYYY)' });
+  }
+
+  try {
+    const baseUrl = process.env.TEAM_OFFICE_BASE_URL || 'https://api.etimeoffice.com/api';
+    const authToken = process.env.TEAM_OFFICE_AUTH_TOKEN;
+    const company = process.env.TEAM_OFFICE_COMPANY || 'Navabharath Technologies';
+    const url = `${baseUrl}/DownloadInOutPunchData?Empcode=${userId}&FromDate=${fromDate}&ToDate=${toDate}&Company=${encodeURIComponent(company)}`;
+    console.log(`[USER SYNC] Fetching from: ${url}`);
+    const response = await fetch(url, { headers: { 'Authorization': `Basic ${authToken}` } });
+    if (!response.ok) throw new Error(`External API Failure: ${response.status}`);
+    const data = await response.json();
+    const rawLogs = data.InOutPunchData || [];
+
+    const pool = await getPool();
+    const usersMap = await getUsersMap();
+
+    // Holiday map as in etime-logs
+    const [fromD, fromM, fromY] = fromDate.split('/');
+    const [toD, toM, toY] = toDate.split('/');
+    const startSqlDate = `${fromY}-${fromM}-${fromD}`;
+    const endSqlDate = `${toY}-${toM}-${toD}`;
+    const holidaysRes = await pool.request()
+      .input('start', sql.Date, startSqlDate)
+      .input('end', sql.Date, endSqlDate)
+      .query('SELECT holiday_date, name AS holiday_name FROM holidays WHERE holiday_date >= @start AND holiday_date <= @end');
+    const holidayMap = new Map();
+    holidaysRes.recordset.forEach(h => {
+      try { const ds = new Date(h.holiday_date).toISOString().split('T')[0]; holidayMap.set(ds, h.holiday_name); } catch (e) {}
+    });
+
+    let syncCount = 0;
+    for (const log of rawLogs) {
+      if (!log.Empcode || !log.DateString) continue;
+      // Ensure this log belongs to the requested userId (after auto‑correct handling)
+      let rawEmpId = String(log.Empcode).trim();
+      if (rawEmpId.length === 6 && rawEmpId.startsWith('20250')) rawEmpId = rawEmpId.replace('20250', '2025');
+      const empId = parseInt(rawEmpId, 10);
+      if (empId !== parseInt(userId, 10)) continue;
+
+      const user = usersMap.get(empId) || { id: empId, joining_date: null, name: null };
+
+      const [d, m, y] = log.DateString.split('/');
+      const punchDateStr = `${y}-${m}-${d}`;
+      const punchDate = new Date(punchDateStr);
+      if (user.joining_date && punchDate < new Date(user.joining_date)) continue;
+
+      // Work time calculation
+      const calcWorkTime = (inT, outT) => {
+        if (!inT || !outT || inT === '00:00' || outT === '00:00' || inT === '--:--' || outT === '--:--') return "00:00";
+        try {
+          const [inH, inM] = inT.split(':').map(Number);
+          const [outH, outM] = outT.split(':').map(Number);
+          if (isNaN(inH) || isNaN(inM) || isNaN(outH) || isNaN(outM)) return "00:00";
+          let diff = (outH * 60 + outM) - (inH * 60 + inM);
+          if (diff < 0) diff += 1440;
+          return `${String(Math.floor(diff / 60)).padStart(2, '0')}:${String(diff % 60).padStart(2, '0')}`;
+        } catch { return "00:00"; }
+      };
+      const manualWorkTime = calcWorkTime(log.INTime, log.OUTTime);
+
+      // Status logic (reuse from earlier endpoint)
+      const isMissing = t => !t || t === '--:--' || t === '00:00';
+      let finalStatus = log.Status;
+      const istOffset = 330;
+      const now = new Date();
+      const istTodayStr = new Date(now.getTime() + (istOffset * 60 * 1000)).toISOString().split('T')[0];
+      const isToday = punchDateStr === istTodayStr;
+      if (!isMissing(log.INTime) && isMissing(log.OUTTime)) {
+        if (isToday) {
+          let completedShift = false;
+          try {
+            const [inH, inM] = log.INTime.split(':').map(Number);
+            const ist = new Date(now.getTime() + (istOffset * 60 * 1000));
+            const curH = ist.getUTCHours();
+            const curM = ist.getUTCMinutes();
+            let elapsed = (curH * 60 + curM) - (inH * 60 + inM);
+            if (elapsed < 0) elapsed += 1440;
+            if (elapsed >= 480) completedShift = true;
+          } catch (e) {}
+          finalStatus = completedShift ? 'P' : 'In Office';
+        } else {
+          finalStatus = 'A';
+        }
+      } else if (!isMissing(log.INTime) && !isMissing(log.OUTTime)) {
+        if (manualWorkTime && manualWorkTime.includes(':')) {
+          const [h, m] = manualWorkTime.split(':').map(Number);
+          const totalHours = h + (m / 60);
+          if (totalHours >= 8) finalStatus = 'P';
+          else if (totalHours >= 5) finalStatus = 'Half Day';
+          else finalStatus = 'A';
+        }
+      } else {
+        finalStatus = 'A';
+      }
+
+      // Holiday/WeekOff handling
+      let finalRemark = log.Remark || '--';
+      const holidayName = holidayMap.get(punchDateStr);
+      if (holidayName) {
+        finalStatus = 'H';
+        finalRemark = holidayName;
+      } else if (punchDate.getUTCDay() === 0 && finalStatus === 'A') {
+        finalStatus = 'WO';
+        finalRemark = 'Week Off';
+      }
+
+      // Upsert
+      await pool.request()
+        .input('userId', sql.Int, empId)
+        .input('punchDate', sql.Date, punchDateStr)
+        .input('inTime', sql.NVarChar, log.INTime || '--:--')
+        .input('outTime', sql.NVarChar, log.OUTTime || '--:--')
+        .input('workTime', sql.NVarChar, manualWorkTime)
+        .input('status', sql.NVarChar, finalStatus)
+        .input('remark', sql.NVarChar, finalRemark)
+        .query(`
+          MERGE INTO attendance_logs WITH (HOLDLOCK) AS target
+          USING (SELECT @userId AS user_id, @punchDate AS punch_date) AS source
+          ON (target.user_id = source.user_id AND target.punch_date = source.punch_date)
+          WHEN MATCHED THEN
+            UPDATE SET in_time = @inTime, out_time = @outTime, work_time = @workTime, status = @status, remark = @remark, last_sync = GETDATE()
+          WHEN NOT MATCHED THEN
+            INSERT (user_id, punch_date, in_time, out_time, work_time, status, remark)
+            VALUES (@userId, @punchDate, @inTime, @outTime, @workTime, @status, @remark);
+        `);
+      syncCount++;
+    }
+
+    res.json({ success: true, syncedCount: syncCount, userId: userId, fromDate, toDate });
+  } catch (err) {
+    console.error('[USER SYNC ERROR]:', err);
+    res.status(500).json({ error: 'Failed to sync user attendance.', details: err.message });
+  }
+});
+
+// GET: Fetch attendance from Etime Office for all users in the local DB
+app.get('/api/admin/user-attendance', verifyToken, async (req, res) => {
+    // Only HR/Admin can access
+    const role = (req.user.role || '').toLowerCase();
+    const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('manager') || role.includes('lead');
+    if (!isAdmin) return res.status(403).json({ error: 'Unauthorized: Admin access required.' });
+
+    const { fromDate, toDate } = req.query;
+    // Default to today IST if dates not provided
+    const istOffset = 330; // minutes
+    const now = new Date();
+    const istDate = new Date(now.getTime() + istOffset * 60 * 1000);
+    const defaultDate = istDate.toISOString().split('T')[0];
+    const start = fromDate || defaultDate;
+    const end = toDate || defaultDate;
+
+    try {
+      const pool = await getPool();
+      // Fetch all active users (excluding placeholder CEO id 20250)
+      const usersRes = await pool.request()
+        .query('SELECT id, name FROM users WHERE id <> 20250');
+      const users = usersRes.recordset;
+
+      const baseUrl = process.env.TEAM_OFFICE_BASE_URL || 'https://api.etimeoffice.com/api';
+      const authToken = process.env.TEAM_OFFICE_AUTH_TOKEN;
+
+      const attendanceResults = [];
+      const errors = [];
+
+      const company = process.env.TEAM_OFFICE_COMPANY || 'Navabharath Technologies';
+      // Process each user sequentially to avoid overwhelming the external API
+      for (const user of users) {
+        const url = `${baseUrl}/DownloadInOutPunchData?Empcode=${user.id}&FromDate=${start}&ToDate=${end}&Company=${encodeURIComponent(company)}`;
+        try {
+          const response = await fetch(url, { headers: { 'Authorization': `Basic ${authToken}` } });
+          if (!response.ok) throw new Error(`API ${response.status}`);
+          const data = await response.json();
+          const logs = data.InOutPunchData || [];
+          // Attach user info to each log
+          logs.forEach(log => {
+            attendanceResults.push({ userId: user.id, userName: user.name, ...log });
+          });
+        } catch (e) {
+          console.error(`[USER ATTENDANCE FETCH ERROR] User ${user.id}:`, e.message);
+          errors.push({ userId: user.id, error: e.message });
+        }
+      }
+
+      res.json({ success: true, fromDate: start, toDate: end, attendance: attendanceResults, errors });
+    } catch (err) {
+      console.error('[USER ATTENDANCE ENDPOINT ERROR]:', err);
+      res.status(500).json({ error: 'Failed to retrieve user attendance.', details: err.message });
+    }
+  });
 
 // GET: /api/admin/attendance/summary (Admin dashboard overview of Present vs Absent)
 app.get('/api/admin/attendance/summary', verifyToken, async (req, res) => {
@@ -3958,7 +4345,7 @@ app.get('/api/admin/attendance/summary', verifyToken, async (req, res) => {
     request.input('targetDate', sql.Date, targetDateStr);
 
     const usersRes = await request.query(`
-      SELECT id, name, team, designation, joining_date 
+      SELECT id, name, team, role, joining_date 
       FROM users WITH (NOLOCK) 
       WHERE id <> 20250 AND (joining_date IS NULL OR joining_date <= @targetDate)
     `);
@@ -3998,7 +4385,7 @@ app.get('/api/admin/attendance/summary', verifyToken, async (req, res) => {
         id: u.id,
         name: u.name,
         team: u.team || 'N/A',
-        designation: u.designation || 'N/A',
+        designation: u.role || 'N/A',
         in_time: log ? log.in_time : null,
         out_time: log ? log.out_time : null,
         work_time: log ? log.work_time : null,
@@ -5500,7 +5887,7 @@ const isDuplicateNotification = async (pool, targetUserId, message) => {
   }
 };
 
-// Helper: Notify team on Task Assignment
+// Helper: Notify assignee on Task Assignment (targeted only, with team notification if assignee is Team Lead)
 const notifyTaskAssignment = async (pool, assignerId, assigneeId, taskName) => {
   try {
     const parsedAssignerId = parseInt(assignerId);
@@ -5526,13 +5913,17 @@ const notifyTaskAssignment = async (pool, assignerId, assigneeId, taskName) => {
             (SELECT name FROM new_joinees WITH (NOLOCK) WHERE id = @assigneeId)
           ) as assigneeName,
           COALESCE(
+            (SELECT role FROM users WITH (NOLOCK) WHERE id = @assigneeId),
+            'New Joinee'
+          ) as assigneeRole,
+          COALESCE(
             (SELECT team FROM users WITH (NOLOCK) WHERE id = @assigneeId),
             'New Joinee'
           ) as assigneeTeam
       `);
 
     if (userQuery.recordset.length === 0) return;
-    const { assignerName, assignerRole, assigneeName, assigneeTeam } = userQuery.recordset[0];
+    const { assignerName, assignerRole, assigneeName, assigneeRole, assigneeTeam } = userQuery.recordset[0];
 
     // Check if the assigner is a manager/lead/CEO/founder/admin
     const isManager = assignerRole && (
@@ -5551,22 +5942,6 @@ const notifyTaskAssignment = async (pool, assignerId, assigneeId, taskName) => {
       return;
     }
 
-    const recipientIds = new Set();
-    if (assigneeTeam && assigneeTeam !== 'New Joinee') {
-      const teamMembersQuery = await pool.request()
-        .input('teamName', sql.NVarChar, assigneeTeam)
-        .query('SELECT id FROM users WITH (NOLOCK) WHERE team = @teamName');
-      for (const row of teamMembersQuery.recordset) {
-        recipientIds.add(row.id);
-      }
-    }
-
-    // Remove assignee from team recipients to handle separately
-    recipientIds.delete(parsedAssigneeId);
-
-    // Also remove the assigner/manager so they don't receive notification about their own action
-    recipientIds.delete(parsedAssignerId);
-
     // 1. Notify Assignee: "Task assigned to you: [Task Name] by [Manager Name]"
     const assigneeAlert = `Task assigned to you: ${taskName} by ${assignerName || 'Manager'}`;
     const assigneeDup = await isDuplicateNotification(pool, parsedAssigneeId, assigneeAlert);
@@ -5575,22 +5950,39 @@ const notifyTaskAssignment = async (pool, assignerId, assigneeId, taskName) => {
         .input('assigneeId', sql.Int, parsedAssigneeId)
         .input('msg', sql.NVarChar, assigneeAlert)
         .query("INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@assigneeId, @msg, 'TASK', 0, DATEADD(MINUTE, 330, GETUTCDATE()))");
+      console.log(`[NOTIFICATION] Task assignment notification sent to assignee ${parsedAssigneeId}`);
     }
 
-    // 2. Notify other team members
-    if (recipientIds.size > 0) {
-      const alertMessage = `Task assigned to ${assigneeName || 'Employee'}: ${taskName} by ${assignerName || 'Manager'}`;
-      const filteredRecipients = [];
-      for (const rid of recipientIds) {
-        const isDup = await isDuplicateNotification(pool, rid, alertMessage);
-        if (!isDup) filteredRecipients.push(rid);
+    // 2. Notify team members ONLY if the assignee is a Team Lead / TL
+    const assigneeRoleLower = (assigneeRole || '').toLowerCase();
+    const isAssigneeTL = assigneeRoleLower.includes('lead') || assigneeRoleLower.includes('tl');
+
+    if (isAssigneeTL && assigneeTeam && assigneeTeam !== 'New Joinee') {
+      const teamMembersQuery = await pool.request()
+        .input('teamName', sql.NVarChar, assigneeTeam)
+        .query('SELECT id FROM users WITH (NOLOCK) WHERE team = @teamName');
+
+      const recipientIds = new Set();
+      for (const row of teamMembersQuery.recordset) {
+        recipientIds.add(row.id);
       }
-      if (filteredRecipients.length > 0) {
-        const valuesClauses = filteredRecipients.map((_, i) => `(@uid${i}, @msg, 'TASK', 0, DATEADD(MINUTE, 330, GETUTCDATE()))`);
-        const batchRequest = pool.request().input('msg', sql.NVarChar, alertMessage);
-        filteredRecipients.forEach((rid, i) => batchRequest.input(`uid${i}`, sql.Int, rid));
-        await batchRequest.query(`INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES ${valuesClauses.join(', ')}`);
-        console.log(`[NOTIFICATION] Task assignment notification sent to team ${assigneeTeam || 'None'} (${filteredRecipients.length} recipients)`);
+      recipientIds.delete(parsedAssigneeId);
+      recipientIds.delete(parsedAssignerId);
+
+      if (recipientIds.size > 0) {
+        const alertMessage = `Task assigned to your Lead ${assigneeName || 'Employee'}: ${taskName} by ${assignerName || 'Manager'}`;
+        const filteredRecipients = [];
+        for (const rid of recipientIds) {
+          const isDup = await isDuplicateNotification(pool, rid, alertMessage);
+          if (!isDup) filteredRecipients.push(rid);
+        }
+        if (filteredRecipients.length > 0) {
+          const valuesClauses = filteredRecipients.map((_, i) => `(@uid${i}, @msg, 'TASK', 0, DATEADD(MINUTE, 330, GETUTCDATE()))`);
+          const batchRequest = pool.request().input('msg', sql.NVarChar, alertMessage);
+          filteredRecipients.forEach((rid, i) => batchRequest.input(`uid${i}`, sql.Int, rid));
+          await batchRequest.query(`INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES ${valuesClauses.join(', ')}`);
+          console.log(`[NOTIFICATION] Lead task assignment notification sent to team ${assigneeTeam} (${filteredRecipients.length} recipients)`);
+        }
       }
     }
   } catch (err) {
@@ -5646,7 +6038,7 @@ const notifyTaskCompletion = async (pool, taskId) => {
   }
 };
 
-// Helper: Notify team on Task Approval or Ejection
+// Helper: Notify assignee and reporting manager on Task Approval or Ejection
 const notifyTaskReview = async (pool, taskId, verifyStatus) => {
   try {
     const parsedTaskId = parseInt(taskId);
@@ -5691,15 +6083,6 @@ const notifyTaskReview = async (pool, taskId, verifyStatus) => {
     if (assigneeId) recipientIds.add(assigneeId);
     if (reportingManagerId) recipientIds.add(reportingManagerId); // Direct Team Lead/Reporting Manager
 
-    if (assigneeTeam && assigneeTeam !== 'New Joinee') {
-      const teamMembersQuery = await pool.request()
-        .input('teamName', sql.NVarChar, assigneeTeam)
-        .query('SELECT id FROM users WITH (NOLOCK) WHERE team = @teamName');
-      for (const row of teamMembersQuery.recordset) {
-        recipientIds.add(row.id);
-      }
-    }
-
     // Exclude the owner/creator (who performed the review) from receiving notifications about their own review
     if (ownerId) {
       recipientIds.delete(ownerId);
@@ -5724,13 +6107,50 @@ const notifyTaskReview = async (pool, taskId, verifyStatus) => {
         const batchRequest = pool.request().input('msg', sql.NVarChar, alertMessage);
         filteredRecipients.forEach((rid, i) => batchRequest.input(`uid${i}`, sql.Int, rid));
         await batchRequest.query(`INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES ${valuesClauses.join(', ')}`);
-        console.log(`[NOTIFICATION] Task review (${cleanStatus}) notification sent to team ${assigneeTeam || 'None'} (${filteredRecipients.length} recipients)`);
+        console.log(`[NOTIFICATION] Task review (${cleanStatus}) notification sent to assignee and/or manager (${filteredRecipients.length} recipients)`);
       }
     } else {
       console.log(`[NOTIFICATION DEBUG] notifyTaskReview: No recipients to notify for task ${parsedTaskId}`);
     }
   } catch (err) {
     console.error('[NOTIFICATION REVIEW ERROR]:', err);
+  }
+};
+
+// Helper: Notify reporting manager on Task Update
+const notifyTaskUpdate = async (pool, taskId) => {
+  try {
+    const parsedTaskId = parseInt(taskId);
+    const taskQuery = await pool.request()
+      .input('taskId', sql.Int, parsedTaskId)
+      .query(`
+        SELECT 
+          t.title as taskName,
+          t.assignee_id as assigneeId,
+          COALESCE(u_assignee.name, j_assignee.name) as assigneeName,
+          COALESCE(u_assignee.reporting_manager_id, j_assignee.hired_by) as reportingManagerId
+        FROM master_tasks t WITH (NOLOCK)
+        LEFT JOIN users u_assignee WITH (NOLOCK) ON t.assignee_id = u_assignee.id
+        LEFT JOIN new_joinees j_assignee WITH (NOLOCK) ON t.assignee_id = j_assignee.id
+        WHERE t.id = @taskId
+      `);
+
+    if (taskQuery.recordset.length === 0) return;
+    const { taskName, assigneeId, assigneeName, reportingManagerId } = taskQuery.recordset[0];
+
+    if (reportingManagerId && reportingManagerId !== assigneeId) {
+      const alertMessage = `Task updated by ${assigneeName || 'Employee'}: ${taskName}`;
+      const isDup = await isDuplicateNotification(pool, reportingManagerId, alertMessage);
+      if (!isDup) {
+        await pool.request()
+          .input('targetId', sql.Int, reportingManagerId)
+          .input('msg', sql.NVarChar, alertMessage)
+          .query("INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@targetId, @msg, 'TASK', 0, DATEADD(MINUTE, 330, GETUTCDATE()))");
+        console.log(`[NOTIFICATION] Task update notification sent to reporting manager ${reportingManagerId}`);
+      }
+    }
+  } catch (err) {
+    console.error('[NOTIFICATION UPDATE ERROR]:', err);
   }
 };
 
@@ -6318,6 +6738,13 @@ app.put(['/api/tasks/:id', '/api/tasks/status/:taskId', '/api/task-updates/:id',
     const result = await request.query(query);
 
     if (result.rowsAffected && result.rowsAffected[0] > 0) {
+      // If employee updates progress/status/details (not a verification/review)
+      if (verify === undefined) {
+        notifyTaskUpdate(pool, taskId).catch(err => {
+          console.error('[NOTIFICATION UPDATE EXCEPTION]:', err);
+        });
+      }
+
       if (status !== undefined || progress !== undefined) {
         const isCompletedStatus = status && status.toLowerCase() === 'completed';
         const isCompletedProgress = progress !== undefined && parseInt(progress) === 100;
@@ -7656,12 +8083,10 @@ const createComplianceNotification = async (joineeId, reason) => {
 
     // Collect all unique recipient IDs in a Set
     const recipientIds = new Set();
-    recipientIds.add(202501);
-    recipientIds.add(202515);
 
     // Fetch HR users + manager in a single query
     const request = pool.request();
-    let lookupQuery = "SELECT id FROM users WITH (NOLOCK) WHERE LOWER(role) = 'hr'";
+    let lookupQuery = "SELECT id FROM users WITH (NOLOCK) WHERE LOWER(role) LIKE '%human resource%' OR LOWER(role) LIKE '%project manager%'";
     if (hiredBy) {
       lookupQuery += " UNION SELECT id FROM users WITH (NOLOCK) WHERE name = @val OR CAST(id AS NVARCHAR) = @val";
       request.input('val', sql.NVarChar, hiredBy);
@@ -7925,37 +8350,25 @@ app.get('/api/admin/onboarding/audit-now', verifyToken, async (req, res) => {
       });
     }
 
-    // 2. Send welcome emails in parallel to the individuals
-    const { getWelcomeOnboardingHtml } = require('./templates/welcomeEmailTemplate');
+    // 2. Mark as processed so we don't repeatedly alert for the same candidate
     const sentTo = [];
     for (const candidate of candidates) {
-      if (candidate.email) {
-        try {
-          await sendAppEmail({
-            to: candidate.email,
-            subject: `🌟 Onboarding Complete - Congratulations, ${candidate.name}!`,
-            html: getWelcomeOnboardingHtml(candidate.name, candidate.type),
-            text: `Congratulations ${candidate.name}! You have successfully completed your ${candidate.type === 'Intern' ? 'Internship' : 'Onboarding'} duration. Welcome to the next chapter at Navabharath Technologies!`
-          });
+      try {
+        const table = candidate.type === 'Intern' ? 'interns' : 'new_joinees';
+        await pool.request()
+          .input('id', sql.Int, candidate.id)
+          .query(`UPDATE ${table} SET welcome_sent = 1 WHERE id = @id`);
 
-          // Mark as welcome_sent in DB
-          const table = candidate.type === 'Intern' ? 'interns' : 'new_joinees';
-          await pool.request()
-            .input('id', sql.Int, candidate.id)
-            .query(`UPDATE ${table} SET welcome_sent = 1 WHERE id = @id`);
-
-          sentTo.push({ name: candidate.name, email: candidate.email, type: candidate.type });
-          Log.success('SMTP', `Sent manual duration completion welcome email to ${candidate.name} (${candidate.email})`);
-        } catch (mailErr) {
-          console.error(`[SMTP ERROR] Failed to send welcome email to ${candidate.name}:`, mailErr.message);
-        }
+        sentTo.push({ name: candidate.name, email: candidate.email, type: candidate.type });
+      } catch (dbErr) {
+        console.error(`[DB ERROR] Failed to update welcome_sent for ${candidate.name}:`, dbErr.message);
       }
     }
 
-    // 3. Fetch HR and Admin emails
+    // 3. Fetch HR and Manager emails
     const admins = await pool.request().query(`
       SELECT email FROM users WITH (NOLOCK) 
-      WHERE LOWER(role) LIKE '%hr%' OR LOWER(role) LIKE '%admin%' OR LOWER(role) LIKE '%ceo%'
+      WHERE LOWER(role) LIKE '%human resource%' OR LOWER(role) LIKE '%project manager%' OR LOWER(role) LIKE '%hr%'
     `);
 
     const adminEmails = admins.recordset.map(r => r.email).filter(Boolean);
@@ -8250,14 +8663,41 @@ app.get('/api/admin/onboarding/reminders', verifyToken, async (req, res) => {
  * Converts an Intern or New Joinee to a Full-time User
  */
 app.post('/api/admin/onboarding/promote', verifyToken, async (req, res) => {
-  const { id, type, emp_id, team_name, role: newRole } = req.body;
+  const { id, type, team_name, role: newRole } = req.body;
+  const emp_id = req.body.emp_id || req.body.empId || req.body.employeeId || req.body.employee_id || req.query.emp_id || req.query.empId || req.query.employeeId || req.query.employee_id;
   const adminRole = (req.user.role || '').toLowerCase();
   const isAuthorized = adminRole.includes('hr') || adminRole.includes('admin') || adminRole.includes('ceo') || adminRole.includes('manager');
 
   if (!isAuthorized) return res.status(403).json({ error: 'Unauthorized promotion attempt.' });
 
+  if (!emp_id) {
+    console.warn('[PROMOTION VALIDATION WARNING]: Employee ID is missing in request. Full Body:', req.body, 'Query:', req.query);
+    return res.status(400).json({ error: 'Employee ID is required for promotion.' });
+  }
+
+  const targetEmpId = parseInt(emp_id, 10);
+  if (isNaN(targetEmpId) || !targetEmpId) {
+    console.warn('[PROMOTION VALIDATION WARNING]: Employee ID is not a valid number. Value received:', emp_id);
+    return res.status(400).json({ error: 'Invalid Employee ID. It must be a valid number.' });
+  }
+
   try {
     const pool = await getPool();
+
+    // Check if the Employee ID is already present in either users or employee table to restrict duplicates
+    const checkIdRes = await pool.request()
+      .input('empId', sql.Int, targetEmpId)
+      .query(`
+        SELECT id FROM users WITH (NOLOCK) WHERE id = @empId
+        UNION
+        SELECT user_id FROM employee WITH (NOLOCK) WHERE emp_id = @empId
+      `);
+
+    if (checkIdRes.recordset.length > 0) {
+      console.warn(`[PROMOTION VALIDATION WARNING]: Employee ID ${targetEmpId} is already in use in users or employee table.`);
+      return res.status(400).json({ error: `Employee ID ${targetEmpId} is already in use/present in the database. Please specify a unique ID.` });
+    }
+
     const table = type === 'Intern' ? 'interns' : 'new_joinees';
 
     // 1. Fetch Source Record
@@ -8269,43 +8709,40 @@ app.post('/api/admin/onboarding/promote', verifyToken, async (req, res) => {
     await transaction.begin();
 
     try {
-      // 2. Create User Record
-      const userResult = await transaction.request()
+      // 1.5 Clean up any orphan records in child tables for this targetEmpId before user insertion
+      await transaction.request()
+        .input('userId', sql.Int, targetEmpId)
+        .query(`
+          DELETE FROM employee WHERE user_id = @userId OR emp_id = @userId;
+          DELETE FROM employee_profiles WHERE employee_id = @userId;
+        `);
+
+      // 1.9 Generate new password
+      const crypto = require('crypto');
+      const plainPassword = crypto.randomBytes(4).toString('hex');
+      const saltRounds = 10;
+      const hashedPassword = await bcrypt.hash(plainPassword, saltRounds);
+
+      // 2. Create User Record (Forcing users.id to equal the chosen targetEmpId)
+      await transaction.request()
+        .input('id', sql.Int, targetEmpId)
         .input('name', sql.NVarChar, person.name)
         .input('email', sql.NVarChar, person.email || person.email_id)
-        .input('password', sql.NVarChar, person.password)
+        .input('password', sql.NVarChar, hashedPassword)
         .input('role', sql.NVarChar, newRole || person.role || 'Employee')
         .input('joiningDate', sql.Date, person.joining_date)
         .input('managerId', sql.Int, person.reporting_manager_id || null)
         .input('phone', sql.NVarChar, person.phone_number)
         .query(`
-          INSERT INTO users (name, email, password, role, joining_date, reporting_manager_id, phone_number)
-          OUTPUT INSERTED.id
-          VALUES (@name, @email, @password, @role, @joiningDate, @managerId, @phone)
+          SET IDENTITY_INSERT users ON;
+          INSERT INTO users (id, name, email, password, role, joining_date, reporting_manager_id, phone_number)
+          VALUES (@id, @name, @email, @password, @role, @joiningDate, @managerId, @phone);
+          SET IDENTITY_INSERT users OFF;
         `);
 
-      const newUserId = userResult.recordset[0].id;
+      const newUserId = targetEmpId;
 
-      // 3. Create Employee Record
-      let targetEmpId = parseInt(emp_id, 10);
-      if (isNaN(targetEmpId) || !targetEmpId) {
-        const currentYear = new Date().getFullYear();
-        const prefix = `${currentYear}`;
-        const maxIdRes = await transaction.request()
-          .input('prefix', sql.NVarChar, prefix + '%')
-          .query(`
-            SELECT MAX(emp_id) as maxId 
-            FROM employee 
-            WHERE CAST(emp_id AS VARCHAR) LIKE @prefix
-          `);
-        const maxId = maxIdRes.recordset[0]?.maxId;
-        if (maxId) {
-          targetEmpId = parseInt(maxId, 10) + 1;
-        } else {
-          targetEmpId = parseInt(prefix + '01', 10);
-        }
-      }
-
+      // 3. Create Employee Record using the verified targetEmpId
       await transaction.request()
         .input('userId', sql.Int, newUserId)
         .input('empName', sql.NVarChar, person.name)
@@ -8341,8 +8778,8 @@ app.post('/api/admin/onboarding/promote', verifyToken, async (req, res) => {
           await sendAppEmail({
             to: finalEmail,
             subject: `💼 Confirmation of Employment - Congratulations!`,
-            html: getEmploymentConfirmationHtml(person.name, finalDesignation, finalEmpId, finalTeam, person.joining_date),
-            text: `Dear ${person.name}, your transition has been officially approved! We confirm your appointment as a permanent, full-time employee at Navabharath Technologies.`
+            html: getEmploymentConfirmationHtml(person.name, finalDesignation, finalEmpId, finalTeam, person.joining_date, plainPassword, finalEmail),
+            text: `Dear ${person.name}, your transition has been officially approved! We confirm your appointment as a permanent, full-time employee at Navabharath Technologies. Your new login password is: ${plainPassword}`
           });
           Log.success('SMTP', `Sent employment confirmation email to ${person.name} (${finalEmail})`);
         } catch (mailErr) {
@@ -10065,20 +10502,46 @@ app.post('/api/leaves/request', verifyToken, async (req, res) => {
       });
     }
 
+    // Fetch CEO and PM dynamically by role/designation
+    const keyPersonnelResult = await pool.request().query(`
+      SELECT id, role 
+      FROM users WITH (NOLOCK)
+      WHERE role LIKE '%CEO%' 
+         OR role LIKE '%Founder%' 
+         OR role LIKE '%Project Manager%' 
+         OR role LIKE '%PM%'
+    `);
+
+    let ceoId = null;
+    let defaultPmId = null;
+
+    keyPersonnelResult.recordset.forEach(u => {
+      const r = (u.role || '').toLowerCase();
+      if (r.includes('ceo') || r.includes('founder')) ceoId = u.id;
+      if (r.includes('project manager') || r === 'pm') defaultPmId = u.id;
+    });
+
+    if (!ceoId || !defaultPmId) {
+      return res.status(500).json({ error: 'Organizational hierarchy error: CEO or Project Manager not found by role/designation' });
+    }
+
     const normalizedRole = (employee.role || '').toLowerCase();
     const isTL = normalizedRole.includes('lead') || normalizedRole.includes('tl');
     const isManager = normalizedRole.includes('manager');
     const isHR = isHRRole(normalizedRole);
 
     // HIERARCHY LOGIC:
-    // If Manager or HR: Reports directly to CEO (20250)
+    // If Manager or HR: Reports directly to CEO
     // If Lead: PM is their direct RM
     // If Member: PM is their RM's RM
     const managerId = employee.reporting_manager_id;
-    let projectManagerId = isTL ? managerId : (employee.hierarchy_pm_id || 20251);
+    let projectManagerId = isTL ? managerId : (employee.hierarchy_pm_id || defaultPmId);
 
-    if (isManager || isHR) {
-      projectManagerId = 20250; // Set CEO as their direct PM/Approver
+    if (isManager) {
+      projectManagerId = ceoId; // Set CEO as their direct PM/Approver
+    }
+    if (isHR) {
+      projectManagerId = managerId || defaultPmId; // Set PM/Manager as their PM
     }
 
     // Initial Statuses
@@ -10684,13 +11147,21 @@ app.put(['/api/leaves/:id/status', '/api/ceo/leaves/:id/status'], verifyToken, a
 
     // Identify Approver Slot (Use loose equality for ID matching to handle string/number mismatches)
     const isRM = approverId == leave.manager_id;
-    const isPM = approverId == leave.pm_id;
+    let isPM = approverId == leave.pm_id;
     const isHR = isHRRole(userRole);
 
     // Capture normalized statuses for easier logic
     const curRMStatus = (leave.rm_status || 'Pending').trim();
     const curPMStatus = (leave.pm_status || 'Pending').trim();
     const curHRStatus = (leave.hr_status || 'Pending').trim();
+
+    // If the requester is an HR employee, the RM stage is N/A.
+    // If the approver is the reporting manager (isRM), allow them to act as the PM.
+    const requesterRole = (leave.role || '').toLowerCase();
+    const isRequesterHR = requesterRole.includes('hr') || requesterRole.includes('human resource');
+    if (isRM && curRMStatus === 'N/A' && isRequesterHR) {
+      isPM = true;
+    }
 
     // 2. Determine which roles the user is acting as for this approval
     let actingRoles = [];
@@ -10743,8 +11214,13 @@ app.put(['/api/leaves/:id/status', '/api/ceo/leaves/:id/status'], verifyToken, a
         const requesterRole = (leave.role || '').toLowerCase();
 
         let autoApproveHR = false;
-        // If CEO (20250) is approving for a Manager or HR via PM role, make it final
-        if (actingRoles.includes('PM') && approverId == 20250 && (requesterRole.includes('manager') || requesterRole.includes('hr'))) {
+        // If CEO is approving for a Manager via PM role, OR if any PM is approving for HR, make it final
+        const isApproverCEO = userRole.includes('ceo') || userRole.includes('founder');
+        if (actingRoles.includes('PM') && (
+          (isApproverCEO && requesterRole.includes('manager')) ||
+          requesterRole.includes('hr') ||
+          requesterRole.includes('human resource')
+        )) {
           autoApproveHR = true;
         }
 
@@ -10759,7 +11235,11 @@ app.put(['/api/leaves/:id/status', '/api/ceo/leaves/:id/status'], verifyToken, a
         if (actingRoles.includes('HR') || autoApproveHR) {
           setClauses.push("hr_status = 'Approved'");
           if (autoApproveHR && !actingRoles.includes('HR')) {
-            setClauses.push("hr_remarks = 'Auto-approved by CEO'");
+            if (isApproverCEO) {
+              setClauses.push("hr_remarks = 'Auto-approved by CEO'");
+            } else {
+              setClauses.push("hr_remarks = 'Auto-approved by PM'");
+            }
           } else {
             setClauses.push("hr_remarks = @remarks");
           }
@@ -11288,35 +11768,22 @@ cron.schedule('0 10 * * *', async () => {
       return;
     }
 
-    // 2. Send welcome emails in parallel to the individuals
-    const { getWelcomeOnboardingHtml } = require('./templates/welcomeEmailTemplate');
+    // 2. Mark as processed so we don't repeatedly alert for the same candidate
     for (const candidate of candidates) {
-      if (candidate.email) {
-        try {
-          await sendAppEmail({
-            to: candidate.email,
-            subject: `🌟 Onboarding Complete - Congratulations, ${candidate.name}!`,
-            html: getWelcomeOnboardingHtml(candidate.name, candidate.type),
-            text: `Congratulations ${candidate.name}! You have successfully completed your ${candidate.type === 'Intern' ? 'Internship' : 'Onboarding'} duration. Welcome to the next chapter at Navabharath Technologies!`
-          });
-
-          // Mark as welcome_sent in DB
-          const table = candidate.type === 'Intern' ? 'interns' : 'new_joinees';
-          await pool.request()
-            .input('id', sql.Int, candidate.id)
-            .query(`UPDATE ${table} SET welcome_sent = 1 WHERE id = @id`);
-
-          Log.success('SMTP', `Sent duration completion welcome email to ${candidate.name} (${candidate.email})`);
-        } catch (mailErr) {
-          console.error(`[SMTP ERROR] Failed to send welcome email to ${candidate.name}:`, mailErr.message);
-        }
+      try {
+        const table = candidate.type === 'Intern' ? 'interns' : 'new_joinees';
+        await pool.request()
+          .input('id', sql.Int, candidate.id)
+          .query(`UPDATE ${table} SET welcome_sent = 1 WHERE id = @id`);
+      } catch (dbErr) {
+        console.error(`[DB ERROR] Failed to update welcome_sent for ${candidate.name}:`, dbErr.message);
       }
     }
 
-    // 3. Fetch HR and Admin emails
+    // 3. Fetch HR and Manager emails
     const admins = await pool.request().query(`
       SELECT email FROM users WITH (NOLOCK) 
-      WHERE LOWER(role) LIKE '%hr%' OR LOWER(role) LIKE '%admin%' OR LOWER(role) LIKE '%ceo%'
+      WHERE LOWER(role) LIKE '%human resource%' OR LOWER(role) LIKE '%project manager%' OR LOWER(role) LIKE '%hr%'
     `);
 
     const adminEmails = admins.recordset.map(r => r.email).filter(Boolean);
@@ -12714,13 +13181,61 @@ app.get(['/api/admin/rewards/history', '/api/admin/reward/history'], verifyToken
  * 46. Global Leaderboard
  */
 app.get(['/api/rewards/leaderboard', '/api/quizzes/leaderboard', '/api/admin/rewards/leaderboard', '/api/admin/reward/leaderboard'], verifyToken, async (req, res) => {
+  const { date, month, year } = req.query;
   try {
     const pool = await getPool();
-    const result = await pool.request().query(`
+    const request = pool.request();
+
+    let quizWhere = '';
+    let rewardWhere = '';
+
+    if (date) {
+      const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+      if (dateRegex.test(date)) {
+        request.input('targetDate', sql.Date, date);
+        quizWhere = 'WHERE completion_date = @targetDate';
+        rewardWhere = 'WHERE CAST(created_at AS DATE) = @targetDate';
+      }
+    } else if (month) {
+      let targetYear = parseInt(year) || new Date().getFullYear();
+      let targetMonth = null;
+
+      if (/^\d{4}-\d{2}$/.test(month)) {
+        const parts = month.split('-');
+        targetYear = parseInt(parts[0]);
+        targetMonth = parseInt(parts[1]);
+      } else if (/^\d{1,2}$/.test(month)) {
+        targetMonth = parseInt(month);
+      } else {
+        const monthNames = [
+          'january', 'february', 'march', 'april', 'may', 'june',
+          'july', 'august', 'september', 'october', 'november', 'december'
+        ];
+        const cleanMonth = month.toLowerCase().trim();
+        const idx = monthNames.findIndex(m => m.startsWith(cleanMonth.substring(0, 3)));
+        if (idx !== -1) targetMonth = idx + 1;
+      }
+
+      if (targetMonth >= 1 && targetMonth <= 12) {
+        request.input('targetYear', sql.Int, targetYear);
+        request.input('targetMonth', sql.Int, targetMonth);
+        quizWhere = 'WHERE YEAR(completion_date) = @targetYear AND MONTH(completion_date) = @targetMonth';
+        rewardWhere = 'WHERE YEAR(created_at) = @targetYear AND MONTH(created_at) = @targetMonth';
+      }
+    } else if (year) {
+      const targetYear = parseInt(year);
+      if (!isNaN(targetYear) && targetYear > 2000 && targetYear < 2100) {
+        request.input('targetYear', sql.Int, targetYear);
+        quizWhere = 'WHERE YEAR(completion_date) = @targetYear';
+        rewardWhere = 'WHERE YEAR(created_at) = @targetYear';
+      }
+    }
+
+    const result = await request.query(`
       WITH CombinedPoints AS (
-        SELECT employee_id, points, 1 as is_award FROM employee_rewards WITH (NOLOCK)
+        SELECT employee_id, points, 1 as is_award FROM employee_rewards WITH (NOLOCK) ${rewardWhere}
         UNION ALL
-        SELECT employee_id, total_points as points, 0 as is_award FROM quiz_completions WITH (NOLOCK)
+        SELECT employee_id, total_points as points, 0 as is_award FROM quiz_completions WITH (NOLOCK) ${quizWhere}
       ),
       AllParticipants AS (
         SELECT id, name, role, team, profile_picture FROM users WITH (NOLOCK)
@@ -12902,42 +13417,135 @@ app.get('/api/employees/leaderboard/all', verifyToken, async (req, res) => {
 
 // GET: Public Comprehensive Leaderboard using webhook secret key (Direct Browser Access)
 app.get('/api/public/employees/leaderboard/all', async (req, res) => {
-  const { key } = req.query;
+  const { key, date, month, year } = req.query;
   if (!key || key !== process.env.NBT_WEBHOOK_SECRET) {
     return res.status(401).json({ error: 'Unauthorized. Invalid or missing secret key.' });
   }
 
   try {
     const pool = await getPool();
-    const result = await pool.request().query(`
-      WITH QuizPoints AS (
+    const request = pool.request();
+
+    // Default filters
+    let quizWhere = 'WHERE 1=1';
+    let rewardWhere = 'WHERE 1=1';
+    let awardWhere = 'WHERE 1=1';
+    let filterSub = 'Live Performance & Reputation Rankings';
+    let prefilledMonth = '';
+
+    if (date) {
+      const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+      if (dateRegex.test(date)) {
+        request.input('targetDate', sql.Date, date);
+        quizWhere = 'WHERE completion_date = @targetDate';
+        rewardWhere = 'WHERE CAST(created_at AS DATE) = @targetDate';
+        awardWhere = 'WHERE CAST(created_at AS DATE) = @targetDate';
+
+        const dObj = new Date(date);
+        if (!isNaN(dObj.getTime())) {
+          const formattedDate = dObj.toLocaleDateString('en-US', {
+            month: 'long',
+            day: 'numeric',
+            year: 'numeric'
+          });
+          filterSub = `Leaderboard for ${formattedDate}`;
+        } else {
+          filterSub = `Leaderboard for ${date}`;
+        }
+      }
+    } else if (month) {
+      let targetYear = parseInt(year) || new Date().getFullYear();
+      let targetMonth = null;
+
+      if (/^\d{4}-\d{2}$/.test(month)) {
+        const parts = month.split('-');
+        targetYear = parseInt(parts[0]);
+        targetMonth = parseInt(parts[1]);
+      } else if (/^\d{1,2}$/.test(month)) {
+        targetMonth = parseInt(month);
+      } else {
+        const monthNames = [
+          'january', 'february', 'march', 'april', 'may', 'june',
+          'july', 'august', 'september', 'october', 'november', 'december'
+        ];
+        const shortMonthNames = [
+          'jan', 'feb', 'mar', 'apr', 'may', 'jun',
+          'jul', 'aug', 'sep', 'oct', 'nov', 'dec'
+        ];
+        const cleanMonth = month.toLowerCase().trim();
+        let idx = monthNames.indexOf(cleanMonth);
+        if (idx === -1) {
+          idx = shortMonthNames.indexOf(cleanMonth);
+        }
+        if (idx !== -1) {
+          targetMonth = idx + 1;
+        }
+      }
+
+      if (targetMonth >= 1 && targetMonth <= 12) {
+        request.input('targetYear', sql.Int, targetYear);
+        request.input('targetMonth', sql.Int, targetMonth);
+
+        quizWhere = 'WHERE YEAR(completion_date) = @targetYear AND MONTH(completion_date) = @targetMonth';
+        rewardWhere = 'WHERE YEAR(created_at) = @targetYear AND MONTH(created_at) = @targetMonth';
+        awardWhere = 'WHERE YEAR(created_at) = @targetYear AND MONTH(created_at) = @targetMonth';
+
+        const monthName = new Date(targetYear, targetMonth - 1, 1).toLocaleDateString('en-US', { month: 'long' });
+        filterSub = `Leaderboard for ${monthName} ${targetYear}`;
+        prefilledMonth = `${targetYear}-${String(targetMonth).padStart(2, '0')}`;
+      }
+    } else if (year) {
+      const targetYear = parseInt(year);
+      if (!isNaN(targetYear) && targetYear > 2000 && targetYear < 2100) {
+        request.input('targetYear', sql.Int, targetYear);
+        quizWhere = 'WHERE YEAR(completion_date) = @targetYear';
+        rewardWhere = 'WHERE YEAR(created_at) = @targetYear';
+        awardWhere = 'WHERE YEAR(created_at) = @targetYear';
+        filterSub = `Leaderboard for Year ${targetYear}`;
+      }
+    }
+
+    const query = `
+      WITH AllParticipants AS (
+        SELECT id, name, role, team, profile_picture FROM users WITH (NOLOCK)
+        UNION ALL
+        SELECT id, name, role, 'New Joinee' as team, profile_picture FROM new_joinees WITH (NOLOCK)
+        UNION ALL
+        SELECT id, name, role, 'Intern' as team, profile_picture FROM interns WITH (NOLOCK)
+      ),
+      QuizPoints AS (
         SELECT employee_id, ISNULL(SUM(total_points), 0) as quiz_pts
-        FROM quiz_completions
+        FROM quiz_completions WITH (NOLOCK)
+        ${quizWhere}
         GROUP BY employee_id
       ),
       RewardPoints AS (
         SELECT employee_id, ISNULL(SUM(points), 0) as reward_pts
-        FROM employee_rewards
+        FROM employee_rewards WITH (NOLOCK)
+        ${rewardWhere}
         GROUP BY employee_id
       ),
       AwardCount AS (
         SELECT employee_id, COUNT(*) as award_count
-        FROM employee_rewards
+        FROM employee_rewards WITH (NOLOCK)
+        ${awardWhere}
         GROUP BY employee_id
       )
       SELECT 
-        u.id, u.name, u.role, u.team, u.profile_picture,
+        ap.id, ap.name, ap.role, ap.team, ap.profile_picture,
         ISNULL(qp.quiz_pts, 0)   as quiz_points,
         ISNULL(rp.reward_pts, 0) as reward_points,
         ISNULL(qp.quiz_pts, 0) + ISNULL(rp.reward_pts, 0) as total_rep,
         ISNULL(ac.award_count, 0) as total_awards,
         DENSE_RANK() OVER (ORDER BY ISNULL(qp.quiz_pts, 0) + ISNULL(rp.reward_pts, 0) DESC) as rank
-      FROM users u WITH (NOLOCK)
-      LEFT JOIN QuizPoints   qp WITH (NOLOCK) ON u.id = qp.employee_id
-      LEFT JOIN RewardPoints rp WITH (NOLOCK) ON u.id = rp.employee_id
-      LEFT JOIN AwardCount   ac WITH (NOLOCK) ON u.id = ac.employee_id
-      ORDER BY total_rep DESC, u.name ASC
-    `);
+      FROM AllParticipants ap
+      LEFT JOIN QuizPoints   qp ON ap.id = qp.employee_id
+      LEFT JOIN RewardPoints rp ON ap.id = rp.employee_id
+      LEFT JOIN AwardCount   ac ON ap.id = ac.employee_id
+      ORDER BY total_rep DESC, ap.name ASC
+    `;
+
+    const result = await request.query(query);
 
     const formatted = result.recordset.map(row => ({
       ...row,
@@ -13043,7 +13651,7 @@ app.get('/api/public/employees/leaderboard/all', async (req, res) => {
     }
     .header {
       text-align: center;
-      margin-bottom: 3.5rem;
+      margin-bottom: 2.5rem;
     }
     .header h1 {
       font-size: 3rem;
@@ -13058,6 +13666,70 @@ app.get('/api/public/employees/leaderboard/all', async (req, res) => {
       color: #9ca3af;
       font-size: 1.25rem;
       font-weight: 300;
+    }
+
+    /* Filter Bar styling */
+    .filter-form {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 1.5rem;
+      margin: 0 auto 3rem auto;
+      background: rgba(17, 24, 39, 0.45);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      border-radius: 12px;
+      padding: 0.75rem 1.5rem;
+      width: fit-content;
+      backdrop-filter: blur(16px);
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+    }
+    .filter-group {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+    .filter-group label {
+      font-size: 0.9rem;
+      font-weight: 500;
+      color: #9ca3af;
+    }
+    .filter-form select,
+    .filter-form input[type="date"],
+    .filter-form input[type="month"] {
+      background: rgba(31, 41, 55, 0.7);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 8px;
+      color: #f3f4f6;
+      padding: 0.4rem 0.8rem;
+      font-family: 'Outfit', sans-serif;
+      font-size: 0.9rem;
+      outline: none;
+      transition: all 0.2s ease;
+      cursor: pointer;
+    }
+    .filter-form select:hover,
+    .filter-form input[type="date"]:hover,
+    .filter-form input[type="month"]:hover,
+    .filter-form select:focus,
+    .filter-form input[type="date"]:focus,
+    .filter-form input[type="month"]:focus {
+      border-color: rgba(99, 102, 241, 0.5);
+      background: rgba(31, 41, 55, 0.9);
+      box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.2);
+    }
+    .clear-btn {
+      color: #f43f5e;
+      font-size: 0.9rem;
+      font-weight: 500;
+      text-decoration: none;
+      padding: 0.4rem 0.8rem;
+      border: 1px solid rgba(244, 63, 94, 0.2);
+      border-radius: 8px;
+      transition: all 0.2s ease;
+    }
+    .clear-btn:hover {
+      background: rgba(244, 63, 94, 0.1);
+      border-color: rgba(244, 63, 94, 0.4);
     }
     
     /* Podium Ranks Grid */
@@ -13271,13 +13943,62 @@ app.get('/api/public/employees/leaderboard/all', async (req, res) => {
       --bronze: #d97706;
     }
   </style>
+  <script>
+    function toggleFilterInputs() {
+      const filterType = document.getElementById('filter-type').value;
+      const dateGroup = document.getElementById('date-input-group');
+      const monthGroup = document.getElementById('month-input-group');
+      const datePicker = document.getElementById('date-picker');
+      const monthPicker = document.getElementById('month-picker');
+
+      if (filterType === 'all') {
+        dateGroup.style.display = 'none';
+        monthGroup.style.display = 'none';
+        datePicker.value = '';
+        monthPicker.value = '';
+        window.location.href = '?key=' + encodeURIComponent(document.querySelector('input[name="key"]').value);
+      } else if (filterType === 'date') {
+        dateGroup.style.display = 'flex';
+        monthGroup.style.display = 'none';
+        monthPicker.value = '';
+      } else if (filterType === 'month') {
+        dateGroup.style.display = 'none';
+        monthGroup.style.display = 'flex';
+        datePicker.value = '';
+      }
+    }
+  </script>
 </head>
 <body>
   <div class="container">
     <div class="header">
       <h1>NBT Leaderboard</h1>
-      <p>Live Performance & Reputation Rankings</p>
+      <p>${filterSub}</p>
     </div>
+
+    <!-- Interactive Filter Form -->
+    <form id="filterForm" class="filter-form" method="GET">
+      <input type="hidden" name="key" value="${key}">
+      
+      <div class="filter-group">
+        <label for="filter-type">Filter By:</label>
+        <select id="filter-type" onchange="toggleFilterInputs()">
+          <option value="all" ${!date && !month ? 'selected' : ''}>All-Time</option>
+          <option value="date" ${date ? 'selected' : ''}>Specific Date</option>
+          <option value="month" ${month && !date ? 'selected' : ''}>Specific Month</option>
+        </select>
+      </div>
+
+      <div class="filter-group date-input-group" id="date-input-group" style="display: ${date ? 'flex' : 'none'};">
+        <input type="date" id="date-picker" name="date" value="${date || ''}" onchange="this.form.submit()">
+      </div>
+
+      <div class="filter-group month-input-group" id="month-input-group" style="display: ${month && !date ? 'flex' : 'none'};">
+        <input type="month" id="month-picker" name="month" value="${prefilledMonth}" onchange="this.form.submit()">
+      </div>
+      
+      ${(date || month) ? `<a href="?key=${key}" class="clear-btn">Clear</a>` : ''}
+    </form>
     
     <!-- Top 3 Podium Grid -->
     <div class="podium-grid">
@@ -13680,14 +14401,24 @@ app.post(['/api/quizzes/:id/answer', '/api/fun-quizzes/submit-answer'], verifyTo
               WHERE employee_id = @userId AND completion_date = @today
             `);
         } else {
-          // Create new record
+          // Create new record (safely avoiding duplicate insert on race conditions)
           await transaction.request()
             .input('userId', sql.Int, userId)
             .input('today', sql.Date, today)
             .input('pts', sql.Int, points)
             .query(`
-              INSERT INTO quiz_completions (employee_id, completion_date, total_points, correct_count)
-              VALUES (@userId, @today, @pts, 1)
+              IF NOT EXISTS (SELECT 1 FROM quiz_completions WHERE employee_id = @userId AND completion_date = @today)
+              BEGIN
+                INSERT INTO quiz_completions (employee_id, completion_date, total_points, correct_count)
+                VALUES (@userId, @today, @pts, 1)
+              END
+              ELSE
+              BEGIN
+                UPDATE quiz_completions 
+                SET total_points = total_points + @pts,
+                    correct_count = correct_count + 1
+                WHERE employee_id = @userId AND completion_date = @today
+              END
             `);
         }
         await transaction.commit();
@@ -13779,8 +14510,18 @@ app.post(['/api/quizzes/submit-session', '/api/quizzes/submit-total', '/api/fun-
         .input('pts', sql.Int, totalPoints)
         .input('count', sql.Int, correctCount)
         .query(`
-          INSERT INTO quiz_completions (employee_id, completion_date, total_points, correct_count)
-          VALUES (@userId, @today, @pts, @count)
+          IF NOT EXISTS (SELECT 1 FROM quiz_completions WHERE employee_id = @userId AND completion_date = @today)
+          BEGIN
+            INSERT INTO quiz_completions (employee_id, completion_date, total_points, correct_count)
+            VALUES (@userId, @today, @pts, @count)
+          END
+          ELSE
+          BEGIN
+            UPDATE quiz_completions
+            SET total_points = total_points + @pts,
+                correct_count = correct_count + @count
+            WHERE employee_id = @userId AND completion_date = @today
+          END
         `);
 
       await transaction.request()
@@ -13848,12 +14589,19 @@ app.get(['/api/fun-quizzes/leaderboard', '/api/quizzes/leaderboard/daily'], veri
  * 46.5 Get My Quiz Completion History
  */
 app.get([
+  '/api/quiz_completion',
   '/api/quizzes/completions',
   '/api/quizzes/completions/my',
   '/api/quizzes/my-completions',
   '/api/quizzes/my_completions'
 ], verifyToken, async (req, res) => {
-  const userId = req.user.id;
+  const queryUserId = req.query.employee_id || req.query.employeeId || req.query.userId || req.query.user_id;
+  const userId = queryUserId ? parseInt(queryUserId) : req.user.id;
+
+  if (isNaN(userId)) {
+    return res.status(400).json({ error: 'Invalid employee ID format' });
+  }
+
   try {
     const pool = await getPool();
     const result = await pool.request()

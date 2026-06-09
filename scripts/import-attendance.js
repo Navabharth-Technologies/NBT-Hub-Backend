@@ -9,29 +9,41 @@ async function importAttendance() {
 
     const baseUrl = process.env.TEAM_OFFICE_BASE_URL;
     const authToken = process.env.TEAM_OFFICE_AUTH_TOKEN;
-    const EXCLUDED_EMPCODES = ['0088', '0099', '2025102', '20250'];
+    const company = process.env.TEAM_OFFICE_COMPANY || 'Navabharath Technologies';
+    const EXCLUDED_EMPCODES = ['0088', '2025100', '0099', '20250'];
 
     if (!authToken || authToken === 'c3VwcG9ydDpzdXBwb3J0OnN1cHBvcnRAMTp0cnVl') {
-        console.warn('⚠️ WARNING: You are using Demo Credentials (support@1). Data may not match your employees.');
+        console.warn('⚠️ WARNING: You are using Demo Credentials. Data may not match your employees.');
     }
 
     try {
         const pool = await getPool();
 
-        // --- NEW: Fetch Holidays List ---
+        // --- Fetch Holidays List ---
         const holidaysRes = await pool.request().query('SELECT holiday_date, name FROM holidays');
         const holidayMap = holidaysRes.recordset.reduce((acc, h) => {
             acc[h.holiday_date.toISOString().split('T')[0]] = h.name;
             return acc;
         }, {});
 
-        const loggedDates = new Set();
+        // --- Fetch all participants from DB to build a lookup map ---
+        const usersRes = await pool.request().query(`
+            SELECT id, name, joining_date FROM users WHERE id <> 20250
+            UNION ALL
+            SELECT id, name, joining_date FROM new_joinees
+            UNION ALL
+            SELECT id, name, joining_date FROM interns
+        `);
+        const usersMap = new Map();
+        usersRes.recordset.forEach(u => usersMap.set(u.id, u));
+        console.log(`\n👥 Loaded ${usersMap.size} users from DB (Including Interns & New Joinees).`);
+
         const daysToImport = 2;
         const now = new Date();
 
         for (let i = 0; i < daysToImport; i++) {
-            const syncDate = new Date(now.getTime() + (330 * 60 * 1000)); // Current IST
-            syncDate.setDate(syncDate.getDate() - i); // Go back 'i' days
+            const syncDate = new Date(now.getTime() + (330 * 60 * 1000)); // IST
+            syncDate.setDate(syncDate.getDate() - i);
 
             const day = String(syncDate.getUTCDate()).padStart(2, '0');
             const month = String(syncDate.getUTCMonth() + 1).padStart(2, '0');
@@ -40,192 +52,161 @@ async function importAttendance() {
 
             console.log(`\n📅 Processing Date: ${formattedDate} (${i === 0 ? 'Today' : i + ' days ago'})`);
 
-            const company = process.env.TEAM_OFFICE_COMPANY || 'Navabharath Technologies';
+            // --- Fetch ALL company data in a single API call ---
             const url = `${baseUrl}/DownloadInOutPunchData?Empcode=ALL&FromDate=${formattedDate}&ToDate=${formattedDate}&Company=${encodeURIComponent(company)}`;
+            console.log(`   🌐 Fetching: ${url}`);
 
             try {
                 const response = await fetch(url, { headers: { 'Authorization': `Basic ${authToken}` } });
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
                 const data = await response.json();
                 const logs = data.InOutPunchData || [];
-
-                console.log(`   Found ${logs.length} logs from Team Office.`);
+                console.log(`   📥 Received ${logs.length} records from Etime Office for ${company}.`);
 
                 let successCount = 0;
-                for (const log of logs) {
-                    // --- DYNAMIC ID BRIDGE: AUTO-CORRECT 6-DIGIT EMPCODE (20250X -> 2025X) ---
-                    const empId = parseInt(String(log.Empcode).trim());
-                    if (isNaN(empId) || EXCLUDED_EMPCODES.includes(String(log.Empcode).trim())) continue;
+                let skippedCount = 0;
 
-                    // --- NEW: FETCH USER NAME FROM DB TO PREVENT COLLISIONS ---
-                    // This prevents "Mohan Kumar P" (ID 2025101 -> 20251) from overwriting "Anish V N" (ID 20251)
-                    let userMatch = null;
-                    try {
-                        const userRes = await pool.request()
-                            .input('id', sql.Int, empId)
-                            .query('SELECT name FROM users WHERE id = @id');
-                        if (userRes.recordset.length > 0) {
-                            userMatch = userRes.recordset[0];
-                        }
-                    } catch (e) {
-                        console.error(`   ⚠️ Failed to verify user ${empId}:`, e.message);
+                for (const log of logs) {
+                    if (!log.Empcode || !log.DateString) continue;
+
+                    // --- DYNAMIC ID BRIDGE: AUTO-CORRECT MISFORMATTED EMPCODES ---
+                    let rawEmpcode = String(log.Empcode).trim();
+
+                    // Correct 6-digit 20250X -> 2025X
+                    if (rawEmpcode.length === 6 && rawEmpcode.startsWith('20250')) {
+                        rawEmpcode = rawEmpcode.replace('20250', '2025');
+                    }
+                    // Correct 7-digit 20251XX -> mathematically map to 202510 + sequence
+                    else if (rawEmpcode.length === 7 && rawEmpcode.startsWith('20251')) {
+                        const sequence = parseInt(rawEmpcode.substring(5), 10);
+                        rawEmpcode = String(202510 + sequence);
+                    }
+                    // Correct 5-digit 2026X -> map to Intern ID X
+                    else if (rawEmpcode.length === 5 && rawEmpcode.startsWith('2026')) {
+                        rawEmpcode = rawEmpcode.replace('2026', '');
                     }
 
-                    if (!userMatch) {
-                        console.warn(`   ⚠️ User not found in DB for Empcode: ${log.Empcode} (Mapped ID: ${empId})`);
+                    const empId = parseInt(rawEmpcode, 10);
+
+                    if (isNaN(empId) || EXCLUDED_EMPCODES.includes(String(log.Empcode).trim())) continue;
+
+                    // --- Only sync users that exist in local DB ---
+                    const user = usersMap.get(empId);
+                    if (!user) {
+                        console.warn(`   ⚠️ No DB record for Empcode: ${log.Empcode} (ID: ${empId}) — skipping.`);
+                        skippedCount++;
                         continue;
                     }
 
-                    // Strict Name Check: If the API name and DB name are completely different, skip this record
-                    // (Ignore case, handle reversed names like "V N Anish" vs "Anish V N")
-                    const clean = (s) => (s || '').toLowerCase().replace(/[^a-z]/g, '');
-                    const apiName = clean(log.Name);
-                    const dbName = clean(userMatch.name);
-                    
-                    // Simple check: if one name doesn't contain a significant part of the other, warn/skip
-                    // But for now, we'll just log a warning and skip if they are totally different
-                    if (apiName && dbName && !apiName.includes(dbName) && !dbName.includes(apiName)) {
-                        // Special case: ignore if names are too short or empty
-                        if (apiName.length > 3 && dbName.length > 3) {
-                            console.warn(`   🛑 COLLISION DETECTED: API Name "${log.Name}" does not match DB Name "${userMatch.name}" for ID ${empId}. Skipping.`);
-                            continue;
-                        }
-                    }
+                    // --- Skip if punch is before joining date ---
+                    const [d, m, y] = log.DateString.split('/');
+                    const punchDateStr = `${y}-${m}-${d}`;
+                    const punchDate = new Date(punchDateStr);
+                    if (user.joining_date && punchDate < new Date(user.joining_date)) continue;
 
-                    // --- NEW: Calculate WorkTime manually from IN/OUT times ---
+                    // --- Calculate WorkTime from IN/OUT times ---
                     const calcWorkTime = (inT, outT) => {
-                        if (!inT || !outT || inT === '00:00' || outT === '00:00' || inT === '--:--' || outT === '--:--') return "00:00";
+                        if (!inT || !outT || inT === '00:00' || outT === '00:00' || inT === '--:--' || outT === '--:--') return '00:00';
                         try {
                             const [inH, inM] = inT.split(':').map(Number);
                             const [outH, outM] = outT.split(':').map(Number);
-                            if (isNaN(inH) || isNaN(inM) || isNaN(outH) || isNaN(outM)) return "00:00";
+                            if (isNaN(inH) || isNaN(inM) || isNaN(outH) || isNaN(outM)) return '00:00';
                             let diff = (outH * 60 + outM) - (inH * 60 + inM);
-                            if (diff < 0) diff += 1440; // Handle shifts crossing midnight
+                            if (diff < 0) diff += 1440;
                             return `${String(Math.floor(diff / 60)).padStart(2, '0')}:${String(diff % 60).padStart(2, '0')}`;
-                        } catch { return "00:00"; }
+                        } catch { return '00:00'; }
                     };
-
                     const manualWorkTime = calcWorkTime(log.INTime, log.OUTTime);
 
-                    // --- IMPROVED: Use Date from API if available ---
-                    const [d, m, y] = log.DateString.split('/');
-                    const punchDate = new Date(`${y}-${m}-${d}`);
-                    const dateKey = punchDate.toISOString().split('T')[0];
-
-                    // --- NEW RULE: Status calculation based on criteria ---
-                    let finalStatus = log.Status;
-                    
-                    const isMissing = (time) => !time || time === '--:--' || time === '00:00';
+                    // --- Status calculation ---
+                    const isMissing = (t) => !t || t === '--:--' || t === '00:00';
                     const todayStr = new Date().toISOString().split('T')[0];
-                    const recordDateStr = punchDate.toISOString().split('T')[0];
-                    const isToday = recordDateStr === todayStr;
+                    const isToday = punchDateStr === todayStr;
+                    let finalStatus = log.Status;
 
                     if (!isMissing(log.INTime) && isMissing(log.OUTTime)) {
-                        // User has punched in but not out
                         if (isToday) {
                             let completedShift = false;
                             try {
-                                const now = new Date();
-                                const ist = new Date(now.getTime() + (330 * 60 * 1000));
+                                const ist = new Date(new Date().getTime() + (330 * 60 * 1000));
                                 const [inH, inM] = log.INTime.split(':').map(Number);
                                 const curH = ist.getUTCHours();
                                 const curM = ist.getUTCMinutes();
-                                let elapsedMins = (curH * 60 + curM) - (inH * 60 + inM);
-                                if (elapsedMins < 0) elapsedMins += 1440;
-                                if (elapsedMins >= 480) { // 8 hours
-                                    completedShift = true;
-                                }
-                            } catch (e) {}
-
-                            if (completedShift) {
-                                finalStatus = 'P';
-                            } else {
-                                finalStatus = log.INTime > '10:15' ? 'Half Day' : 'In Office';
-                            }
+                                let elapsed = (curH * 60 + curM) - (inH * 60 + inM);
+                                if (elapsed < 0) elapsed += 1440;
+                                if (elapsed >= 480) completedShift = true;
+                            } catch (e) { }
+                            finalStatus = completedShift ? 'P' : (log.INTime > '10:15' ? 'Half Day' : 'In Office');
                         } else {
-                            // If it was a past day and they never punched out, it's Absent
                             finalStatus = 'A';
                         }
                     } else if (!isMissing(log.INTime) && !isMissing(log.OUTTime)) {
-                        // Both punches exist, calculate based on hours & late login penalty
                         try {
-                            const [h, m] = manualWorkTime.split(':').map(n => parseInt(n, 10));
-                            const totalHours = h + (m / 60);
-
+                            const [h, mi] = manualWorkTime.split(':').map(n => parseInt(n, 10));
+                            const totalHours = h + (mi / 60);
                             if (log.INTime > '10:15') {
-                                // Late login locked to Half Day or Absent
-                                if (totalHours >= 5) {
-                                    finalStatus = 'Half Day';
-                                } else {
-                                    finalStatus = 'A';
-                                }
+                                finalStatus = totalHours >= 5 ? 'Half Day' : 'A';
                             } else {
-                                if (totalHours >= 8) {
-                                    finalStatus = 'P';
-                                } else if (totalHours >= 5 && totalHours < 8) {
-                                    finalStatus = 'Half Day';
-                                } else {
-                                    finalStatus = 'A';
-                                }
+                                if (totalHours >= 8) finalStatus = 'P';
+                                else if (totalHours >= 5) finalStatus = 'Half Day';
+                                else finalStatus = 'A';
                             }
                         } catch (e) {
-                            console.warn(`   ⚠️ Failed to parse WorkTime for Empcode ${log.Empcode}: ${manualWorkTime}`);
+                            console.warn(`   ⚠️ WorkTime parse failed for ${log.Empcode}: ${manualWorkTime}`);
                         }
                     } else {
-                        // No punches at all
                         finalStatus = 'A';
                     }
 
-                    // --- NEW: Mark Sundays as Week Off (WO) if not already Present ---
-                    if (syncDate.getDay() === 0 && finalStatus !== 'P' && finalStatus !== 'Half Day') {
+                    // --- Sunday = Week Off if not Present ---
+                    if (punchDate.getUTCDay() === 0 && finalStatus !== 'P' && finalStatus !== 'Half Day') {
                         finalStatus = 'WO';
                     }
 
-
-                    let finalRemark = log.Remark;
-                    if (holidayMap[dateKey]) {
-                        if (!loggedDates.has(dateKey)) {
-                            console.log(`   ✨ Holiday Detected: ${holidayMap[dateKey]}`);
-                            loggedDates.add(dateKey);
-                        }
+                    // --- Holiday override ---
+                    let finalRemark = log.Remark || '--';
+                    if (holidayMap[punchDateStr]) {
                         finalStatus = 'Holiday';
-                        finalRemark = holidayMap[dateKey];
+                        finalRemark = holidayMap[punchDateStr];
+                        console.log(`   ✨ Holiday: ${finalRemark} for user ${empId}`);
                     }
 
+                    // --- UPSERT into attendance_logs ---
                     try {
-                        const res = await pool.request()
+                        const result = await pool.request()
                             .input('userId', sql.Int, empId)
-                            .input('punchDate', sql.Date, punchDate)
-                            .input('inTime', sql.NVarChar, (log.INTime === '--:--' || log.INTime === '00:00') ? null : log.INTime)
-                            .input('outTime', sql.NVarChar, (log.OUTTime === '--:--' || log.OUTTime === '00:00') ? null : log.OUTTime)
-                            .input('workTime', sql.NVarChar, (manualWorkTime === '00:00') ? null : manualWorkTime)
+                            .input('punchDate', sql.Date, punchDateStr)
+                            .input('inTime', sql.NVarChar, isMissing(log.INTime) ? null : log.INTime)
+                            .input('outTime', sql.NVarChar, isMissing(log.OUTTime) ? null : log.OUTTime)
+                            .input('workTime', sql.NVarChar, manualWorkTime === '00:00' ? null : manualWorkTime)
                             .input('status', sql.NVarChar, finalStatus)
                             .input('remark', sql.NVarChar, finalRemark)
                             .query(`
-                                IF EXISTS (SELECT 1 FROM users WHERE id = @userId)
-                                BEGIN
-                                    MERGE INTO attendance_logs WITH (HOLDLOCK) AS target
-                                    USING (SELECT @userId AS user_id, @punchDate AS punch_date) AS source
-                                    ON (target.user_id = source.user_id AND target.punch_date = source.punch_date)
-                                    WHEN MATCHED THEN
-                                        UPDATE SET in_time = @inTime, out_time = @outTime, work_time = @workTime, status = @status, remark = @remark, last_sync = GETDATE(), punchin_location = 'Biometric Terminal', punchout_location = 'Biometric Terminal'
-                                    WHEN NOT MATCHED THEN
-                                        INSERT (user_id, punch_date, in_time, out_time, work_time, status, remark, punchin_location, punchout_location)
-                                        VALUES (@userId, @punchDate, @inTime, @outTime, @workTime, @status, @remark, 'Biometric Terminal', 'Biometric Terminal');
-                                END
+                                MERGE INTO attendance_logs WITH (HOLDLOCK) AS target
+                                USING (SELECT @userId AS user_id, @punchDate AS punch_date) AS source
+                                ON (target.user_id = source.user_id AND target.punch_date = source.punch_date)
+                                WHEN MATCHED THEN
+                                    UPDATE SET in_time = @inTime, out_time = @outTime, work_time = @workTime,
+                                               status = @status, remark = @remark, last_sync = GETDATE(),
+                                               punchin_location = 'Biometric Terminal', punchout_location = 'Biometric Terminal'
+                                WHEN NOT MATCHED THEN
+                                    INSERT (user_id, punch_date, in_time, out_time, work_time, status, remark, punchin_location, punchout_location)
+                                    VALUES (@userId, @punchDate, @inTime, @outTime, @workTime, @status, @remark, 'Biometric Terminal', 'Biometric Terminal');
                             `);
-                        if (res.rowsAffected[0] > 0) {
-                            successCount++;
-                        }
+                        if (result.rowsAffected[0] > 0) successCount++;
                     } catch (e) {
                         console.error(`   ⚠️ Sync failed for Empcode ${log.Empcode} (ID: ${empId}):`, e.message);
                     }
                 }
-                console.log(`   ✅ Synced ${successCount} records into attendance_logs.`);
+
+                console.log(`   ✅ Synced: ${successCount} | Skipped (no DB match): ${skippedCount} | Total from API: ${logs.length}`);
 
             } catch (err) {
                 console.error(`   ❌ Failed to fetch for ${formattedDate}:`, err.message);
             }
         }
+
     } catch (err) {
         throw err;
     }
