@@ -82,11 +82,9 @@ async function importAttendance() {
                         const sequence = parseInt(rawEmpcode.substring(5), 10);
                         rawEmpcode = String(202510 + sequence);
                     }
-                    // Correct 5-digit 2026X -> map to Intern ID X
-                    else if (rawEmpcode.length === 5 && rawEmpcode.startsWith('2026')) {
-                        rawEmpcode = rawEmpcode.replace('2026', '');
-                    }
-
+                    // --- INTERN MAPPING REMOVED ---
+                    // Etimeoffice does not contain Intern records. Any 5-digit Empcode
+                    // starting with 2026 (like 20261 for Pavan Kumar) is a regular employee.
                     const empId = parseInt(rawEmpcode, 10);
 
                     if (isNaN(empId) || EXCLUDED_EMPCODES.includes(String(log.Empcode).trim())) continue;

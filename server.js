@@ -3709,19 +3709,41 @@ app.get(['/api/attendance', '/api/attendance ', '/api/attendance%20'], verifyTok
                 `);
     }
 
+    // --- NEW: FETCH FINAL STATE FROM LOCAL DB (Includes Web Punches) ---
+    const localRes = await pool.request()
+      .input('uid', sql.Int, userId)
+      .input('pDate', sql.Date, istTime.toISOString().split('T')[0])
+      .query('SELECT in_time as inTime, out_time as outTime, work_time as workTime, status, remark FROM attendance_logs WHERE user_id = @uid AND punch_date = @pDate');
+
+    let finalResponseData = null;
     const cleanTime = (t) => (!t || t === '--:--' || t === '00:00' || String(t).trim() === '') ? null : t;
-    const mappedStatus = finalStatus === 'P' ? 'Present' : (finalStatus === 'A' ? 'Absent' : finalStatus);
-    res.json({
-      success: true,
-      date: formattedDate,
-      empCode: empCode,
-      attendance: apiLog ? {
+
+    if (localRes.recordset.length > 0) {
+      const dbLog = localRes.recordset[0];
+      const dbMappedStatus = dbLog.status === 'P' ? 'Present' : (dbLog.status === 'A' ? 'Absent' : dbLog.status);
+      finalResponseData = {
+        inTime: cleanTime(dbLog.inTime),
+        outTime: cleanTime(dbLog.outTime),
+        workTime: cleanTime(dbLog.workTime),
+        status: dbMappedStatus,
+        remark: dbLog.remark || (apiLog ? finalRemark : null)
+      };
+    } else if (apiLog) {
+      const mappedStatus = finalStatus === 'P' ? 'Present' : (finalStatus === 'A' ? 'Absent' : finalStatus);
+      finalResponseData = {
         inTime: cleanTime(apiLog.INTime),
         outTime: cleanTime(apiLog.OUTTime),
         workTime: cleanTime(manualWorkTime),
         status: mappedStatus,
         remark: finalRemark
-      } : null
+      };
+    }
+
+    res.json({
+      success: true,
+      date: formattedDate,
+      empCode: empCode,
+      attendance: finalResponseData
     });
 
   } catch (err) {
@@ -6579,6 +6601,9 @@ app.put(['/api/assign-task/review/:id', '/api/assigned-task/review/:id', '/api/m
     if (finalVerify !== undefined) {
       query += ', verify = @verify';
       request.input('verify', sql.NVarChar, finalVerify);
+      if (finalVerify.toLowerCase() === 'rejected') {
+        query += ", progress = 70, status = 'In Progress'";
+      }
     }
 
     query += ' WHERE id = @id';
@@ -6698,7 +6723,12 @@ app.get('/api/tasks/team/:teamName', async (req, res) => {
 app.put(['/api/tasks/:id', '/api/tasks/status/:taskId', '/api/task-updates/:id', '/api/master-task/:id'], async (req, res) => {
   const rawId = req.params.id || req.params.taskId;
   const taskId = parseInt(rawId); // Handles "2:1" or similar by taking only the first integer
-  const { status, progress, verify, title, description, deadline } = req.body;
+  let { status, progress, verify, title, description, deadline } = req.body;
+
+  if (verify && verify.toLowerCase() === 'rejected') {
+    status = 'In Progress';
+    progress = 70;
+  }
 
   try {
     let pool = await getPool();
@@ -9475,6 +9505,16 @@ app.post('/api/send-certificate', verifyToken, async (req, res) => {
     const resolvedCourseId = sanitizeNumericId(courseId || course_id);
 
     if (resolvedUserId && resolvedCourseId) {
+      // 0. Prevent duplicate certificate emails for the same course
+      const mailCheck = await pool.request()
+        .input('uid', sql.Int, resolvedUserId)
+        .input('cid', sql.Int, resolvedCourseId)
+        .query('SELECT email_sent FROM user_courses WITH (NOLOCK) WHERE user_id = @uid AND course_id = @cid');
+
+      if (mailCheck.recordset.length > 0 && mailCheck.recordset[0].email_sent) {
+        return res.status(400).json({ error: 'Certificate has already been sent to this employee for this course.' });
+      }
+
       // 1. Try General Course lookup first
       const generalRes = await pool.request()
         .input('cid', sql.Int, resolvedCourseId)
@@ -9522,6 +9562,20 @@ app.post('/api/send-certificate', verifyToken, async (req, res) => {
           if (!finalCourseTitle) finalCourseTitle = onboardingRes.recordset[0].courseTitle;
           if (!finalEmail) finalEmail = onboardingRes.recordset[0].userEmail;
           if (!finalName) finalName = onboardingRes.recordset[0].userName;
+
+          // Track email sent for onboarding courses using user_courses junction table
+          await pool.request()
+            .input('uid', sql.Int, resolvedUserId)
+            .input('cid', sql.Int, resolvedCourseId)
+            .input('title', sql.NVarChar, finalCourseTitle)
+            .input('email', sql.NVarChar, finalEmail)
+            .query(`
+              IF EXISTS (SELECT 1 FROM user_courses WHERE user_id = @uid AND course_id = @cid)
+                UPDATE user_courses SET email_sent = 1, email_sent_at = DATEADD(MINUTE, 330, GETUTCDATE()) WHERE user_id = @uid AND course_id = @cid
+              ELSE
+                INSERT INTO user_courses (user_id, user_email, course_id, course_title, completed, email_sent, email_sent_at, completed_at, updated_at)
+                VALUES (@uid, @email, @cid, @title, 1, 1, DATEADD(MINUTE, 330, GETUTCDATE()), DATEADD(MINUTE, 330, GETUTCDATE()), DATEADD(MINUTE, 330, GETUTCDATE()))
+            `);
         }
       }
     } else if (resolvedUserId && !finalEmail) {

@@ -343,7 +343,7 @@ async function syncApplications() {
 
     console.log(`[SYNC] Querying external Careers website at ${CAREERS_BACKEND}/api/admin/applications...`);
     const fetchController = new AbortController();
-    const fetchTimeout = setTimeout(() => fetchController.abort(), 15000);
+    const fetchTimeout = setTimeout(() => fetchController.abort(), 60000); // Increased from 15s to 60s for Render cold starts
     const resWeb = await fetch(`${CAREERS_BACKEND}/api/admin/applications`, {
       headers: { 'x-admin-key': ADMIN_API_KEY },
       signal: fetchController.signal,

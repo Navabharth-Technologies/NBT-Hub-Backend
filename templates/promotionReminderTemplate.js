@@ -7,15 +7,15 @@ const logoUrl = 'https://navabharathtechnologies.com/assets/logo.png';
 const getPromotionReminderHtml = (candidates) => {
   const rows = candidates.map(c => {
     const isIntern = c.type === 'Intern';
-    const typeBadgeStyle = isIntern 
-      ? 'background-color: #ecfdf5; color: #065f46; border: 1px solid #a7f3d0;' 
+    const typeBadgeStyle = isIntern
+      ? 'background-color: #ecfdf5; color: #065f46; border: 1px solid #a7f3d0;'
       : 'background-color: #eff6ff; color: #1e40af; border: 1px solid #bfdbfe;';
-    
+
     const durationText = isIntern
       ? `${c.duration} ${c.duration === 1 ? 'Month' : 'Months'}`
       : `${c.duration} ${c.duration === '1' ? 'Day' : 'Days'}`;
 
-    const formattedDate = c.joining_date 
+    const formattedDate = c.joining_date
       ? new Date(c.joining_date).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' })
       : 'N/A';
 
@@ -44,7 +44,7 @@ const getPromotionReminderHtml = (candidates) => {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Daily Onboarding Promotion Audit</title>
+  <title>Onboarding Promotion Audit</title>
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
     @media only screen and (max-width: 600px) {
@@ -73,20 +73,20 @@ const getPromotionReminderHtml = (candidates) => {
     <!-- Hero Header with Brand Colors Gradient -->
     <div style="background: linear-gradient(135deg, #1e3a8a 0%, #3b82f6 100%); padding: 45px 40px; text-align: center; color: #ffffff;">
       <div style="margin-bottom: 25px;">
-        <img src="${logoUrl}" alt="NBT Logo" style="height: 40px; width: auto; display: inline-block; filter: brightness(0) invert(1);">
+        <img src="${logoUrl}" alt="NBT Logo" style="height: 65px; width: auto; display: inline-block; filter: brightness(0) invert(1);">
       </div>
       <h1 style="font-size: 26px; font-weight: 700; margin: 0 0 8px 0; letter-spacing: -0.025em; line-height: 1.2; text-shadow: 0 2px 4px rgba(0,0,0,0.15);">
-        Daily Promotion Audit 📋
+        Promotion Audit 📋
       </h1>
       <p style="font-size: 15px; margin: 0; opacity: 0.9; font-weight: 500; letter-spacing: 0.025em;">
-        Automated Onboarding Status Report
+        Onboarding Status Report
       </p>
     </div>
 
     <!-- Email Content Body -->
     <div class="email-body" style="padding: 40px;">
       <p style="font-size:15px;line-height:1.6;margin:0 0 24px 0;color:#475569;">
-        The following team members have successfully completed their required onboarding or internship duration and are now eligible to be promoted to <strong>Full-time Employees</strong>:
+        The following employees have successfully completed the required onboarding period and are now eligible for promotion to <strong>Full-time Employee</strong>. Approval is required to proceed with the promotion.
       </p>
       
       <!-- Table Container -->
@@ -109,7 +109,7 @@ const getPromotionReminderHtml = (candidates) => {
       <!-- Action Button Card -->
       <div style="margin-top: 35px; padding: 25px; background-color: #eff6ff; border: 1px solid #bfdbfe; border-radius: 12px; text-align: center;">
         <p style="font-size:15px;line-height:1.5; margin: 0 0 16px 0; color: #1e3a8a; font-weight: 600;">
-          Review details and finalize these promotions in the Admin Dashboard.
+          Please review the employee details and approve the promotion in the Admin Dashboard.
         </p>
         <a href="https://nbthub.navabharathtechnologies.com/admin/onboarding" target="_blank" style="display: inline-block; background-color: #2563eb; color: #ffffff; padding: 12px 28px; font-size: 14px; font-weight: 600; text-decoration: none; border-radius: 8px; box-shadow: 0 4px 10px rgba(37, 99, 235, 0.3); transition: background-color 0.2s;">
           Go to Admin Dashboard
