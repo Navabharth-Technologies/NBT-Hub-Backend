@@ -38,7 +38,7 @@ const getSaturdayReminderHtml = (userName) => `<!DOCTYPE html>
 <body style="margin:0;padding:10px;background:#f8fafc;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI', Roboto, Helvetica, Arial, sans-serif;color:#334155;-webkit-text-size-adjust:100%;">
   <div class="email-container" style="max-width: 600px; margin: 10px auto; border: 1px solid #e2e8f0; border-radius: 8px; background-color: #ffffff; box-shadow: 0 4px 12px rgba(0,0,0,0.05); box-sizing:border-box;">
     <div class="email-header" style="padding: 32px; background-color: #f8fafc; border-bottom: 1px solid #e2e8f0; border-radius: 8px 8px 0 0; text-align: center; box-sizing:border-box;">
-      <img src="${logoUrl}" alt="NBT Logo" style="width: 110px; max-width: 100%; height: auto; display: block; margin: 0 auto 15px auto;">
+      <img src="${logoUrl}" alt="NBT Logo" style="width: 110px; max-width: 100%; height: auto; display: block; margin: 0 auto 15px auto; pointer-events: none; user-select: none; -webkit-user-drag: none;">
       <h1 style="margin: 0; font-size: 20px; color: #1e293b; line-height: 1.3;">NBT HUB: Saturday Suggestion Reminder</h1>
     </div>
     
@@ -103,7 +103,7 @@ const getSaturdayFinalWarningHtml = (userName) => `<!DOCTYPE html>
 <body style="margin:0;padding:10px;background:#f8fafc;font-family:-apple-system,BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;color:#1e293b;-webkit-text-size-adjust:100%;">
   <div class="email-container" style="max-width: 600px; margin: 10px auto; border: 1px solid #fca5a5; border-radius: 8px; background-color: #ffffff; border-top: 4px solid #dc2626; box-shadow: 0 4px 12px rgba(0,0,0,0.05); box-sizing:border-box;">
     <div class="email-header" style="padding: 32px 40px; text-align: center; border-bottom: 1px solid #fecaca; background-color: #fef2f2; box-sizing:border-box;">
-      <img src="${logoUrl}" alt="NBT Logo" style="width: 100px; max-width: 100%; height: auto; display: block; margin: 0 auto 15px auto;">
+      <img src="${logoUrl}" alt="NBT Logo" style="width: 100px; max-width: 100%; height: auto; display: block; margin: 0 auto 15px auto; pointer-events: none; user-select: none; -webkit-user-drag: none;">
       <p style="margin: 0; font-size: 11px; font-weight: 700; color: #991b1b; text-transform: uppercase; letter-spacing: 1.5px;">Urgent Compliance</p>
       <h1 style="margin: 8px 0 0 0; font-size: 22px; font-weight: 800; color: #7f1d1d;">Final Submission Notice</h1>
     </div>

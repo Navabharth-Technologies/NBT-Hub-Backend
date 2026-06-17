@@ -1,5 +1,18 @@
 require('dotenv').config();
 const cron = require('node-cron');
+
+// PM2 Load Balancer / Cluster Mode Support
+// Ensure cron jobs are only executed on the primary node (instance 0) to prevent duplicate background processing.
+const isPrimaryNode = typeof process.env.NODE_APP_INSTANCE === 'undefined' || process.env.NODE_APP_INSTANCE === '0';
+
+if (!isPrimaryNode) {
+  cron.schedule = function(cronExpression, taskFunction, options) {
+    console.log(`[LOAD BALANCER] Skipping cron job initialization on worker instance ${process.env.NODE_APP_INSTANCE}`);
+    // Return a dummy task object to prevent crashes if the code calls .start() or .stop() on it
+    return { start: () => {}, stop: () => {} };
+  };
+}
+
 const { importAttendance } = require('./scripts/import-attendance');
 const express = require('express');
 const cors = require('cors');
@@ -13,6 +26,7 @@ const { getOtpEmailHtml } = require('./templates/otpEmailTemplate');
 const { getSaturdayReminderHtml, getSaturdayFinalWarningHtml } = require('./templates/saturdayReminderTemplate');
 const { getPromotionReminderHtml } = require('./templates/promotionReminderTemplate');
 const { getEmploymentConfirmationHtml } = require('./templates/employmentConfirmationTemplate');
+const { getWelcomeDayOneHtml } = require('./templates/welcomeEmailTemplate');
 
 // --- SMTP CONFIGURATION (Nodemailer) --- //
 const mailTransporter = nodemailer.createTransport({
@@ -91,6 +105,17 @@ const app = express();
 app.get('/api/test-sync', (req, res) => res.send('Backend is Working!'));
 
 // --- PREMIUM LOGGING UTILITY --- //
+const getInstanceColor = () => {
+  const instanceId = process.env.NODE_APP_INSTANCE;
+  if (instanceId === undefined) return '\x1b[38;5;87m';
+  const instanceColors = [
+    '\x1b[38;5;27m', '\x1b[38;5;33m', '\x1b[38;5;39m', '\x1b[38;5;45m',
+    '\x1b[38;5;51m', '\x1b[38;5;93m', '\x1b[38;5;135m', '\x1b[38;5;165m',
+    '\x1b[38;5;177m', '\x1b[38;5;208m', '\x1b[38;5;214m', '\x1b[38;5;226m'
+  ];
+  return instanceColors[parseInt(instanceId, 10) % instanceColors.length];
+};
+
 const Log = {
   reset: '\x1b[0m',
   bold: '\x1b[1m',
@@ -104,34 +129,59 @@ const Log = {
   sky: '\x1b[94m',
   pink: '\x1b[35m',
 
-  timestamp: () => `\x1b[90m[${new Date().toLocaleTimeString('en-IN', { hour12: true })}]\x1b[0m`,
+  timestamp: () => {
+    const timeStr = new Date().toLocaleTimeString('en-IN', { hour12: true });
+    const instanceId = process.env.NODE_APP_INSTANCE;
+    
+    if (instanceId !== undefined) {
+      const iColor = getInstanceColor();
+      return `\x1b[1m${iColor}● Node-${instanceId.toString().padEnd(2)}\x1b[0m \x1b[90m│\x1b[0m \x1b[37m${timeStr.padEnd(11)}\x1b[0m \x1b[90m│\x1b[0m`;
+    }
+    
+    return `\x1b[90m● System  │ ${timeStr.padEnd(11)} │\x1b[0m`;
+  },
 
   // Semantic Loggers
   ready: (msg) => {
-    console.log(`\n${Log.emerald}${Log.bold}â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”${Log.reset}`);
-    console.log(`${Log.emerald}${Log.bold}â”‚  âœ… READY  \x1b[0m ${Log.cyan}${msg.padEnd(41)}\x1b[32m\x1b[1mâ”‚${Log.reset}`);
-    console.log(`${Log.emerald}${Log.bold}â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜${Log.reset}\n`);
+    const instanceId = process.env.NODE_APP_INSTANCE;
+    if (instanceId === '0' || instanceId === undefined) {
+      console.log(`\n${Log.emerald}${Log.bold}┌──────────────────────────────────────────────┐${Log.reset}`);
+      console.log(`${Log.emerald}${Log.bold}│  ✅ READY  \x1b[0m ${Log.cyan}${msg.padEnd(41)}\x1b[32m\x1b[1m│${Log.reset}`);
+      console.log(`${Log.emerald}${Log.bold}└──────────────────────────────────────────────┘${Log.reset}\n`);
+    }
   },
 
   network: (origin, method, url) => {
-    const methodColors = { 'GET': '\x1b[32m', 'POST': '\x1b[33m', 'PUT': '\x1b[34m', 'DELETE': '\x1b[31m' };
-    const mColor = methodColors[method] || '\x1b[37m';
-    console.log(`${Log.timestamp()} \x1b[36m${origin.padEnd(15)}\x1b[0m âš¡ ${mColor}${method.padEnd(7)}\x1b[0m \x1b[90mâž”\x1b[0m \x1b[35m${url}\x1b[0m`);
+    // Premium Solid Background Badges for HTTP Methods
+    const methodBadges = { 
+      'GET': '\x1b[42m\x1b[30m\x1b[1m  GET   \x1b[0m', 
+      'POST': '\x1b[43m\x1b[30m\x1b[1m  POST  \x1b[0m', 
+      'PUT': '\x1b[44m\x1b[30m\x1b[1m  PUT   \x1b[0m', 
+      'DELETE': '\x1b[41m\x1b[30m\x1b[1m DELETE \x1b[0m' 
+    };
+    const mBadge = methodBadges[method] || `\x1b[47m\x1b[30m\x1b[1m  ${method.padEnd(5)} \x1b[0m`;
+    const iColor = getInstanceColor();
+    
+    // Clean up origin for concise auxiliary display
+    let shortOrigin = origin.replace('https://', '').replace('http://', '');
+    if (shortOrigin === 'Local/Unknown') shortOrigin = 'localhost';
+    if (shortOrigin.length > 25) shortOrigin = shortOrigin.substring(0, 22) + '...';
+    
+    // Ultra-Premium Layout with Generous Spacing
+    console.log(`${Log.timestamp()}   ${mBadge}   ${iColor}► \x1b[1m${url.padEnd(45)}\x1b[0m \x1b[90m${shortOrigin}\x1b[0m`);
   },
 
-  success: (area, msg) => console.log(`${Log.timestamp()} ${Log.emerald}${Log.bold}[${area.toUpperCase()}]\x1b[0m ${Log.emerald}${msg}${Log.reset}`),
+  success: (area, msg) => console.log(`${Log.timestamp()}   \x1b[42m\x1b[30m\x1b[1m ✔ OK \x1b[0m   \x1b[32m\x1b[1m[${area.toUpperCase()}]\x1b[0m \x1b[32m${msg}\x1b[0m`),
 
   auth: (msg, hint) => {
-    console.log(`${Log.timestamp()} ${Log.gold}${Log.bold}ðŸ›¡ï¸  [AUTH]\x1b[0m ${Log.gold}${msg}${Log.reset}`);
-    if (hint) console.log(`           \x1b[90mðŸ’¡ ${hint}\x1b[0m`);
+    console.log(`${Log.timestamp()}   \x1b[43m\x1b[30m\x1b[1m 🛡️ AUTH \x1b[0m   \x1b[33m\x1b[1m${msg}\x1b[0m`);
+    if (hint) console.log(`                                \x1b[90m↳ 💡 ${hint}\x1b[0m`);
   },
 
   error: (area, msg, hint) => {
-    console.log(`${Log.timestamp()} ${Log.crimson}${Log.bold}âŒ [${area.toUpperCase()}]\x1b[0m ${Log.crimson}${msg}${Log.reset}`);
-    if (hint) console.log(`           \x1b[90mðŸ’¡ ${hint}\x1b[0m`);
-  },
-
-  divider: () => console.log(`\x1b[90m${'â”€'.repeat(60)}\x1b[0m`)
+    console.log(`${Log.timestamp()}   \x1b[41m\x1b[30m\x1b[1m ✖ ERR \x1b[0m   \x1b[31m\x1b[1m[${area.toUpperCase()}]\x1b[0m \x1b[31m${msg}\x1b[0m`);
+    if (hint) console.log(`                                \x1b[90m↳ 💡 ${hint}\x1b[0m`);
+  }
 };
 
 const BANNER = `
@@ -189,7 +239,7 @@ const sanitizeNumericId = (rawId) => {
 };
 
 // --- PASSWORD RESET OTP STORE --- //
-const otps = new Map(); // Store: { email: { code, expires } }
+// OTPs are now stored in the database table 'password_resets'
 
 // NEW: Google Drive Service Integration
 const driveService = require('./google-drive-service');
@@ -887,6 +937,43 @@ app.get('/api/status', (req, res) => {
 // --- PERFORMANCE CACHE: Token Version Cache to prevent DB bottlenecks ---
 const tokenVersionCache = new Map();
 
+const checkAndDeactivateUser = async (poolOrTx, employeeId) => {
+  try {
+    // Check if resignation is approved by both PM and HR
+    const checkRes = await poolOrTx.request()
+      .input('empId', sql.Int, employeeId)
+      .query("SELECT id FROM resignations WHERE employee_id = @empId AND hr_status = 'Approved' AND pm_status = 'Approved'");
+
+    if (checkRes.recordset.length === 0) {
+      return false;
+    }
+
+    // Check if service certificate request is approved by both PM and HR
+    const checkCert = await poolOrTx.request()
+      .input('empId', sql.Int, employeeId)
+      .query("SELECT id FROM service_certificate_requests WHERE employee_id = @empId AND hr_status = 'Approved' AND pm_status = 'Approved'");
+
+    if (checkCert.recordset.length === 0) {
+      return false;
+    }
+
+    // Both approved by PM & HR, deactivate user!
+    await poolOrTx.request()
+      .input('userId', sql.Int, employeeId)
+      .query("UPDATE users SET status = 'Resigned', token_version = ISNULL(token_version, 0) + 1 WHERE id = @userId");
+    
+    tokenVersionCache.delete(`employee_${employeeId}`);
+    allUsersCache = null;
+    lastAllUsersCacheUpdate = 0;
+    
+    console.log(`[OFFBOARDING] Successfully deactivated resigned employee ID ${employeeId} after final approvals.`);
+    return true;
+  } catch (err) {
+    console.error(`[OFFBOARDING ERROR] Failed to check/deactivate employee ID ${employeeId}:`, err);
+    return false;
+  }
+};
+
 const getVerifiedUser = async (token) => {
   if (!token) return { user: null, reason: 'no_token' };
   try {
@@ -909,12 +996,18 @@ const getVerifiedUser = async (token) => {
     const cached = tokenVersionCache.get(cacheKey);
 
     let currentVersion = 0;
+    let currentStatus = null;
     if (cached && cached.expiry > now) {
       currentVersion = cached.version;
+      currentStatus = cached.status;
     } else {
+      const queryStr = table === 'users'
+        ? `SELECT token_version, status FROM users WHERE id = @id`
+        : `SELECT token_version FROM ${table} WHERE id = @id`;
+
       const result = await pool.request()
         .input('id', sql.Int, decoded.id)
-        .query(`SELECT token_version FROM ${table} WHERE id = @id`);
+        .query(queryStr);
 
       if (result.recordset.length === 0) {
         Log.auth(`Account Not Found: User ID ${decoded.id} in ${table}`, 'This account may have been deleted or the token is for a different environment.');
@@ -922,9 +1015,16 @@ const getVerifiedUser = async (token) => {
       }
 
       currentVersion = result.recordset[0].token_version || 0;
-      // Cache token version for 5 seconds (5000ms) to make parallel requests extremely fast
-      tokenVersionCache.set(cacheKey, { version: currentVersion, expiry: now + 5000 });
+      currentStatus = result.recordset[0].status || null;
+      // Cache token version and status for 5 seconds (5000ms) to make parallel requests extremely fast
+      tokenVersionCache.set(cacheKey, { version: currentVersion, status: currentStatus, expiry: now + 5000 });
     }
+
+    if (table === 'users' && currentStatus === 'Resigned') {
+      Log.auth(`Deactivated Account access attempt: User ID ${decoded.id}`, 'This user is deactivated due to resignation.');
+      return { user: null, reason: 'account_deactivated' };
+    }
+
     const tokenVersion = decoded.token_version || 0;
 
     // REJECTION LOGIC: If DB has a newer version, the token is stale/revoked
@@ -965,6 +1065,8 @@ const verifyToken = async (req, res, next) => {
       message = 'Your password was changed. Please log in again with your new password.';
     } else if (reason === 'account_deleted') {
       message = 'Your account could not be found. Please contact your administrator.';
+    } else if (reason === 'account_deactivated') {
+      message = 'Your account has been deactivated (resigned). Please contact HR.';
     } else if (reason === 'token_expired') {
       message = 'Your session has expired. Please log in again.';
     } else if (reason === 'token_invalid') {
@@ -1321,13 +1423,19 @@ app.post('/api/register', async (req, res) => {
       return res.status(503).json({ error: 'Database is currently offline' });
     }
 
-    // Check if user already exists (using parameterized query to prevent SQL injection)
+    // Check if user already exists across all user tables
     const checkUser = await pool.request()
       .input('email', sql.NVarChar, email)
-      .query('SELECT id FROM users WHERE email = @email');
+      .query(`
+        SELECT email FROM users WHERE email = @email
+        UNION ALL
+        SELECT email_id as email FROM new_joinees WHERE email_id = @email
+        UNION ALL
+        SELECT email FROM interns WHERE email = @email
+      `);
 
     if (checkUser.recordset.length > 0) {
-      return res.status(400).json({ error: 'User with this email already exists' });
+      return res.status(400).json({ error: 'Email already exists. Please use a unique email address.' });
     }
 
     // Hash the password before saving
@@ -1375,7 +1483,7 @@ app.post('/api/register', async (req, res) => {
 
 // 2. Login User
 app.post('/api/login', async (req, res) => {
-  const { email, password } = req.body;
+  const { email, password, role } = req.body;
 
   if (!email || !password) {
     return res.status(400).json({ error: 'Email and password are required' });
@@ -1387,10 +1495,10 @@ app.post('/api/login', async (req, res) => {
       return res.status(503).json({ error: 'Database is currently offline' });
     }
 
-    // Find user by email â€” only select needed fields
+    // Find user by email — only select needed fields
     let userResult = await pool.request()
       .input('email', sql.NVarChar, email)
-      .query('SELECT id, name, email, password, role, phone_number, profile_picture, about_me, team, joining_date, token_version FROM users WHERE email = @email');
+      .query('SELECT id, name, email, password, role, phone_number, profile_picture, about_me, team, joining_date, token_version, status FROM users WHERE email = @email');
 
     let user;
     let userType = 'employee';
@@ -1433,6 +1541,10 @@ app.post('/api/login', async (req, res) => {
       }
     } else {
       user = userResult.recordset[0];
+      user.isActive = user.status === 'Active';
+      if (!user.isActive) {
+        return res.status(403).json({ message: "Account disabled." });
+      }
     }
 
     // Compare submitted password with the hashed password (or plaintext for temporary accounts)
@@ -1445,6 +1557,35 @@ app.post('/api/login', async (req, res) => {
 
     if (!isMatch) {
       return res.status(401).json({ error: 'Invalid email or password' });
+    }
+
+    // --- STRICT MODULE ROLE VALIDATION ---
+    // Prevents an Employee from selecting "HR" or "PM" in the frontend dropdown and gaining unauthorized dashboard access
+    if (role) {
+      const reqRole = String(role).toLowerCase().trim();
+      const actualRole = String(user.role || '').toLowerCase().trim();
+
+      let isAuthorized = false;
+      
+      if (actualRole.includes(reqRole) || reqRole.includes(actualRole)) {
+        isAuthorized = true;
+      } else if (reqRole === 'hr' && actualRole.includes('hr')) {
+        isAuthorized = true;
+      } else if (reqRole === 'pm' && (actualRole.includes('project') || actualRole.includes('manager'))) {
+        isAuthorized = true;
+      } else if (reqRole === 'tl' && (actualRole.includes('team') || actualRole.includes('lead'))) {
+        isAuthorized = true;
+      } else if (reqRole === 'employee') {
+        // Typically higher roles (HR/PM) are allowed to log into the base Employee module for self-service
+        isAuthorized = true;
+      }
+
+      if (!isAuthorized) {
+        return res.status(403).json({ 
+          error: 'Module Access Denied', 
+          message: `You are registered as '${user.role}'. You do not have permission to log into the '${role}' module.` 
+        });
+      }
     }
 
     // Generate JWT token
@@ -1558,6 +1699,77 @@ app.post('/api/new-joinee/login', async (req, res) => {
   }
 });
 
+// 2C. INTERN LOGIN (Dedicated path to avoid ID collision)
+app.post('/api/intern/login', async (req, res) => {
+  const { email, password } = req.body;
+
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Email and password are required' });
+  }
+
+  try {
+    let pool = await getPool();
+    if (!pool || typeof pool.request !== 'function') {
+      return res.status(503).json({ error: 'Database is offline' });
+    }
+
+    const internResult = await pool.request()
+      .input('email', sql.NVarChar, email)
+      .query('SELECT id, name, email, password, role, joining_date, is_blocked, block_reason, token_version FROM interns WHERE email = @email');
+
+    if (internResult.recordset.length === 0) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+
+    const intern = internResult.recordset[0];
+
+    // Check password
+    if (password !== intern.password) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+
+    // Generate JWT token
+    const token = jwt.sign(
+      {
+        id: intern.id,
+        email: intern.email,
+        role: 'intern',
+        name: intern.name,
+        userType: 'intern',
+        token_version: intern.token_version || 0
+      },
+      process.env.JWT_SECRET || 'fallback_secret_key',
+      { expiresIn: '365d' }
+    );
+
+    const isUserBlocked = intern.is_blocked === true || intern.is_blocked === 1 || String(intern.is_blocked) === 'true';
+
+    if (isUserBlocked) {
+      return res.status(403).json({
+        error: 'Account Blocked',
+        message: intern.block_reason || 'Your account has been blocked. Please contact your Manager or HR to unblock.',
+        is_blocked: true
+      });
+    }
+
+    res.json({
+      message: 'Intern Login successful',
+      token,
+      user: {
+        id: intern.id,
+        email: intern.email,
+        role: 'intern',
+        name: intern.name,
+        userType: 'intern'
+      }
+    });
+
+  } catch (err) {
+    console.error('Intern login error:', err);
+    res.status(500).json({ error: 'Server error during intern login' });
+  }
+});
+
 /**
  * 2.D Request Password Reset OTP
  * Generates a 6-digit code and prints it to the terminal for administrative recovery.
@@ -1571,19 +1783,28 @@ app.post(['/api/password/request-otp', '/api/auth/request-otp'], async (req, res
     // Check both tables
     const userResult = await pool.request().input('email', sql.NVarChar, email).query('SELECT id, name FROM users WHERE email = @email');
     const joineeResult = await pool.request().input('email', sql.NVarChar, email).query('SELECT id, name FROM new_joinees WHERE email_id = @email');
+    const internResult = await pool.request().input('email', sql.NVarChar, email).query('SELECT id, name FROM interns WHERE email = @email');
 
-    if (userResult.recordset.length === 0 && joineeResult.recordset.length === 0) {
+    if (userResult.recordset.length === 0 && joineeResult.recordset.length === 0 && internResult.recordset.length === 0) {
       return res.status(404).json({ error: 'User not found in NBT system' });
     }
 
     // Generate 6-digit OTP
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    const expires = Date.now() + 10 * 60 * 1000; // 10 minutes
 
-    otps.set(email, { otp, expires });
+    await pool.request()
+      .input('email', sql.NVarChar, email)
+      .input('otp', sql.NVarChar, otp)
+      .query(`
+        BEGIN TRAN;
+        DELETE FROM password_resets WHERE email = @email;
+        INSERT INTO password_resets (email, otp, expires_at) 
+        VALUES (@email, @otp, DATEADD(minute, 10, GETDATE()));
+        COMMIT TRAN;
+      `);
 
     // Send email with OTP
-    const userName = (userResult.recordset[0]?.name || joineeResult.recordset[0]?.name || 'User');
+    const userName = (userResult.recordset[0]?.name || joineeResult.recordset[0]?.name || internResult.recordset[0]?.name || 'User');
     const htmlContent = getOtpEmailHtml(userName, otp);
 
     try {
@@ -1620,20 +1841,29 @@ app.post(['/api/password/verify-otp', '/api/auth/verify-otp'], async (req, res) 
   const { email, otp } = req.body;
   if (!email || !otp) return res.status(400).json({ error: 'Email and OTP required' });
 
-  const record = otps.get(email);
-  if (!record || Date.now() > record.expires) {
-    return res.status(400).json({ error: 'Invalid or expired OTP' });
+  try {
+    const pool = await getPool();
+    const resOtp = await pool.request()
+      .input('email', sql.NVarChar, email)
+      .query('SELECT otp FROM password_resets WHERE email = @email AND expires_at > GETDATE()');
+
+    if (resOtp.recordset.length === 0) {
+      return res.status(400).json({ error: 'Invalid or expired OTP' });
+    }
+
+    const correctOtp = String(resOtp.recordset[0].otp).trim();
+    const submittedOtp = String(otp).trim();
+
+    if (correctOtp !== submittedOtp) {
+      Log.error('Auth', `Failed OTP verification attempt for ${email}. Submitted: "${submittedOtp}", Expected: "${correctOtp}"`);
+      return res.status(400).json({ error: 'Invalid or expired OTP' });
+    }
+
+    res.json({ success: true, message: 'OTP verified successfully' });
+  } catch (err) {
+    console.error('[OTP VERIFY ERROR]:', err);
+    res.status(500).json({ error: 'Internal server error' });
   }
-
-  const correctOtp = String(record.otp).trim();
-  const submittedOtp = String(otp).trim();
-
-  if (correctOtp !== submittedOtp) {
-    Log.error('Auth', `Failed OTP verification attempt for ${email}. Submitted: "${submittedOtp}", Expected: "${correctOtp}"`);
-    return res.status(400).json({ error: 'Invalid or expired OTP' });
-  }
-
-  res.json({ success: true, message: 'OTP verified successfully' });
 });
 
 /**
@@ -1643,23 +1873,27 @@ app.post(['/api/password/reset-with-otp', '/api/auth/reset-with-otp', '/api/auth
   const { email, otp, newPassword } = req.body;
   if (!email || !otp || !newPassword) return res.status(400).json({ error: 'All fields are required' });
 
-  const record = otps.get(email);
-  if (!record || Date.now() > record.expires) {
-    return res.status(400).json({ error: 'Invalid or expired OTP' });
-  }
-
-  const correctOtp = String(record.otp).trim();
-  const submittedOtp = String(otp).trim();
-
-  if (correctOtp !== submittedOtp) {
-    Log.error('Auth', `Failed password reset attempt (invalid OTP) for ${email}`);
-    return res.status(400).json({ error: 'Invalid or expired OTP' });
-  }
-
-
   try {
     const pool = await getPool();
+    
+    const resOtp = await pool.request()
+      .input('email', sql.NVarChar, email)
+      .query('SELECT otp FROM password_resets WHERE email = @email AND expires_at > GETDATE()');
+
+    if (resOtp.recordset.length === 0) {
+      return res.status(400).json({ error: 'Invalid or expired OTP' });
+    }
+
+    const correctOtp = String(resOtp.recordset[0].otp).trim();
+    const submittedOtp = String(otp).trim();
+
+    if (correctOtp !== submittedOtp) {
+      Log.error('Auth', `Failed password reset attempt (invalid OTP) for ${email}`);
+      return res.status(400).json({ error: 'Invalid or expired OTP' });
+    }
+
     const userRes = await pool.request().input('email', sql.NVarChar, email).query('SELECT id, token_version FROM users WHERE email = @email');
+    const internRes = await pool.request().input('email', sql.NVarChar, email).query('SELECT id, token_version FROM interns WHERE email = @email');
 
     if (userRes.recordset.length > 0) {
       const hashedValue = await bcrypt.hash(newPassword, 10);
@@ -1667,6 +1901,11 @@ app.post(['/api/password/reset-with-otp', '/api/auth/reset-with-otp', '/api/auth
         .input('pass', sql.NVarChar, hashedValue)
         .input('email', sql.NVarChar, email)
         .query('UPDATE users SET password = @pass, token_version = ISNULL(token_version, 0) + 1 WHERE email = @email');
+    } else if (internRes.recordset.length > 0) {
+      await pool.request()
+        .input('pass', sql.NVarChar, newPassword)
+        .input('email', sql.NVarChar, email)
+        .query('UPDATE interns SET password = @pass, token_version = ISNULL(token_version, 0) + 1 WHERE email = @email');
     } else {
       await pool.request()
         .input('pass', sql.NVarChar, newPassword)
@@ -1676,7 +1915,11 @@ app.post(['/api/password/reset-with-otp', '/api/auth/reset-with-otp', '/api/auth
 
     // Invalidate token cache
     tokenVersionCache.clear();
-    otps.delete(email);
+    
+    await pool.request()
+      .input('email', sql.NVarChar, email)
+      .query('DELETE FROM password_resets WHERE email = @email');
+      
     Log.success('Auth', `Password successfully reset via OTP for ${email}`);
     res.json({ success: true, message: 'Password updated successfully' });
   } catch (err) {
@@ -2316,7 +2559,30 @@ app.put('/api/profile/update', verifyToken, memoryUpload.single('profilePicture'
   }
 
   const aboutMe = req.body.aboutMe !== undefined ? req.body.aboutMe : req.body.about_me;
-  const dateOfBirth = req.body.dateOfBirth !== undefined ? req.body.dateOfBirth : (req.body.date_of_birth !== undefined ? req.body.date_of_birth : req.body.dob);
+  let dateOfBirth = req.body.dateOfBirth !== undefined ? req.body.dateOfBirth : (req.body.date_of_birth !== undefined ? req.body.date_of_birth : req.body.dob);
+  
+  if (dateOfBirth && typeof dateOfBirth === 'string' && dateOfBirth.trim() !== '') {
+    const ymdMatch = dateOfBirth.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})/);
+    const dmyMatch = dateOfBirth.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
+    let parsedD, parsedM, parsedY;
+    
+    if (ymdMatch) {
+      parsedY = ymdMatch[1]; parsedM = ymdMatch[2]; parsedD = ymdMatch[3];
+    } else if (dmyMatch) {
+      parsedD = dmyMatch[1]; parsedM = dmyMatch[2]; parsedY = dmyMatch[3];
+    } else {
+      const d = new Date(dateOfBirth);
+      if (!isNaN(d.getTime())) {
+        parsedY = d.getFullYear(); parsedM = d.getMonth() + 1; parsedD = d.getDate();
+      }
+    }
+    
+    if (parsedY && parsedM && parsedD) {
+      // Reconstruct as strictly DD/MM/YYYY
+      dateOfBirth = `${String(parsedD).padStart(2, '0')}/${String(parsedM).padStart(2, '0')}/${parsedY}`;
+    }
+  }
+
   const team = req.body.team;
   const reportingManagerId = req.body.reportingManager !== undefined ? req.body.reportingManager : (req.body.reportingManagerId !== undefined ? req.body.reportingManagerId : req.body.reporting_manager_id);
 
@@ -2475,14 +2741,15 @@ app.put('/api/profile/update', verifyToken, memoryUpload.single('profilePicture'
       const userRes = await pool.request().input('email', sql.NVarChar, email).query('SELECT id FROM users WHERE email = @email');
       if (userRes.recordset.length > 0) {
         const userId = userRes.recordset[0].id;
+        // dateOfBirth is already normalized to DD/MM/YYYY. Use CONVERT with style 103 to safely parse it into DATE
         await pool.request()
           .input('userId', sql.Int, userId)
           .input('dob', sql.NVarChar, dateOfBirth)
           .query(`
             IF EXISTS (SELECT 1 FROM employee_profiles WHERE employee_id = @userId)
-            UPDATE employee_profiles SET dob = @dob WHERE employee_id = @userId
+            UPDATE employee_profiles SET dob = CONVERT(date, @dob, 103) WHERE employee_id = @userId
             ELSE
-            INSERT INTO employee_profiles (employee_id, dob) VALUES (@userId, @dob)
+            INSERT INTO employee_profiles (employee_id, dob) VALUES (@userId, CONVERT(date, @dob, 103))
           `);
       }
     }
@@ -4709,11 +4976,11 @@ app.post('/api/attendance/update-punch-time', verifyToken, async (req, res) => {
   try {
     const pool = await getPool();
 
-    // 1. Fetch existing log
+    // 1. Fetch existing log securely by casting punchDate string
     const checkRes = await pool.request()
-      .input('userId', sql.Int, targetUserId)
-      .input('punchDate', sql.Date, punchDate)
-      .query('SELECT in_time, out_time, work_time, status, remark FROM attendance_logs WHERE user_id = @userId AND punch_date = @punchDate');
+      .input('userId', sql.Int, parseInt(targetUserId, 10))
+      .input('punchDate', sql.NVarChar, String(punchDate))
+      .query('SELECT in_time, out_time, work_time, status, remark FROM attendance_logs WHERE user_id = @userId AND CONVERT(DATE, punch_date) = CONVERT(DATE, @punchDate)');
 
     const existing = checkRes.recordset[0];
 
@@ -4738,9 +5005,9 @@ app.post('/api/attendance/update-punch-time', verifyToken, async (req, res) => {
 
     if (existing) {
       // UPDATE
-      await pool.request()
-        .input('userId', sql.Int, targetUserId)
-        .input('punchDate', sql.Date, punchDate)
+      const updateResult = await pool.request()
+        .input('userId', sql.Int, parseInt(targetUserId, 10))
+        .input('punchDate', sql.NVarChar, String(punchDate))
         .input('inTime', sql.NVarChar, finalInTime)
         .input('outTime', sql.NVarChar, finalOutTime)
         .input('workTime', sql.NVarChar, finalWorkTime)
@@ -4748,13 +5015,14 @@ app.post('/api/attendance/update-punch-time', verifyToken, async (req, res) => {
         .query(`
           UPDATE attendance_logs 
           SET in_time = @inTime, out_time = @outTime, work_time = @workTime, status = 'P', remark = @remark, last_sync = GETDATE()
-          WHERE user_id = @userId AND punch_date = @punchDate
+          WHERE user_id = @userId AND CONVERT(DATE, punch_date) = CONVERT(DATE, @punchDate)
         `);
+      console.log(`[UPDATE PUNCH TIME] Updated ${updateResult.rowsAffected[0]} rows.`);
     } else {
       // INSERT
-      await pool.request()
-        .input('userId', sql.Int, targetUserId)
-        .input('punchDate', sql.Date, punchDate)
+      const insertResult = await pool.request()
+        .input('userId', sql.Int, parseInt(targetUserId, 10))
+        .input('punchDate', sql.NVarChar, String(punchDate))
         .input('inTime', sql.NVarChar, finalInTime)
         .input('outTime', sql.NVarChar, finalOutTime)
         .input('workTime', sql.NVarChar, finalWorkTime)
@@ -4762,8 +5030,9 @@ app.post('/api/attendance/update-punch-time', verifyToken, async (req, res) => {
         .input('remark', sql.NVarChar, auditRemark)
         .query(`
           INSERT INTO attendance_logs (user_id, punch_date, in_time, out_time, work_time, status, remark, last_sync)
-          VALUES (@userId, @punchDate, @inTime, @outTime, @workTime, @status, @remark, GETDATE())
+          VALUES (@userId, CONVERT(DATE, @punchDate), @inTime, @outTime, @workTime, @status, @remark, GETDATE())
         `);
+      console.log(`[UPDATE PUNCH TIME] Inserted ${insertResult.rowsAffected[0]} rows.`);
     }
 
     res.json({ success: true, message: 'Attendance log updated successfully.', workTime: finalWorkTime });
@@ -4779,8 +5048,23 @@ app.post('/api/task-updates', async (req, res) => {
   console.log('RECEIVED TASK PAYLOAD:', req.body);
   const payload = req.body;
 
-  // 1. Precise Extraction (handles userId, user_id, employeeId, employee_id)
-  const userId = payload.userId || payload.user_id || payload.employeeId || payload.employee_id;
+  // 1. Precise Extraction
+  let userId = payload.userId || payload.user_id || payload.employeeId || payload.employee_id;
+  let tokenUserType = payload.userType || null;
+
+  const authHeader = req.headers['authorization'];
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    try {
+      const token = authHeader.split(' ')[1];
+      const { user: decoded } = await getVerifiedUser(token);
+      if (decoded && decoded.id) {
+        userId = decoded.id;
+        tokenUserType = decoded.userType || tokenUserType;
+      }
+    } catch (err) {
+      console.warn('[TASK POST] Token verification failed:', err.message);
+    }
+  }
 
   if (!userId) {
     return res.status(400).json({ error: 'Valid userId is required for task synchronization' });
@@ -4792,14 +5076,35 @@ app.post('/api/task-updates', async (req, res) => {
       return res.status(503).json({ error: 'Database is currently offline' });
     }
 
-    // 2. Fetch User Metadata
-    const userLookup = await pool.request()
-      .input('userId', sql.Int, userId)
-      .query('SELECT email, team FROM users WHERE id = @userId');
+    // 2. Fetch User Metadata across all 3 tables
+    let email = 'no-email@nbt.com';
+    let team = payload.teamName || payload.team_name || 'General';
+    let employeeName = payload.userName || payload.user_name || 'Unknown User';
+    let userRole = payload.role || 'employee';
+    let userLookup = { recordset: [] };
+
+    if (tokenUserType === 'intern') {
+      userLookup = await pool.request().input('uId', sql.Int, userId).query('SELECT name, role, email FROM interns WHERE id = @uId');
+    } else if (tokenUserType === 'new_joinee') {
+      userLookup = await pool.request().input('uId', sql.Int, userId).query('SELECT name, role, email_id as email FROM new_joinees WHERE id = @uId');
+    } else if (tokenUserType === 'employee') {
+      userLookup = await pool.request().input('uId', sql.Int, userId).query('SELECT name, role, email, team FROM users WHERE id = @uId');
+    } else {
+      userLookup = await pool.request().input('uId', sql.Int, userId).query('SELECT name, role, email, team FROM users WHERE id = @uId');
+      if (userLookup.recordset.length === 0) {
+        userLookup = await pool.request().input('uId', sql.Int, userId).query('SELECT name, role, email_id as email FROM new_joinees WHERE id = @uId');
+        if (userLookup.recordset.length === 0) {
+          userLookup = await pool.request().input('uId', sql.Int, userId).query('SELECT name, role, email FROM interns WHERE id = @uId');
+        }
+      }
+    }
 
     if (userLookup.recordset.length === 0) return res.status(404).json({ error: 'User mapping not found' });
 
-    const { email, team } = userLookup.recordset[0];
+    email = userLookup.recordset[0].email || email;
+    team = userLookup.recordset[0].team || team;
+    employeeName = userLookup.recordset[0].name || employeeName;
+    userRole = userLookup.recordset[0].role || userRole;
 
     // 3. Intelligently Normalize Tasks (handles tasks, taskBreakdown, description, content)
     const rawTasks = payload.tasks || payload.taskBreakdown || payload.description || payload.content || payload.details;
@@ -4832,9 +5137,12 @@ app.post('/api/task-updates', async (req, res) => {
         .input('team', sql.NVarChar, team)
         .input('overall_status', sql.NVarChar, incomingStatus)
         .input('description', sql.NVarChar, finalDescription)
+        .input('userName', sql.NVarChar, employeeName)
+        .input('userRole', sql.NVarChar, userRole)
         .query(`
         UPDATE task_updates 
         SET overall_status = @overall_status, badge = @badge, team = @team, description = @description,
+            user_name = @userName, user_role = @userRole,
             created_at = DATEADD(minute, 330, GETUTCDATE())
         WHERE id = @id
         `);
@@ -4843,9 +5151,9 @@ app.post('/api/task-updates', async (req, res) => {
       const finalResult = await pool.request()
         .input('id', sql.Int, existingId || (checkToday.recordset.length > 0 ? checkToday.recordset[0].id : null))
         .query(`
-          SELECT t.*, u.name as userName, u.role as userRole 
+          SELECT t.*, COALESCE(t.user_name, u.name) as userName, COALESCE(t.user_role, u.role) as userRole 
           FROM task_updates t 
-          JOIN users u ON u.id = t.employee_id 
+          LEFT JOIN users u ON u.id = t.employee_id 
           WHERE t.id = (SELECT TOP 1 id FROM task_updates WHERE employee_id = @id ORDER BY created_at DESC)
         `);
       // Note: We'll use a more precise fetch below to ensure we get exactly what was just saved
@@ -4859,9 +5167,11 @@ app.post('/api/task-updates', async (req, res) => {
         .input('status', sql.NVarChar, incomingStatus)
         .input('desc', sql.NVarChar, finalDescription)
         .input('categ', sql.NVarChar, payload.taskCategory || payload.category || 'Daily Log')
+        .input('userName', sql.NVarChar, employeeName)
+        .input('userRole', sql.NVarChar, userRole)
         .query(`
-          INSERT INTO task_updates (employee_id, email, team, badge, overall_status, description, task_category, created_at)
-          VALUES (@userId, @email, @team, @badge, @status, @desc, @categ, DATEADD(minute, 330, GETUTCDATE()))
+          INSERT INTO task_updates (employee_id, email, team, badge, overall_status, description, task_category, user_name, user_role, created_at)
+          VALUES (@userId, @email, @team, @badge, @status, @desc, @categ, @userName, @userRole, DATEADD(minute, 330, GETUTCDATE()))
         `);
     }
 
@@ -4870,9 +5180,9 @@ app.post('/api/task-updates', async (req, res) => {
     const refreshResult = await pool.request()
       .input('employee_id', sql.Int, userId)
       .query(`
-        SELECT TOP 1 t.*, u.name as userName, u.role as userRole 
+        SELECT TOP 1 t.*, COALESCE(t.user_name, u.name) as userName, COALESCE(t.user_role, u.role) as userRole 
         FROM task_updates t 
-        JOIN users u ON u.id = t.employee_id 
+        LEFT JOIN users u ON u.id = t.employee_id 
         WHERE t.employee_id = @employee_id
         ORDER BY t.created_at DESC
       `);
@@ -4945,9 +5255,9 @@ const getTaskUpdatesHandler = async (req, res) => {
     const offset = (p - 1) * l;
 
     let baseQuery = `
-      SELECT t.*, u.name as userName, u.role as userRole, t.team 
+      SELECT t.*, COALESCE(t.user_name, u.name) as userName, COALESCE(t.user_role, u.role) as userRole, t.team 
       FROM task_updates t 
-      JOIN users u ON u.id = t.employee_id 
+      LEFT JOIN users u ON u.id = t.employee_id 
       WHERE 1=1
     `;
 
@@ -5336,7 +5646,7 @@ const fetchBirthdaysAsJSON = async (req, res) => {
                    ELSE NULL 
                  END, 103) as dob
         FROM users WITH (NOLOCK)
-        WHERE date_of_birth IS NOT NULL AND date_of_birth <> ''
+        WHERE date_of_birth IS NOT NULL AND date_of_birth <> '' AND status = 'Active'
       ),
       NextBirthdays AS (
         SELECT *,
@@ -5438,7 +5748,7 @@ app.get('/api/dashboard-stats', async (req, res) => {
     const pool = await getPool();
     const result = await pool.request().query(`
       SELECT
-        (SELECT COUNT(*) FROM users WITH (NOLOCK)) as totalEmployees,
+        (SELECT COUNT(*) FROM users WITH (NOLOCK) WHERE status = 'Active') as totalEmployees,
         (SELECT COUNT(*) FROM master_tasks WITH (NOLOCK)) as totalTasks,
         (SELECT COUNT(*) FROM leaves WITH (NOLOCK) WHERE (rm_status <> 'Rejected' AND pm_status <> 'Rejected' AND hr_status <> 'Rejected' AND hr_status <> 'Approved')) as pendingLeaves,
         (SELECT COUNT(*) FROM support_tickets WITH (NOLOCK) WHERE status IN ('Open', 'In Progress')) as openTickets,
@@ -5477,21 +5787,32 @@ let lastAllUsersCacheUpdate = 0;
 app.get('/api/users', async (req, res) => {
   const page = req.query.page ? parseInt(req.query.page) : null;
   const limit = req.query.limit ? Math.min(parseInt(req.query.limit) || 10, 100) : null;
+  const includeInactive = req.query.include_inactive === 'true' || req.query.includeInactive === 'true';
 
   // If pagination is not requested, use the memory cache to make it extremely fast
   if (!page) {
-    const now = Date.now();
-    if (allUsersCache && (now - lastAllUsersCacheUpdate < 300000)) return res.json(allUsersCache);
+    if (!includeInactive) {
+      const now = Date.now();
+      if (allUsersCache && (now - lastAllUsersCacheUpdate < 300000)) return res.json(allUsersCache);
 
-    try {
-      let pool = await getPool();
-      const result = await pool.request().query('SELECT id, name, email, role, team, joining_date FROM users WITH (NOLOCK) ORDER BY name ASC');
-      allUsersCache = result.recordset;
-      lastAllUsersCacheUpdate = now;
-      return res.json(allUsersCache);
-    } catch (err) {
-      if (allUsersCache) return res.json(allUsersCache);
-      return res.status(500).json({ error: 'Failed to fetch users' });
+      try {
+        let pool = await getPool();
+        const result = await pool.request().query("SELECT id, name, email, role, team, joining_date FROM users WITH (NOLOCK) WHERE status = 'Active' ORDER BY name ASC");
+        allUsersCache = result.recordset;
+        lastAllUsersCacheUpdate = now;
+        return res.json(allUsersCache);
+      } catch (err) {
+        if (allUsersCache) return res.json(allUsersCache);
+        return res.status(500).json({ error: 'Failed to fetch users' });
+      }
+    } else {
+      try {
+        let pool = await getPool();
+        const result = await pool.request().query("SELECT id, name, email, role, team, joining_date FROM users WITH (NOLOCK) ORDER BY name ASC");
+        return res.json(result.recordset);
+      } catch (err) {
+        return res.status(500).json({ error: 'Failed to fetch users' });
+      }
     }
   }
 
@@ -5503,17 +5824,32 @@ app.get('/api/users', async (req, res) => {
     request.input('offset', sql.Int, offset);
     request.input('limit', sql.Int, limit);
 
-    // Fetch total users count
-    const countRes = await pool.request().query('SELECT COUNT(*) as total FROM users WITH (NOLOCK)');
-    const totalCount = countRes.recordset[0]?.total || 0;
-
-    const result = await request.query(`
+    let countQuery = 'SELECT COUNT(*) as total FROM users WITH (NOLOCK)';
+    let selectQuery = `
       SELECT id, name, email, role, team, joining_date 
       FROM users WITH (NOLOCK) 
       ORDER BY name ASC 
       OFFSET @offset ROWS 
       FETCH NEXT @limit ROWS ONLY
-    `);
+    `;
+
+    if (!includeInactive) {
+      countQuery = "SELECT COUNT(*) as total FROM users WITH (NOLOCK) WHERE status = 'Active'";
+      selectQuery = `
+        SELECT id, name, email, role, team, joining_date 
+        FROM users WITH (NOLOCK) 
+        WHERE status = 'Active'
+        ORDER BY name ASC 
+        OFFSET @offset ROWS 
+        FETCH NEXT @limit ROWS ONLY
+      `;
+    }
+
+    // Fetch total users count
+    const countRes = await pool.request().query(countQuery);
+    const totalCount = countRes.recordset[0]?.total || 0;
+
+    const result = await request.query(selectQuery);
 
     res.json({
       success: true,
@@ -5536,17 +5872,28 @@ app.get('/api/users', async (req, res) => {
 app.get('/api/users/search', verifyToken, async (req, res) => {
   const query = req.query.q || '';
   if (query.length < 2) return res.json([]);
+  const includeInactive = req.query.include_inactive === 'true' || req.query.includeInactive === 'true';
 
   try {
     const pool = await getPool();
-    const result = await pool.request()
-      .input('q', sql.NVarChar, `%${query}%`)
-      .query(`
+    let queryStr = `
+      SELECT id, name, role, team, profile_picture 
+      FROM users 
+      WHERE (name LIKE @q OR email LIKE @q) AND status = 'Active'
+      ORDER BY name ASC
+    `;
+    if (includeInactive) {
+      queryStr = `
         SELECT id, name, role, team, profile_picture 
         FROM users 
         WHERE name LIKE @q OR email LIKE @q
         ORDER BY name ASC
-      `);
+      `;
+    }
+
+    const result = await pool.request()
+      .input('q', sql.NVarChar, `%${query}%`)
+      .query(queryStr);
     res.json(result.recordset);
   } catch (err) {
     console.error('[USER SEARCH ERROR]:', err);
@@ -5571,7 +5918,7 @@ app.get('/api/teams', async (req, res) => {
 
     // 2. Fetch ALL users assigned to any team in a single request
     const allUsersResult = await pool.request().query(
-      "SELECT name, role, email, team FROM users WITH (NOLOCK) WHERE team IS NOT NULL AND team <> ''"
+      "SELECT name, role, email, team FROM users WITH (NOLOCK) WHERE team IS NOT NULL AND team <> '' AND status = 'Active'"
     );
 
     // Group active users by team key (case-insensitive and normalized)
@@ -5603,7 +5950,7 @@ app.get('/api/teams', async (req, res) => {
               END ASC
           ) AS rn
         FROM users WITH (NOLOCK)
-        WHERE team IS NOT NULL AND team <> ''
+        WHERE team IS NOT NULL AND team <> '' AND status = 'Active'
           AND (role LIKE '%Lead%' OR role LIKE '%Manager%' OR role LIKE '%Superadmin%')
       ) ranked
       WHERE rn = 1
@@ -5810,10 +6157,13 @@ const deleteTeamHandler = async (req, res) => {
     checkUsersReq.input('teamName', sql.NVarChar, teamName);
     checkUsersReq.input('sanitizedInput', sql.NVarChar, sanitizedInput);
     const usersResult = await checkUsersReq.query(
-      "SELECT id, name, role, email FROM users WHERE team = @teamName OR LOWER(REPLACE(team, ' ', '_')) = @sanitizedInput"
+      "SELECT id, name, role, email FROM users WHERE (team = @teamName OR LOWER(REPLACE(team, ' ', '_')) = @sanitizedInput) AND status = 'Active'"
     );
 
-    if (usersResult.recordset.length > 0) {
+    const force = req.body?.force || req.query?.force;
+    const isForce = force === 'true' || force === true;
+
+    if (!isForce && usersResult.recordset.length > 0) {
       const count = usersResult.recordset.length;
       return res.status(400).json({
         error: `Cannot delete team '${teamName}' because it has ${count} existing employees.`,
@@ -6037,8 +6387,8 @@ const notifyTaskCompletion = async (pool, taskId) => {
     const { taskName, assignerId, assigneeName, reportingManagerId } = taskQuery.recordset[0];
 
     const managersToNotify = new Set();
-    if (assignerId) managersToNotify.add(assignerId);
-    if (reportingManagerId) managersToNotify.add(reportingManagerId);
+    if (assignerId) managersToNotify.add(parseInt(assignerId));
+    if (reportingManagerId) managersToNotify.add(parseInt(reportingManagerId));
 
     if (managersToNotify.size > 0) {
       const alertMessage = `Task has been completed: ${taskName} (Completed by ${assigneeName || 'Employee'})`;
@@ -6103,7 +6453,6 @@ const notifyTaskReview = async (pool, taskId, verifyStatus) => {
 
     const recipientIds = new Set();
     if (assigneeId) recipientIds.add(assigneeId);
-    if (reportingManagerId) recipientIds.add(reportingManagerId); // Direct Team Lead/Reporting Manager
 
     // Exclude the owner/creator (who performed the review) from receiving notifications about their own review
     if (ownerId) {
@@ -6768,17 +7117,19 @@ app.put(['/api/tasks/:id', '/api/tasks/status/:taskId', '/api/task-updates/:id',
     const result = await request.query(query);
 
     if (result.rowsAffected && result.rowsAffected[0] > 0) {
+      const isCompletedStatus = status && status.toLowerCase() === 'completed';
+      const isCompletedProgress = progress !== undefined && parseInt(progress) === 100;
+      const isCompleting = isCompletedStatus || isCompletedProgress;
+
       // If employee updates progress/status/details (not a verification/review)
-      if (verify === undefined) {
+      if (verify === undefined && !isCompleting) {
         notifyTaskUpdate(pool, taskId).catch(err => {
           console.error('[NOTIFICATION UPDATE EXCEPTION]:', err);
         });
       }
 
       if (status !== undefined || progress !== undefined) {
-        const isCompletedStatus = status && status.toLowerCase() === 'completed';
-        const isCompletedProgress = progress !== undefined && parseInt(progress) === 100;
-        if (isCompletedStatus || isCompletedProgress) {
+        if (isCompleting) {
           notifyTaskCompletion(pool, taskId).catch(err => {
             console.error('[NOTIFICATION COMPLETION EXCEPTION]:', err);
           });
@@ -6824,43 +7175,70 @@ app.post('/api/threads', async (req, res) => {
   }
   console.log('[THREAD POST] Payload incoming:', Object.keys(payload));
 
-  // Determine user ID (fallback across common names)
-  const userId = payload.userId || payload.user_id || payload.employee_id;
-
   // Determine Content & Media URLs (fallback across common names)
   const content = payload.content || payload.text || payload.description;
   const mediaUrl = payload.mediaUrl || payload.media_url || payload.image || payload.media;
   const mediaType = payload.mediaType || payload.type || (mediaUrl ? 'image' : null);
 
-  if (!userId) {
-    console.warn('[THREAD POST] Blocked: No identifier found (userId/user_id)');
-    return res.status(400).json({ error: 'User ID is required to post' });
-  }
-
   try {
     const pool = await getPool();
 
-    // FETCH THE POSTER'S METADATA from the users table automatically
-    let userResult = await pool.request()
-      .input('uId', sql.Int, userId)
-      .query('SELECT name, role FROM users WHERE id = @uId');
+    // Extract User from Token or Payload
+    const authHeader = req.headers['authorization'];
+    let tokenUserId = payload.userId || payload.user_id || payload.employee_id;
+    let tokenUserType = payload.userType || null;
 
-    let finalUserId = userId;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      try {
+        const token = authHeader.split(' ')[1];
+        const { user: decoded } = await getVerifiedUser(token);
+        if (decoded && decoded.id) {
+          tokenUserId = decoded.id;
+          tokenUserType = decoded.userType || tokenUserType;
+        }
+      } catch (err) {
+        console.warn('[THREAD POST] Token verification failed:', err.message);
+      }
+    }
+
+    if (!tokenUserId) {
+      console.warn('[THREAD POST] Blocked: No identifier found (userId/user_id)');
+      return res.status(400).json({ error: 'User ID is required to post' });
+    }
+
+    let finalUserId = tokenUserId;
     let employeeName = 'Unknown User';
     let postRole = 'employee';
+    let userResult = { recordset: [] };
+
+    if (tokenUserType === 'intern') {
+      userResult = await pool.request().input('uId', sql.Int, finalUserId).query('SELECT name, role FROM interns WHERE id = @uId');
+    } else if (tokenUserType === 'new_joinee') {
+      userResult = await pool.request().input('uId', sql.Int, finalUserId).query('SELECT name, role FROM new_joinees WHERE id = @uId');
+    } else if (tokenUserType === 'employee') {
+      userResult = await pool.request().input('uId', sql.Int, finalUserId).query('SELECT name, role FROM users WHERE id = @uId');
+    } else {
+      userResult = await pool.request().input('uId', sql.Int, finalUserId).query('SELECT name, role FROM users WHERE id = @uId');
+      if (userResult.recordset.length === 0) {
+        userResult = await pool.request().input('uId', sql.Int, finalUserId).query('SELECT name, role FROM new_joinees WHERE id = @uId');
+        if (userResult.recordset.length === 0) {
+          userResult = await pool.request().input('uId', sql.Int, finalUserId).query('SELECT name, role FROM interns WHERE id = @uId');
+        }
+      }
+    }
 
     if (userResult.recordset.length > 0) {
       employeeName = userResult.recordset[0].name;
       postRole = userResult.recordset[0].role;
     } else {
       // Defensive fallback to prevent Foreign Key constraint conflict on dummy/unregistered user IDs
-      console.warn(`[THREAD POST] Warning: userId ${userId} does not exist in users table. Fetching fallback active user...`);
+      console.warn(`[THREAD POST] Warning: userId ${finalUserId} does not exist in mapped table. Fetching fallback active user...`);
       const fallbackUserRes = await pool.request().query('SELECT TOP 1 id, name, role FROM users ORDER BY id ASC');
       if (fallbackUserRes.recordset.length > 0) {
         finalUserId = fallbackUserRes.recordset[0].id;
         employeeName = fallbackUserRes.recordset[0].name;
         postRole = fallbackUserRes.recordset[0].role;
-        console.log(`[THREAD POST] Defensive mapping: Dummy userId ${userId} successfully mapped to valid fallback userId ${finalUserId} (${employeeName})`);
+        console.log(`[THREAD POST] Defensive mapping: Dummy userId mapped to valid fallback userId ${finalUserId} (${employeeName})`);
       } else {
         return res.status(400).json({ error: 'No active users found in the database to publish a thread.' });
       }
@@ -7078,12 +7456,15 @@ const handlePostReaction = async (req, res) => {
   // 3. Robust User ID Extraction (JWT token first, then payload/query/session)
   const authHeader = req.headers['authorization'];
   let tokenUserId = null;
+  let tokenUserType = req.body.userType || req.query.userType || null;
+  
   if (authHeader && authHeader.startsWith('Bearer ')) {
     try {
       const token = authHeader.split(' ')[1];
       const { user: decoded } = await getVerifiedUser(token);
       if (decoded) {
         tokenUserId = decoded.id;
+        tokenUserType = decoded.userType || tokenUserType;
       }
     } catch (err) {
       console.warn('[POST REACTION] Token verification failed:', err.message);
@@ -7106,10 +7487,23 @@ const handlePostReaction = async (req, res) => {
   try {
     const pool = await getPool();
 
-    // Check main users table
-    const userResult = await pool.request()
-      .input('uId', sql.Int, numericUserId)
-      .query('SELECT name, role FROM users WHERE id = @uId');
+    let userResult = { recordset: [] };
+
+    if (tokenUserType === 'intern') {
+      userResult = await pool.request().input('uId', sql.Int, numericUserId).query('SELECT name, role FROM interns WHERE id = @uId');
+    } else if (tokenUserType === 'new_joinee') {
+      userResult = await pool.request().input('uId', sql.Int, numericUserId).query('SELECT name, role FROM new_joinees WHERE id = @uId');
+    } else if (tokenUserType === 'employee') {
+      userResult = await pool.request().input('uId', sql.Int, numericUserId).query('SELECT name, role FROM users WHERE id = @uId');
+    } else {
+      userResult = await pool.request().input('uId', sql.Int, numericUserId).query('SELECT name, role FROM users WHERE id = @uId');
+      if (userResult.recordset.length === 0) {
+        userResult = await pool.request().input('uId', sql.Int, numericUserId).query('SELECT name, role FROM new_joinees WHERE id = @uId');
+        if (userResult.recordset.length === 0) {
+          userResult = await pool.request().input('uId', sql.Int, numericUserId).query('SELECT name, role FROM interns WHERE id = @uId');
+        }
+      }
+    }
 
     if (userResult.recordset.length > 0) {
       employeeName = userResult.recordset[0].name;
@@ -7276,38 +7670,60 @@ app.post('/api/threads/:id/comment', async (req, res) => {
   try {
     const pool = await getPool();
 
-    // FETCH THE COMMENTER'S METADATA automatically (checking both tables)
+    // FETCH THE COMMENTER'S METADATA automatically
     let finalUserId = userId;
     let employeeName = 'Unknown User';
     let userRole = 'employee';
 
-    const userResult = await pool.request()
-      .input('uId', sql.Int, userId)
-      .query('SELECT name, role FROM users WHERE id = @uId');
+    // Extract User from Token or Payload
+    const authHeader = req.headers['authorization'];
+    let tokenUserType = req.body.userType || null;
+
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      try {
+        const token = authHeader.split(' ')[1];
+        const { user: decoded } = await getVerifiedUser(token);
+        if (decoded && decoded.id) {
+          finalUserId = decoded.id;
+          tokenUserType = decoded.userType || tokenUserType;
+        }
+      } catch (err) {
+        console.warn('[THREAD COMMENT] Token verification failed:', err.message);
+      }
+    }
+
+    let userResult = { recordset: [] };
+
+    if (tokenUserType === 'intern') {
+      userResult = await pool.request().input('uId', sql.Int, finalUserId).query('SELECT name, role FROM interns WHERE id = @uId');
+    } else if (tokenUserType === 'new_joinee') {
+      userResult = await pool.request().input('uId', sql.Int, finalUserId).query('SELECT name, role FROM new_joinees WHERE id = @uId');
+    } else if (tokenUserType === 'employee') {
+      userResult = await pool.request().input('uId', sql.Int, finalUserId).query('SELECT name, role FROM users WHERE id = @uId');
+    } else {
+      userResult = await pool.request().input('uId', sql.Int, finalUserId).query('SELECT name, role FROM users WHERE id = @uId');
+      if (userResult.recordset.length === 0) {
+        userResult = await pool.request().input('uId', sql.Int, finalUserId).query('SELECT name, role FROM new_joinees WHERE id = @uId');
+        if (userResult.recordset.length === 0) {
+          userResult = await pool.request().input('uId', sql.Int, finalUserId).query('SELECT name, role FROM interns WHERE id = @uId');
+        }
+      }
+    }
 
     if (userResult.recordset.length > 0) {
       employeeName = userResult.recordset[0].name;
       userRole = userResult.recordset[0].role;
     } else {
-      // Fallback: Check new_joinees table
-      const joineeResult = await pool.request()
-        .input('uId', sql.Int, userId)
-        .query('SELECT name, role FROM new_joinees WHERE id = @uId');
-      if (joineeResult.recordset.length > 0) {
-        employeeName = joineeResult.recordset[0].name;
-        userRole = joineeResult.recordset[0].role;
+      // Unregistered user - Defensive fallback
+      console.warn(`[THREAD COMMENT] Warning: userId ${finalUserId} does not exist in mapped tables. Fetching fallback active user...`);
+      const fallbackUserRes = await pool.request().query('SELECT TOP 1 id, name, role FROM users ORDER BY id ASC');
+      if (fallbackUserRes.recordset.length > 0) {
+        finalUserId = fallbackUserRes.recordset[0].id;
+        employeeName = fallbackUserRes.recordset[0].name;
+        userRole = fallbackUserRes.recordset[0].role;
+        console.log(`[THREAD COMMENT] Defensive mapping: Dummy userId mapped to valid fallback userId ${finalUserId} (${employeeName})`);
       } else {
-        // Unregistered user - Defensive fallback to prevent Foreign Key constraint conflict on dummy/unregistered user IDs
-        console.warn(`[THREAD COMMENT] Warning: userId ${userId} does not exist in users or new_joinees table. Fetching fallback active user...`);
-        const fallbackUserRes = await pool.request().query('SELECT TOP 1 id, name, role FROM users ORDER BY id ASC');
-        if (fallbackUserRes.recordset.length > 0) {
-          finalUserId = fallbackUserRes.recordset[0].id;
-          employeeName = fallbackUserRes.recordset[0].name;
-          userRole = fallbackUserRes.recordset[0].role;
-          console.log(`[THREAD COMMENT] Defensive mapping: Dummy userId ${userId} successfully mapped to valid fallback userId ${finalUserId} (${employeeName})`);
-        } else {
-          return res.status(400).json({ error: 'No active users found to post comment.' });
-        }
+        return res.status(400).json({ error: 'No active users found to post comment.' });
       }
     }
 
@@ -7899,6 +8315,24 @@ app.post('/api/new-joinees', async (req, res) => {
   const finalPhone = phone_number || phone || null;
   try {
     const pool = await getPool();
+    
+    // Cross-table Email Validation
+    if (finalEmail) {
+      const emailCheckResult = await pool.request()
+        .input('checkEmail', sql.NVarChar, finalEmail)
+        .query(`
+          SELECT email as foundEmail FROM users WHERE email = @checkEmail
+          UNION ALL
+          SELECT email_id as foundEmail FROM new_joinees WHERE email_id = @checkEmail
+          UNION ALL
+          SELECT email as foundEmail FROM interns WHERE email = @checkEmail
+        `);
+        
+      if (emailCheckResult.recordset.length > 0) {
+        return res.status(400).json({ error: 'Email already exists. Please use a unique email address.' });
+      }
+    }
+
     await pool.request()
       .input('name', sql.NVarChar, name)
       .input('role', sql.NVarChar, role)
@@ -7910,6 +8344,16 @@ app.post('/api/new-joinees', async (req, res) => {
       .input('duration', sql.NVarChar, duration || null)
       .input('phoneNumber', sql.NVarChar, finalPhone)
       .query('INSERT INTO new_joinees (name, role, email_id, joining_date, course_completion, hired_by, password, duration, phone_number) VALUES (@name, @role, @emailId, @joiningDate, @courseCompletion, @hiredBy, @password, @duration, @phoneNumber)');
+      
+    if (finalEmail) {
+      sendAppEmail({
+        to: finalEmail,
+        subject: `Welcome to Navabharath Technologies, ${name}! 🎉`,
+        html: getWelcomeDayOneHtml(name, 'New Joinee', role || 'Employee', finalEmail, finalPassword),
+        text: `Welcome to the team, ${name}! Your email: ${finalEmail}, password: ${finalPassword}`
+      }).catch(e => console.error('Failed to send welcome email:', e));
+    }
+    
     res.json({ message: 'New joinee recorded successfully' });
   } catch (err) {
     res.status(500).json({ error: 'Failed to add new joinee' });
@@ -8030,51 +8474,35 @@ const auditJoineeCompliance = async (joineeId) => {
   try {
     const pool = await getPool();
 
-    // 1. Fetch Joinee Context (Joining Date, Current Progress, and Block Status)
+    // 1. Fetch Joinee Context (Joining Date, Current Progress, Block Status, and Duration)
     const joineeStatusResult = await pool.request()
       .input('jid', sql.Int, joineeId)
-      .query('SELECT joining_date, course_completion, is_blocked FROM new_joinees WITH (NOLOCK) WHERE id = @jid');
+      .query('SELECT joining_date, course_completion, is_blocked, duration FROM new_joinees WITH (NOLOCK) WHERE id = @jid');
 
     if (joineeStatusResult.recordset.length === 0) return { error: 'Joinee not found' };
 
-    const { joining_date, course_completion, is_blocked: wasAlreadyBlocked } = joineeStatusResult.recordset[0];
+    const { joining_date, course_completion, is_blocked: wasAlreadyBlocked, duration } = joineeStatusResult.recordset[0];
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
     const joiningDate = new Date(joining_date);
     joiningDate.setHours(0, 0, 0, 0);
 
-    // Calculate Grace Period Expiry (Joining Date + 10 Days)
+    // Calculate Grace Period Expiry (Joining Date + Duration in days)
+    const durationDays = parseInt(duration, 10);
+    const actualDurationDays = isNaN(durationDays) ? 10 : durationDays; // default to 10 days if duration is not set or invalid
+
     const gracePeriodExpiry = new Date(joiningDate);
-    gracePeriodExpiry.setDate(gracePeriodExpiry.getDate() + 10);
+    gracePeriodExpiry.setDate(gracePeriodExpiry.getDate() + actualDurationDays);
 
     let isOverdue = false;
     let reason = '';
 
-    // RULE: If more than 10 days since joining and progress is less than 100% -> BLOCK
+    // RULE: If more than duration days since joining and progress is less than 100% -> BLOCK
+    // The specific global course deadlines are ignored, user gets their full duration window.
     if (today > gracePeriodExpiry && course_completion < 100) {
       isOverdue = true;
-      reason = `Blocked: 10-day onboarding window expired (Joined on ${joiningDate.toISOString().split('T')[0]}, required completion by ${gracePeriodExpiry.toISOString().split('T')[0]}). Progress: ${course_completion}%`;
-    }
-    // FALLBACK: Also check for any individual course deadlines that have passed (Secondary safety check)
-    else {
-      const overdueCoursesResult = await pool.request()
-        .input('jid', sql.Int, joineeId)
-        .query(`
-          SELECT COUNT(*) as count 
-          FROM newjoinee_courses c WITH (NOLOCK)
-          WHERE c.deadline < CAST(DATEADD(MINUTE, 330, GETUTCDATE()) AS DATE)
-            AND NOT EXISTS (
-              SELECT 1 FROM joinee_course_progress p WITH (NOLOCK)
-              WHERE p.course_id = c.id AND p.joinee_id = @jid AND p.is_completed = 1
-            )
-        `);
-
-      const count = overdueCoursesResult.recordset[0].count;
-      if (count > 0) {
-        isOverdue = true;
-        reason = `Blocked due to ${count} specific course(s) passing their individual deadlines.`;
-      }
+      reason = `Blocked: ${actualDurationDays}-day onboarding window expired (Joined on ${joiningDate.toISOString().split('T')[0]}, required completion by ${gracePeriodExpiry.toISOString().split('T')[0]}). Progress: ${course_completion}%`;
     }
 
     if (isOverdue) {
@@ -8100,16 +8528,26 @@ const auditJoineeCompliance = async (joineeId) => {
 };
 
 // Helper: Create notifications for HR, Admins and Manager (OPTIMIZED: Batch INSERT)
-const createComplianceNotification = async (joineeId, reason) => {
+const createComplianceNotification = async (userId, reason, userType = 'new_joinee') => {
   try {
     const pool = await getPool();
-    // Single query: Fetch joinee info + HR users + Manager in one go
-    const joineeResult = await pool.request().input('id', sql.Int, joineeId).query('SELECT name, hired_by FROM new_joinees WITH (NOLOCK) WHERE id = @id');
-    if (joineeResult.recordset.length === 0) return;
+    let userName = '';
+    let hiredBy = null;
+    let alertMessage = '';
 
-    const joineeName = joineeResult.recordset[0].name;
-    const hiredBy = joineeResult.recordset[0].hired_by;
-    const alertMessage = `URGENT: New Joinee ${joineeName} (ID: ${joineeId}) has been BLOCKED. Reason: ${reason}`;
+    if (userType === 'intern') {
+      const internResult = await pool.request().input('id', sql.Int, userId).query('SELECT name, reporting_manager_id FROM interns WITH (NOLOCK) WHERE id = @id');
+      if (internResult.recordset.length === 0) return;
+      userName = internResult.recordset[0].name;
+      hiredBy = internResult.recordset[0].reporting_manager_id ? String(internResult.recordset[0].reporting_manager_id) : null;
+      alertMessage = `URGENT: Intern ${userName} (ID: ${userId}) has been BLOCKED. Reason: ${reason}`;
+    } else {
+      const joineeResult = await pool.request().input('id', sql.Int, userId).query('SELECT name, hired_by FROM new_joinees WITH (NOLOCK) WHERE id = @id');
+      if (joineeResult.recordset.length === 0) return;
+      userName = joineeResult.recordset[0].name;
+      hiredBy = joineeResult.recordset[0].hired_by;
+      alertMessage = `URGENT: New Joinee ${userName} (ID: ${userId}) has been BLOCKED. Reason: ${reason}`;
+    }
 
     // Collect all unique recipient IDs in a Set
     const recipientIds = new Set();
@@ -8132,9 +8570,76 @@ const createComplianceNotification = async (joineeId, reason) => {
       await batchRequest.query(`INSERT INTO notifications (target_user_id, message, type) VALUES ${valuesClauses.join(', ')}`);
     }
 
-    console.log(`[NOTIFICATION] Compliance alerts broadcasted to ${recipientIds.size} recipients for joinee ${joineeName}`);
+    console.log(`[NOTIFICATION] Compliance alerts broadcasted to ${recipientIds.size} recipients for user ${userName}`);
   } catch (err) {
     console.error('[NOTIFICATION ERROR]:', err);
+  }
+};
+
+const auditInternCompliance = async (internId) => {
+  try {
+    const pool = await getPool();
+
+    // 1. Fetch Intern Context
+    const internStatusResult = await pool.request()
+      .input('iid', sql.Int, internId)
+      .query('SELECT joining_date, duration_months, is_blocked FROM interns WITH (NOLOCK) WHERE id = @iid');
+
+    if (internStatusResult.recordset.length === 0) return { error: 'Intern not found' };
+
+    const { joining_date, duration_months, is_blocked: wasAlreadyBlocked } = internStatusResult.recordset[0];
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const joiningDate = new Date(joining_date);
+    joiningDate.setHours(0, 0, 0, 0);
+
+    // Calculate Grace Period Expiry (Joining Date + Duration in Months)
+    const durationM = parseInt(duration_months, 10);
+    const actualDurationMonths = isNaN(durationM) ? 2 : durationM; // default 2 months
+
+    const gracePeriodExpiry = new Date(joiningDate);
+    gracePeriodExpiry.setMonth(gracePeriodExpiry.getMonth() + actualDurationMonths);
+
+    // 2. Calculate Progress
+    const progressResult = await pool.request()
+      .input('iid', sql.Int, internId)
+      .query(`
+        SELECT 
+          (SELECT COUNT(*) FROM courses WITH (NOLOCK)) as total_courses,
+          (SELECT COUNT(*) FROM user_courses WITH (NOLOCK) WHERE user_id = @iid AND completed = 1) as completed_courses
+      `);
+    
+    const { total_courses, completed_courses } = progressResult.recordset[0];
+    const course_completion = total_courses > 0 ? Math.round((completed_courses / total_courses) * 100) : 100;
+
+    let isOverdue = false;
+    let reason = '';
+
+    if (today > gracePeriodExpiry && course_completion < 100) {
+      isOverdue = true;
+      reason = `Blocked: ${actualDurationMonths}-month internship window expired (Joined on ${joiningDate.toISOString().split('T')[0]}, required completion by ${gracePeriodExpiry.toISOString().split('T')[0]}). Progress: ${course_completion}%`;
+    }
+
+    if (isOverdue) {
+      await pool.request()
+        .input('iid', sql.Int, internId)
+        .input('reason', sql.NVarChar, reason)
+        .query('UPDATE interns SET is_blocked = 1, block_reason = @reason WHERE id = @iid');
+
+      console.log(`[COMPLIANCE] Intern ${internId} has been BLOCKED. Reason: ${reason}`);
+
+      // TRIGGER NOTIFICATIONS if newly blocked
+      if (!wasAlreadyBlocked) {
+        await createComplianceNotification(internId, reason, 'intern');
+      }
+      return { blocked: true, reason };
+    } else {
+      return { blocked: false };
+    }
+  } catch (err) {
+    console.error(`[AUDIT ERROR] Intern ${internId}:`, err);
+    throw err;
   }
 };
 
@@ -8601,13 +9106,29 @@ app.get('/api/interns/:id', async (req, res) => {
 // POST: Add new intern
 app.post('/api/interns', async (req, res) => {
   const { name, email, password, role, joining_date, stipend, reporting_manager_id, duration_months, intern_id, personal_email, phone_number } = req.body;
+  const finalPassword = password || 'Nbt@123';
 
-  if (!name || !email || !password || !joining_date) {
-    return res.status(400).json({ error: 'Name, Email, Password, and Joining Date are required' });
+  if (!name || !email || !joining_date) {
+    return res.status(400).json({ error: 'Name, Email, and Joining Date are required' });
   }
 
   try {
     const pool = await getPool();
+
+    // Cross-table Email Validation
+    const emailCheckResult = await pool.request()
+      .input('checkEmail', sql.NVarChar, email)
+      .query(`
+        SELECT email as foundEmail FROM users WHERE email = @checkEmail
+        UNION ALL
+        SELECT email_id as foundEmail FROM new_joinees WHERE email_id = @checkEmail
+        UNION ALL
+        SELECT email as foundEmail FROM interns WHERE email = @checkEmail
+      `);
+      
+    if (emailCheckResult.recordset.length > 0) {
+      return res.status(400).json({ error: 'Email already exists. Please use a unique email address.' });
+    }
 
     // 1. Validate reporting manager exists in users table and get name
     let managerName = null;
@@ -8622,17 +9143,38 @@ app.post('/api/interns', async (req, res) => {
       managerName = managerCheck.recordset[0].name;
     }
 
-    // 2. Insert Intern
+    // 2. Auto-generate internId if not provided or if frontend sends a random legacy ID
+    let finalInternId = intern_id;
+    if (!finalInternId || !finalInternId.startsWith('NBTINT')) {
+      const latestIdResult = await pool.request().query(`
+        SELECT TOP 1 intern_id FROM interns 
+        WHERE intern_id LIKE 'NBTINT%' AND ISNUMERIC(SUBSTRING(intern_id, 7, LEN(intern_id))) = 1
+        ORDER BY CAST(SUBSTRING(intern_id, 7, LEN(intern_id)) AS INT) DESC
+      `);
+      if (latestIdResult.recordset.length > 0 && latestIdResult.recordset[0].intern_id) {
+        const lastIdStr = latestIdResult.recordset[0].intern_id;
+        const lastNum = parseInt(lastIdStr.replace('NBTINT', ''), 10);
+        if (!isNaN(lastNum)) {
+          finalInternId = 'NBTINT' + String(lastNum + 1).padStart(3, '0');
+        } else {
+          finalInternId = 'NBTINT001';
+        }
+      } else {
+        finalInternId = 'NBTINT001';
+      }
+    }
+
+    // 3. Insert Intern
     await pool.request()
       .input('name', sql.NVarChar, name)
       .input('email', sql.NVarChar, email)
-      .input('password', sql.NVarChar, password)
+      .input('password', sql.NVarChar, finalPassword)
       .input('role', sql.NVarChar, role || 'Intern')
       .input('joiningDate', sql.Date, joining_date)
       .input('stipend', sql.Decimal(18, 2), stipend || 0)
       .input('reportingManagerId', sql.Int, reporting_manager_id || null)
       .input('durationMonths', sql.Int, duration_months || 2)
-      .input('internId', sql.NVarChar, intern_id || null)
+      .input('internId', sql.NVarChar, finalInternId)
       .input('personalEmail', sql.NVarChar, personal_email || null)
       .input('phoneNumber', sql.NVarChar, phone_number || null)
       .input('rmName', sql.NVarChar, managerName)
@@ -8640,6 +9182,15 @@ app.post('/api/interns', async (req, res) => {
         INSERT INTO interns (name, email, password, role, joining_date, stipend, reporting_manager_id, duration_months, intern_id, personal_email, phone_number, reporting_manager_name, rm_name)
         VALUES (@name, @email, @password, @role, @joiningDate, @stipend, @reportingManagerId, @durationMonths, @internId, @personalEmail, @phoneNumber, @rmName, @rmName)
       `);
+
+    if (email) {
+      sendAppEmail({
+        to: email,
+        subject: `Welcome to Navabharath Technologies, ${name}! 🎉`,
+        html: getWelcomeDayOneHtml(name, 'Intern', role || 'Intern', email, finalPassword),
+        text: `Welcome to the team, ${name}! Your email: ${email}, password: ${finalPassword}`
+      }).catch(e => console.error('Failed to send welcome email:', e));
+    }
 
     res.json({ success: true, message: 'Intern added successfully' });
   } catch (err) {
@@ -9069,20 +9620,7 @@ app.post('/api/support-tickets', async (req, res) => {
             .query('INSERT INTO notifications (target_user_id, message, is_read, created_at) VALUES (@targetId, @msg, 0, DATEADD(MINUTE, 330, GETUTCDATE()))');
         }
       } else if (selectedDept === 'technical' || selectedDept === 'tichnical') {
-        // Send notification to the user's reporting manager
-        if (userId) {
-          const userMgrResult = await pool.request()
-            .input('uid', sql.Int, userId)
-            .query('SELECT reporting_manager_id FROM users WHERE id = @uid');
-
-          const managerId = userMgrResult.recordset.length > 0 ? userMgrResult.recordset[0].reporting_manager_id : null;
-          if (managerId && managerId !== userId) {
-            await pool.request()
-              .input('targetId', sql.Int, managerId)
-              .input('msg', sql.NVarChar, `New Technical Support Ticket #${ticketNum} from ${creatorName || 'Anonymous'}: ${subject}`)
-              .query('INSERT INTO notifications (target_user_id, message, is_read, created_at) VALUES (@targetId, @msg, 0, DATEADD(MINUTE, 330, GETUTCDATE()))');
-          }
-        }
+        // As per requirements, do not send notifications to the team leader when technical tickets are raised.
       }
     } catch (notifErr) {
       console.error('[TICKET CREATION NOTIFICATION ERROR]:', notifErr.message);
@@ -9272,7 +9810,12 @@ app.get('/api/user-courses', verifyToken, async (req, res) => {
 // Handles start/progress/completion across both general academic catalog and onboarding curriculum.
 // Support all variations matching frontend attempts (/api/user-courses, /api/user_courses, /api/user-course, /api/user_course)
 const handleUserCourseSync = async (req, res) => {
-  const userId = req.user.id;
+  // Resolve target user: allow admins/managers to specify target userId from body
+  const role = (req.user.role || '').toLowerCase();
+  const isAdmin = role.includes('hr') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
+  const bodyUserId = req.body.userId || req.body.user_id;
+  const targetId = bodyUserId ? parseInt(bodyUserId, 10) : null;
+  const userId = (isAdmin && targetId && !isNaN(targetId)) ? targetId : req.user.id;
 
   // Extract course ID from path params or request body
   let courseId = req.params.id ? parseInt(req.params.id, 10) : null;
@@ -9834,7 +10377,13 @@ app.put('/api/courses/:id', verifyToken, memoryUpload.fields([{ name: 'pdf', max
  */
 app.post('/api/courses/:courseId/complete', verifyToken, async (req, res) => {
   const { courseId } = req.params;
-  const userId = req.user.id;
+  
+  // Resolve target user: allow admins/managers to specify target userId from body
+  const role = (req.user.role || '').toLowerCase();
+  const isAdmin = role.includes('hr') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
+  const bodyUserId = req.body.userId || req.body.user_id;
+  const targetId = bodyUserId ? parseInt(bodyUserId, 10) : null;
+  const userId = (isAdmin && targetId && !isNaN(targetId)) ? targetId : req.user.id;
 
   try {
     const pool = await getPool();
@@ -11634,7 +12183,7 @@ const autoPostBirthdays = async () => {
     // 1. Fetch users celebrating today (IST adjusted)
     const birthdayBoys = await pool.request().query(`
       SELECT id, name, role FROM users 
-      WHERE date_of_birth IS NOT NULL
+      WHERE date_of_birth IS NOT NULL AND status = 'Active'
       AND MONTH(date_of_birth) = MONTH(DATEADD(MINUTE, 330, GETUTCDATE()))
       AND DAY(date_of_birth) = DAY(DATEADD(MINUTE, 330, GETUTCDATE()))
     `);
@@ -11772,22 +12321,30 @@ app.get('/api/admin/leaves/accrue-now', async (req, res) => {
 });
 
 /**
- * 40. Daily New Joinee Compliance Audit
- * Runs every day at 00:05 IST to block joinees who missed their course deadline.
+ * 40. Daily New Joinee & Intern Compliance Audit
+ * Runs every day at 00:05 IST to block users who missed their course deadline.
  */
 cron.schedule('5 0 * * *', async () => {
-  console.log('[SCHEDULED TASK] Executing Daily New Joinee Compliance Audit...');
+  console.log('[SCHEDULED TASK] Executing Daily Compliance Audit...');
   try {
     const pool = await getPool();
-    const joineesResult = await pool.request().query('SELECT id FROM new_joinees WITH (NOLOCK) WHERE is_blocked = 0');
-
     let blockedCount = 0;
+
+    // Joinees
+    const joineesResult = await pool.request().query('SELECT id FROM new_joinees WITH (NOLOCK) WHERE is_blocked = 0 OR is_blocked IS NULL');
     for (const joinee of joineesResult.recordset) {
       const status = await auditJoineeCompliance(joinee.id);
-      if (status.blocked) blockedCount++;
+      if (status && status.blocked) blockedCount++;
     }
 
-    console.log(`[SCHEDULED TASK] Compliance audit completed. ${blockedCount} joinees blocked.`);
+    // Interns
+    const internsResult = await pool.request().query('SELECT id FROM interns WITH (NOLOCK) WHERE is_blocked = 0 OR is_blocked IS NULL');
+    for (const intern of internsResult.recordset) {
+      const status = await auditInternCompliance(intern.id);
+      if (status && status.blocked) blockedCount++;
+    }
+
+    console.log(`[SCHEDULED TASK] Compliance audit completed. ${blockedCount} total users blocked.`);
   } catch (err) {
     console.error('[SCHEDULED ERROR] Compliance Audit Failed:', err.message);
   }
@@ -14851,7 +15408,7 @@ app.post('/api/resignations', verifyToken, async (req, res) => {
     // Check if already has a pending resignation
     const checkExisting = await pool.request()
       .input('userId', sql.Int, userId)
-      .query("SELECT id FROM resignations WHERE employee_id = @userId AND status = 'Pending'");
+      .query("SELECT id FROM resignations WHERE employee_id = @userId AND hr_status = 'Pending'");
 
     if (checkExisting.recordset.length > 0) {
       return res.status(400).json({ error: 'You already have a pending resignation request.' });
@@ -14885,7 +15442,11 @@ app.get('/api/resignations/my', verifyToken, async (req, res) => {
     const result = await pool.request()
       .input('userId', sql.Int, userId)
       .query('SELECT * FROM resignations WHERE employee_id = @userId ORDER BY created_at DESC');
-    res.json(result.recordset);
+    const formatted = result.recordset.map(row => ({
+      ...row,
+      status: row.hr_status
+    }));
+    res.json(formatted);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch personal resignation history' });
   }
@@ -14917,7 +15478,11 @@ app.get(['/api/resignations/team', '/api/resignations/team/:userId'], verifyToke
         WHERE u.reporting_manager_id = @managerId
         ORDER BY r.created_at DESC
       `);
-    res.json(result.recordset);
+    const formatted = result.recordset.map(row => ({
+      ...row,
+      status: row.hr_status
+    }));
+    res.json(formatted);
   } catch (err) {
     console.error('Failed to fetch team resignations:', err);
     res.status(500).json({ error: 'Failed to extract team resignation data' });
@@ -14941,7 +15506,11 @@ app.get('/api/admin/resignations', verifyToken, async (req, res) => {
       JOIN users u ON r.employee_id = u.id
       ORDER BY r.created_at DESC
     `);
-    res.json(result.recordset);
+    const formatted = result.recordset.map(row => ({
+      ...row,
+      status: row.hr_status
+    }));
+    res.json(formatted);
   } catch (err) {
     res.status(500).json({ error: 'Failed to extract organizational resignation logs' });
   }
@@ -14952,40 +15521,88 @@ app.get('/api/admin/resignations', verifyToken, async (req, res) => {
  */
 app.put('/api/admin/resignations/:id/review', verifyToken, async (req, res) => {
   const { id } = req.params;
-  const { status, reporting_manager_remark, project_manager_remark, hr_remark } = req.body;
+  const { status, hr_status, pm_status, reporting_manager_remark, project_manager_remark, hr_remark } = req.body;
 
   try {
     const pool = await getPool();
-    const request = pool.request().input('id', sql.Int, id);
+    const transaction = new sql.Transaction(pool);
+    await transaction.begin();
 
-    let updateQuery = "UPDATE resignations SET updated_at = DATEADD(MINUTE, 330, GETUTCDATE())";
-    let sets = [];
+    try {
+      // 1. Get the current resignation request to find the employee_id
+      const checkRes = await new sql.Request(transaction)
+        .input('id', sql.Int, id)
+        .query('SELECT employee_id, hr_status, pm_status FROM resignations WHERE id = @id');
+      
+      if (checkRes.recordset.length === 0) {
+        await transaction.rollback();
+        return res.status(404).json({ error: 'Resignation record not found' });
+      }
 
-    if (status) {
-      sets.push("status = @status");
-      request.input('status', sql.NVarChar, status);
-    }
-    if (reporting_manager_remark) {
-      sets.push("reporting_manager_remark = @rm_remark");
-      request.input('rm_remark', sql.NVarChar, reporting_manager_remark);
-    }
-    if (project_manager_remark) {
-      sets.push("project_manager_remark = @pm_remark");
-      request.input('pm_remark', sql.NVarChar, project_manager_remark);
-    }
-    if (hr_remark) {
-      sets.push("hr_remark = @hr_remark");
-      request.input('hr_remark', sql.NVarChar, hr_remark);
-    }
+      const resignation = checkRes.recordset[0];
+      const employeeId = resignation.employee_id;
 
-    if (sets.length > 0) {
-      updateQuery += ", " + sets.join(", ");
+      // Determine target column for generic 'status' if passed
+      let finalHRStatus = hr_status;
+      let finalPMStatus = pm_status;
+
+      if (status) {
+        const role = (req.user.role || '').toLowerCase();
+        const isHR = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo');
+        if (isHR) {
+          finalHRStatus = status;
+        } else {
+          finalPMStatus = status;
+        }
+      }
+
+      // 2. Perform updates to resignations table
+      const request = new sql.Request(transaction).input('id', sql.Int, id);
+
+      let updateQuery = "UPDATE resignations SET updated_at = DATEADD(MINUTE, 330, GETUTCDATE())";
+      let sets = [];
+
+      if (finalHRStatus) {
+        sets.push("hr_status = @hrStatus");
+        request.input('hrStatus', sql.NVarChar, finalHRStatus);
+      }
+      if (finalPMStatus) {
+        sets.push("pm_status = @pmStatus");
+        request.input('pmStatus', sql.NVarChar, finalPMStatus);
+      }
+      if (reporting_manager_remark) {
+        sets.push("reporting_manager_remark = @rm_remark");
+        request.input('rm_remark', sql.NVarChar, reporting_manager_remark);
+      }
+      if (project_manager_remark) {
+        sets.push("project_manager_remark = @pm_remark");
+        request.input('pm_remark', sql.NVarChar, project_manager_remark);
+      }
+      if (hr_remark) {
+        sets.push("hr_remark = @hr_remark");
+        request.input('hr_remark', sql.NVarChar, hr_remark);
+      }
+
+      if (sets.length > 0) {
+        updateQuery += ", " + sets.join(", ");
+      } else {
+        await transaction.rollback();
+        return res.status(400).json({ error: 'No fields provided for update' });
+      }
+      updateQuery += " WHERE id = @id";
+
+      await request.query(updateQuery);
+
+      // 3. Trigger check and potential user deactivation
+      await checkAndDeactivateUser(transaction, employeeId);
+
+      await transaction.commit();
+
+      res.json({ success: true, message: 'Resignation record updated with review comments.' });
+    } catch (err) {
+      await transaction.rollback();
+      throw err;
     }
-
-    updateQuery += " WHERE id = @id";
-
-    await request.query(updateQuery);
-    res.json({ success: true, message: 'Resignation record updated with review comments.' });
   } catch (err) {
     console.error('[RESIGNATION REVIEW ERROR]:', err);
     res.status(500).json({ error: 'Failed to update resignation record' });
@@ -15038,9 +15655,9 @@ app.post(['/api/service-certificates', '/api/service_certificate_requests'], ver
       .input('tablet', sql.Bit, hasTablet ? 1 : 0)
       .query(`
         INSERT INTO service_certificate_requests 
-          (employee_id, purpose, designation_at_request, laptop_details, serial_number, mouse, keyboard, laptop_stand, ruf_pad, pendrive, company_mobile, external_camera, earphone_headphone, tablet, status, created_at, updated_at)
+          (employee_id, purpose, designation_at_request, laptop_details, serial_number, mouse, keyboard, laptop_stand, ruf_pad, pendrive, company_mobile, external_camera, earphone_headphone, tablet, hr_status, pm_status, created_at, updated_at)
         VALUES 
-          (@employee_id, @purpose, @designation, @laptop, @serial, @mouse, @keyboard, @laptop_stand, @ruf_pad, @pendrive, @company_mobile, @external_camera, @earphone_headphone, @tablet, 'Pending', DATEADD(MINUTE, 330, GETUTCDATE()), DATEADD(MINUTE, 330, GETUTCDATE()))
+          (@employee_id, @purpose, @designation, @laptop, @serial, @mouse, @keyboard, @laptop_stand, @ruf_pad, @pendrive, @company_mobile, @external_camera, @earphone_headphone, @tablet, 'Pending', 'Pending', DATEADD(MINUTE, 330, GETUTCDATE()), DATEADD(MINUTE, 330, GETUTCDATE()))
       `);
 
     res.status(201).json({ success: true, message: 'Service certificate application submitted successfully.' });
@@ -15060,7 +15677,11 @@ app.get(['/api/service-certificates/my', '/api/service_certificate_requests/my']
     const result = await pool.request()
       .input('userId', sql.Int, userId)
       .query('SELECT * FROM service_certificate_requests WHERE employee_id = @userId ORDER BY created_at DESC');
-    res.json(result.recordset);
+    const formatted = result.recordset.map(row => ({
+      ...row,
+      status: row.hr_status
+    }));
+    res.json(formatted);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch personal service certificate history' });
   }
@@ -15074,7 +15695,7 @@ app.get(['/api/admin/service-certificates', '/api/service_certificate_requests',
   const { userId } = req.query;
 
   // If a userId is provided, ensure the requester is authorized (Self, Admin, or Manager)
-  const isAuthorized = role.includes('hr') || role.includes('human resource') || role.includes('ceo') || role.includes('admin') || role.includes('manager') || (userId && parseInt(userId) === req.user.id);
+  const isAuthorized = role.includes('hr') || role.includes('human resource') || role.includes('ceo') || role.includes('admin') || role.includes('manager') || role.includes('pm') || role.includes('lead') || (userId && parseInt(userId) === req.user.id);
 
   if (!isAuthorized) {
     return res.status(403).json({ error: 'Unauthorized: Access denied.' });
@@ -15097,7 +15718,11 @@ app.get(['/api/admin/service-certificates', '/api/service_certificate_requests',
     query += ` ORDER BY scr.created_at DESC `;
 
     const result = await request.query(query);
-    res.json(result.recordset);
+    const formatted = result.recordset.map(row => ({
+      ...row,
+      status: row.hr_status
+    }));
+    res.json(formatted);
   } catch (err) {
     res.status(500).json({ error: 'Failed to extract service certificate logs' });
   }
@@ -15113,7 +15738,7 @@ app.get(['/api/service-certificates/:id', '/api/service_certificate_requests/:id
 
   try {
     const pool = await getPool();
-    const result = await pool.request()
+    let result = await pool.request()
       .input('id', sql.Int, id)
       .query(`
         SELECT scr.*, u.name as employee_name, u.email as employee_email, u.team
@@ -15122,14 +15747,34 @@ app.get(['/api/service-certificates/:id', '/api/service_certificate_requests/:id
         WHERE scr.id = @id
       `);
 
+    if (result.recordset.length === 0) {
+      // Fallback: Check if the ID matches an asset ID in the assets table
+      console.log(`[CERT GET] Certificate Request ID ${id} not found. Checking if it is an Asset ID...`);
+      const assetResult = await pool.request().input('id', sql.Int, id).query('SELECT employee_id FROM assets WHERE id = @id');
+      if (assetResult.recordset.length > 0) {
+        const empId = assetResult.recordset[0].employee_id;
+        console.log(`[CERT GET] Resolved asset ID ${id} to employee ${empId}. Searching for their latest request...`);
+        result = await pool.request()
+          .input('empId', sql.NVarChar, String(empId))
+          .query(`
+            SELECT TOP 1 scr.*, u.name as employee_name, u.email as employee_email, u.team
+            FROM service_certificate_requests scr 
+            JOIN users u ON scr.employee_id = u.id 
+            WHERE scr.employee_id = TRY_CAST(@empId AS INT)
+            ORDER BY scr.created_at DESC
+          `);
+      }
+    }
+
     if (result.recordset.length === 0) return res.status(404).json({ error: 'Request not found' });
 
     const certRequest = result.recordset[0];
-    const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('ceo') || role.includes('admin') || role.includes('manager') || role.includes('lead');
+    const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('ceo') || role.includes('admin') || role.includes('manager') || role.includes('lead') || role.includes('pm');
     if (!isAdmin && certRequest.employee_id !== userId) {
       return res.status(403).json({ error: 'Unauthorized access' });
     }
 
+    certRequest.status = certRequest.hr_status;
     res.json(certRequest);
   } catch (err) {
     console.error('[SERVICE CERT FETCH ERROR]:', err);
@@ -15294,7 +15939,7 @@ app.put(['/api/admin/service-certificates/:id', '/api/service-certificates/:id',
   // Resolve ID from URL or Body (Supporting multiple naming conventions)
   const id = req.params.id || req.body.id || req.body.certificateId || req.body.requestId;
   const admin_remark = req.body.admin_remark || req.body.admin_remarks;
-  const { status, certificate_url, purpose } = req.body;
+  const { status, hr_status, pm_status, certificate_url, purpose } = req.body;
 
   try {
     const pool = await getPool();
@@ -15304,17 +15949,38 @@ app.put(['/api/admin/service-certificates/:id', '/api/service-certificates/:id',
     if (id && !isNaN(parseInt(id)) && parseInt(id) > 0) {
       const verifyResult = await pool.request().input('id', sql.Int, id).query('SELECT * FROM service_certificate_requests WHERE id = @id');
       certificate = verifyResult.recordset[0];
+      
+      if (!certificate) {
+        // Fallback: Check if the ID matches an asset ID in the assets table
+        console.log(`[CERT UPDATE] Certificate Request ID ${id} not found. Checking if it is an Asset ID...`);
+        const assetResult = await pool.request().input('id', sql.Int, id).query('SELECT employee_id FROM assets WHERE id = @id');
+        if (assetResult.recordset.length > 0) {
+          const empId = assetResult.recordset[0].employee_id;
+          console.log(`[CERT UPDATE] Resolved asset ID ${id} to employee ${empId}. Searching for their latest request...`);
+          const fallbackResult = await pool.request()
+            .input('empId', sql.NVarChar, String(empId))
+            .query("SELECT TOP 1 * FROM service_certificate_requests WHERE employee_id = TRY_CAST(@empId AS INT) ORDER BY created_at DESC");
+          certificate = fallbackResult.recordset[0];
+        }
+      }
+
+      if (!certificate) {
+        return res.status(404).json({ error: `Service Certificate Request with ID ${id} not found.` });
+      }
     }
 
     const targetEmpId = req.body.employee_id ? sanitizeNumericId(req.body.employee_id) : userId;
 
     if (!certificate && targetEmpId) {
       console.log(`[CERT UPDATE] ID ${id} not found. Searching for latest pending request for Employee ${targetEmpId}...`);
-      const fallbackResult = await pool.request().input('empId', sql.Int, targetEmpId).query('SELECT TOP 1 * FROM service_certificate_requests WHERE employee_id = @empId AND status = \'Pending\' ORDER BY created_at DESC');
+      const fallbackResult = await pool.request().input('empId', sql.Int, targetEmpId).query('SELECT TOP 1 * FROM service_certificate_requests WHERE employee_id = @empId AND hr_status = \'Pending\' ORDER BY created_at DESC');
       certificate = fallbackResult.recordset[0];
     }
 
-    const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('ceo') || role.includes('admin') || role.includes('manager') || role.includes('lead');
+    // Resolve actual employee ID
+    const actualEmpId = certificate ? certificate.employee_id : targetEmpId;
+
+    const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('ceo') || role.includes('admin') || role.includes('manager') || role.includes('lead') || role.includes('pm');
     const isOwner = certificate ? (certificate.employee_id === userId) : (targetEmpId === userId);
 
     if (!isAdmin && !isOwner) {
@@ -15322,14 +15988,24 @@ app.put(['/api/admin/service-certificates/:id', '/api/service-certificates/:id',
       return res.status(403).json({ error: 'Unauthorized: Access denied.' });
     }
 
-    // Security: Only Admin/HR can update status or remarks on existing records
-    if (certificate && (status !== undefined || admin_remark !== undefined || certificate_url !== undefined) && !isAdmin) {
-      return res.status(403).json({ error: 'Unauthorized: Only Admin/HR can approve or comment on certificates.' });
+    // Security: Only Admin/HR/PM can update status or remarks on existing records
+    if (certificate && (status !== undefined || hr_status !== undefined || pm_status !== undefined || admin_remark !== undefined || certificate_url !== undefined) && !isAdmin) {
+      return res.status(403).json({ error: 'Unauthorized: Only Admin/HR/PM can approve or comment on certificates.' });
     }
 
-    const request = pool.request();
+    // Determine target columns based on role
+    let finalHRStatus = hr_status;
+    let finalPMStatus = pm_status;
 
-    // --- Comprehensive Field Mapping ---
+    if (status) {
+      const isHR = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo');
+      if (isHR) {
+        finalHRStatus = status;
+      } else {
+        finalPMStatus = status;
+      }
+    }
+
     const fieldMapping = {
       purpose: 'purpose',
       designation: 'designation_at_request',
@@ -15338,7 +16014,6 @@ app.put(['/api/admin/service-certificates/:id', '/api/service-certificates/:id',
       laptopDetails: 'laptop_details',
       serial_number: 'serial_number',
       serialNumber: 'serial_number',
-      // Asset Columns (Supporting both prefixed and non-prefixed columns in schema)
       mouse: 'mouse', has_mouse: 'has_mouse', hasMouse: 'mouse',
       keyboard: 'keyboard', has_keyboard: 'has_keyboard', hasKeyboard: 'keyboard',
       laptop_stand: 'laptop_stand', has_laptop_stand: 'has_laptop_stand', hasLaptopStand: 'laptop_stand',
@@ -15352,23 +16027,93 @@ app.put(['/api/admin/service-certificates/:id', '/api/service-certificates/:id',
 
     const booleanCols = ['mouse', 'has_mouse', 'keyboard', 'has_keyboard', 'laptop_stand', 'has_laptop_stand', 'ruf_pad', 'pendrive', 'company_mobile', 'external_camera', 'earphone_headphone', 'tablet'];
 
-    if (certificate) {
-      // --- UPDATE PATH ---
-      console.log(`[CERT UPDATE] Updating existing record ID: ${certificate.id}`);
-      let updateQuery = "UPDATE service_certificate_requests SET updated_at = DATEADD(MINUTE, 330, GETUTCDATE())";
-      let sets = [];
+    const transaction = new sql.Transaction(pool);
+    await transaction.begin();
 
-      request.input('id', sql.Int, certificate.id);
+    try {
+      const request = new sql.Request(transaction);
 
-      if (status) { sets.push("status = @status"); request.input('status', sql.NVarChar, status); }
-      if (admin_remark !== undefined) { sets.push("admin_remark = @admin_remark"); request.input('admin_remark', sql.NVarChar, admin_remark); }
-      if (certificate_url !== undefined) { sets.push("certificate_url = @certificate_url"); request.input('certificate_url', sql.NVarChar, certificate_url); }
+      if (certificate) {
+        // --- UPDATE PATH ---
+        console.log(`[CERT UPDATE] Updating existing record ID: ${certificate.id}`);
+        let updateQuery = "UPDATE service_certificate_requests SET updated_at = DATEADD(MINUTE, 330, GETUTCDATE())";
+        let sets = [];
 
-      Object.keys(fieldMapping).forEach(key => {
-        if (req.body[key] !== undefined) {
+        request.input('id', sql.Int, certificate.id);
+
+        if (finalHRStatus) { sets.push("hr_status = @hrStatus"); request.input('hrStatus', sql.NVarChar, finalHRStatus); }
+        if (finalPMStatus) { sets.push("pm_status = @pmStatus"); request.input('pmStatus', sql.NVarChar, finalPMStatus); }
+        if (admin_remark !== undefined) { sets.push("admin_remark = @admin_remark"); request.input('admin_remark', sql.NVarChar, admin_remark); }
+        if (certificate_url !== undefined) { sets.push("certificate_url = @certificate_url"); request.input('certificate_url', sql.NVarChar, certificate_url); }
+
+        Object.keys(fieldMapping).forEach(key => {
+          if (req.body[key] !== undefined) {
+            const col = fieldMapping[key];
+            if (!sets.some(s => s.startsWith(`${col} =`))) {
+              sets.push(`${col} = @${col}`);
+              const val = req.body[key];
+              if (booleanCols.includes(col)) {
+                request.input(col, sql.Bit, (val === true || val === 1 || String(val).toLowerCase() === 'true') ? 1 : 0);
+              } else {
+                request.input(col, sql.NVarChar, val);
+              }
+            }
+          }
+        });
+
+        if (sets.length > 0) {
+          updateQuery += ", " + sets.join(", ") + " WHERE id = @id";
+          await request.query(updateQuery);
+        }
+
+        // Automatically add pledged assets to stock table if status is Approved
+        const checkHR = finalHRStatus || certificate.hr_status;
+        const checkPM = finalPMStatus || certificate.pm_status;
+        const isNewlyApproved = (checkHR === 'Approved' && checkPM === 'Approved') && (certificate.hr_status !== 'Approved' || certificate.pm_status !== 'Approved');
+        if (isNewlyApproved) {
+          await addCertAssetsToStock(transaction, certificate, req.body);
+        }
+
+        // Trigger check and potential user deactivation
+        await checkAndDeactivateUser(transaction, actualEmpId);
+
+        await transaction.commit();
+
+        res.json({ success: true, message: 'Service certificate request updated successfully.', id: certificate.id });
+
+      } else {
+        // --- INSERT PATH (UPSERT Fallback) ---
+        console.log(`[CERT UPDATE] Creating new record for Employee: ${actualEmpId}`);
+
+        const finalPurpose = purpose || 'Professional Requirement';
+        const initialHRStatus = finalHRStatus || 'Pending';
+        const initialPMStatus = finalPMStatus || 'Pending';
+
+        let finalDesignation = req.body.designation || req.body.designation_at_request;
+        if (!finalDesignation) {
+          const userRes = await new sql.Request(transaction).input('uidForRole', sql.Int, actualEmpId).query(`
+            SELECT role FROM users WHERE id = @uidForRole
+            UNION SELECT role FROM new_joinees WHERE id = @uidForRole
+            UNION SELECT role FROM interns WHERE id = @uidForRole
+          `);
+          if (userRes.recordset.length > 0) finalDesignation = userRes.recordset[0].role;
+          if (!finalDesignation) finalDesignation = 'Employee';
+        }
+
+        request.input('emp_id', sql.Int, actualEmpId);
+        request.input('purpose', sql.NVarChar, finalPurpose);
+        request.input('hr_status', sql.NVarChar, initialHRStatus);
+        request.input('pm_status', sql.NVarChar, initialPMStatus);
+        request.input('designation_at_request', sql.NVarChar, finalDesignation);
+
+        let cols = ['employee_id', 'purpose', 'hr_status', 'pm_status', 'designation_at_request', 'created_at', 'updated_at'];
+        let vals = ['@emp_id', '@purpose', '@hr_status', '@pm_status', '@designation_at_request', 'DATEADD(MINUTE, 330, GETUTCDATE())', 'DATEADD(MINUTE, 330, GETUTCDATE())'];
+
+        Object.keys(fieldMapping).forEach(key => {
           const col = fieldMapping[key];
-          if (!sets.some(s => s.startsWith(`${col} =`))) {
-            sets.push(`${col} = @${col}`);
+          if (req.body[key] !== undefined && !cols.includes(col) && col !== 'purpose') {
+            cols.push(col);
+            vals.push(`@${col}`);
             const val = req.body[key];
             if (booleanCols.includes(col)) {
               request.input(col, sql.Bit, (val === true || val === 1 || String(val).toLowerCase() === 'true') ? 1 : 0);
@@ -15376,61 +16121,27 @@ app.put(['/api/admin/service-certificates/:id', '/api/service-certificates/:id',
               request.input(col, sql.NVarChar, val);
             }
           }
+        });
+
+        const insertQuery = `INSERT INTO service_certificate_requests (${cols.join(', ')}) OUTPUT INSERTED.id VALUES (${vals.join(', ')})`;
+        const result = await request.query(insertQuery);
+        const newId = result.recordset[0].id;
+
+        if (initialHRStatus === 'Approved' && initialPMStatus === 'Approved') {
+          const certRecord = { id: newId, employee_id: actualEmpId };
+          await addCertAssetsToStock(transaction, certRecord, req.body);
         }
-      });
 
-      if (sets.length > 0) {
-        updateQuery += ", " + sets.join(", ") + " WHERE id = @id";
-        await request.query(updateQuery);
+        // Trigger check and potential user deactivation
+        await checkAndDeactivateUser(transaction, actualEmpId);
+
+        await transaction.commit();
+
+        res.status(201).json({ success: true, message: 'Service certificate request created successfully.', id: newId });
       }
-
-      // Automatically add pledged assets to stock table if status is Approved
-      const isNewlyApproved = (status === 'Approved' || req.body.status === 'Approved') && certificate.status !== 'Approved';
-      if (isNewlyApproved) {
-        await addCertAssetsToStock(pool, certificate, req.body);
-      }
-
-      res.json({ success: true, message: 'Service certificate request updated successfully.', id: certificate.id });
-
-    } else {
-      // --- INSERT PATH (UPSERT Fallback) ---
-      console.log(`[CERT UPDATE] Creating new record for Employee: ${targetEmpId}`);
-
-      // Ensure we have mandatory fields or fallbacks
-      const finalPurpose = purpose || 'Professional Requirement';
-      const finalStatus = status || 'Pending';
-
-      request.input('emp_id', sql.Int, targetEmpId);
-      request.input('purpose', sql.NVarChar, finalPurpose);
-      request.input('status', sql.NVarChar, finalStatus);
-
-      let cols = ['employee_id', 'purpose', 'status', 'created_at', 'updated_at'];
-      let vals = ['@emp_id', '@purpose', '@status', 'DATEADD(MINUTE, 330, GETUTCDATE())', 'DATEADD(MINUTE, 330, GETUTCDATE())'];
-
-      Object.keys(fieldMapping).forEach(key => {
-        const col = fieldMapping[key];
-        if (req.body[key] !== undefined && !cols.includes(col) && col !== 'purpose') {
-          cols.push(col);
-          vals.push(`@${col}`);
-          const val = req.body[key];
-          if (booleanCols.includes(col)) {
-            request.input(col, sql.Bit, (val === true || val === 1 || String(val).toLowerCase() === 'true') ? 1 : 0);
-          } else {
-            request.input(col, sql.NVarChar, val);
-          }
-        }
-      });
-
-      const insertQuery = `INSERT INTO service_certificate_requests (${cols.join(', ')}) OUTPUT INSERTED.id VALUES (${vals.join(', ')})`;
-      const result = await request.query(insertQuery);
-      const newId = result.recordset[0].id;
-
-      if (finalStatus === 'Approved') {
-        const certRecord = { id: newId, employee_id: targetEmpId };
-        await addCertAssetsToStock(pool, certRecord, req.body);
-      }
-
-      res.status(201).json({ success: true, message: 'Service certificate request created successfully.', id: newId });
+    } catch (err) {
+      await transaction.rollback();
+      throw err;
     }
 
   } catch (err) {
@@ -15829,9 +16540,25 @@ const handleProfileUpdate = async (req, res) => {
         const parsed = parseInt(value, 10);
         request.input(key, sql.Int, (value === '' || value === null || isNaN(parsed)) ? null : parsed);
       } else if (['doj', 'lwd', 'dob', 'separation'].includes(key)) {
-        // Only pass valid date strings, otherwise null
-        const isValidDate = value && value !== '' && !isNaN(new Date(value).getTime());
-        request.input(key, sql.Date, isValidDate ? value : null);
+        // Parse date thoroughly to allow DD/MM/YYYY or YYYY-MM-DD
+        let parsedDateForSql = null;
+        if (value && typeof value === 'string' && value.trim() !== '') {
+          const ymdMatch = value.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})/);
+          const dmyMatch = value.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
+          if (ymdMatch) {
+            parsedDateForSql = `${ymdMatch[1]}-${ymdMatch[2].padStart(2, '0')}-${ymdMatch[3].padStart(2, '0')}`;
+          } else if (dmyMatch) {
+            parsedDateForSql = `${dmyMatch[3]}-${dmyMatch[2].padStart(2, '0')}-${dmyMatch[1].padStart(2, '0')}`;
+          } else {
+            const d = new Date(value);
+            if (!isNaN(d.getTime())) {
+               parsedDateForSql = d.toISOString().split('T')[0];
+            }
+          }
+        } else if (value instanceof Date) {
+          parsedDateForSql = value.toISOString().split('T')[0];
+        }
+        request.input(key, sql.Date, parsedDateForSql);
       } else {
         request.input(key, sql.NVarChar(sql.MAX), (value === '' || value === null) ? null : String(value));
       }
@@ -15868,11 +16595,37 @@ const handleProfileUpdate = async (req, res) => {
 
     // 5. Sync Date of Birth back to the core Users table if it was updated
     if (updateData.dob) {
-      const dobValue = updateData.dob instanceof Date ? updateData.dob.toISOString().split('T')[0] : updateData.dob;
-      await pool.request()
-        .input('userId', sql.Int, targetEmployeeId)
-        .input('dob', sql.NVarChar, dobValue)
-        .query('UPDATE users SET date_of_birth = @dob WHERE id = @userId');
+      let syncDob = null;
+      const dobVal = updateData.dob;
+      if (dobVal && typeof dobVal === 'string' && dobVal.trim() !== '') {
+        const ymdMatch = dobVal.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})/);
+        const dmyMatch = dobVal.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
+        let parsedD, parsedM, parsedY;
+        
+        if (ymdMatch) {
+          parsedY = ymdMatch[1]; parsedM = ymdMatch[2]; parsedD = ymdMatch[3];
+        } else if (dmyMatch) {
+          parsedD = dmyMatch[1]; parsedM = dmyMatch[2]; parsedY = dmyMatch[3];
+        } else {
+          const d = new Date(dobVal);
+          if (!isNaN(d.getTime())) {
+            parsedY = d.getFullYear(); parsedM = d.getMonth() + 1; parsedD = d.getDate();
+          }
+        }
+        
+        if (parsedY && parsedM && parsedD) {
+          syncDob = `${String(parsedD).padStart(2, '0')}/${String(parsedM).padStart(2, '0')}/${parsedY}`;
+        }
+      } else if (dobVal instanceof Date) {
+        syncDob = `${String(dobVal.getDate()).padStart(2, '0')}/${String(dobVal.getMonth() + 1).padStart(2, '0')}/${dobVal.getFullYear()}`;
+      }
+      
+      if (syncDob) {
+        await pool.request()
+          .input('userId', sql.Int, targetEmployeeId)
+          .input('dob', sql.NVarChar, syncDob)
+          .query('UPDATE users SET date_of_birth = @dob WHERE id = @userId');
+      }
     }
 
     res.json({ success: true, message: 'Profile updated successfully.' });
@@ -15890,7 +16643,7 @@ const handleProfileUpdate = async (req, res) => {
 // GET: All assets / Filtered (Admin/Manager use)
 app.get('/api/assets', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead') || role.includes('pm');
 
   if (!isAdmin) return res.status(403).json({ error: 'Unauthorized: Admin access required.' });
 
@@ -15922,7 +16675,7 @@ app.get('/api/my-assets', verifyToken, async (req, res) => {
   const employee_id = sanitizeNumericId(req.query.employee_id);
 
   const role = (req.user.role || '').toLowerCase();
-  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead') || role.includes('pm');
 
   try {
     const pool = await getPool();
@@ -15964,7 +16717,7 @@ app.get('/api/my-assets', verifyToken, async (req, res) => {
 // POST: Add new asset record
 app.post('/api/assets', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead') || role.includes('pm');
 
   if (!isAdmin) return res.status(403).json({ error: 'Unauthorized: Admin access required.' });
 
@@ -15998,14 +16751,16 @@ app.post('/api/assets', verifyToken, async (req, res) => {
     // --- UPSERT LOGIC: Check for duplicate employee_id ---
     const empId = data.employee_id || data.employeeId || null;
     let isUpdate = false;
+    let oldLaptopDetails = null;
 
     if (empId) {
       const checkRes = await pool.request()
         .input('checkId', sql.NVarChar, String(empId))
-        .query('SELECT id FROM assets WHERE employee_id = @checkId');
+        .query('SELECT id, laptop_details FROM assets WHERE employee_id = @checkId');
 
       if (checkRes.recordset.length > 0) {
         isUpdate = true;
+        oldLaptopDetails = checkRes.recordset[0].laptop_details;
       }
     }
 
@@ -16025,6 +16780,17 @@ app.post('/api/assets', verifyToken, async (req, res) => {
     }
 
     await request.query(query);
+
+    // --- Auto-delete ONE matching laptop from stock if a NEW laptop is assigned ---
+    const finalLaptop = data.laptop_details || data.laptopDetails || getAssetValue(data, 'laptop_details');
+    const laptopChanged = !isUpdate || (isUpdate && oldLaptopDetails !== finalLaptop);
+    
+    if (laptopChanged && finalLaptop && String(finalLaptop).trim() !== '') {
+      await pool.request()
+        .input('laptopStr', sql.NVarChar, String(finalLaptop).trim())
+        .query('DELETE TOP (1) FROM assets_stock WHERE laptop_details = @laptopStr');
+    }
+
     res.status(isUpdate ? 200 : 201).json({
       success: true,
       message: isUpdate ? 'Asset record updated successfully' : 'Asset record created successfully'
@@ -16038,7 +16804,7 @@ app.post('/api/assets', verifyToken, async (req, res) => {
 // PUT: Update asset record
 app.put('/api/assets/:id', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead') || role.includes('pm');
 
   if (!isAdmin) return res.status(403).json({ error: 'Unauthorized: Admin access required.' });
 
@@ -16047,6 +16813,9 @@ app.put('/api/assets/:id', verifyToken, async (req, res) => {
   try {
     const pool = await getPool();
     const request = pool.request().input('id', sql.Int, id);
+
+    const checkRes = await pool.request().input('checkId', sql.Int, id).query('SELECT laptop_details FROM assets WHERE id = @checkId');
+    const oldLaptopDetails = checkRes.recordset.length > 0 ? checkRes.recordset[0].laptop_details : null;
 
     const columns = [
       'employee_id', 'employee_name', 'designation', 'joining_date', 'last_working_date',
@@ -16085,6 +16854,15 @@ app.put('/api/assets/:id', verifyToken, async (req, res) => {
 
     const query = `UPDATE assets SET ${updateClauses.join(', ')}, updated_at = GETDATE() WHERE id = @id`;
     await request.query(query);
+
+    // --- Auto-delete ONE matching laptop from stock if the laptop was changed ---
+    const finalLaptop = data.laptop_details || data.laptopDetails || getAssetValue(data, 'laptop_details');
+    if (finalLaptop && finalLaptop !== oldLaptopDetails && String(finalLaptop).trim() !== '') {
+      await pool.request()
+        .input('laptopStr', sql.NVarChar, String(finalLaptop).trim())
+        .query('DELETE TOP (1) FROM assets_stock WHERE laptop_details = @laptopStr');
+    }
+
     res.json({ success: true, message: 'Asset record updated' });
   } catch (err) {
     console.error('[ASSET UPDATE ERROR]:', err);
@@ -16095,7 +16873,7 @@ app.put('/api/assets/:id', verifyToken, async (req, res) => {
 // DELETE: Remove asset record
 app.delete('/api/assets/:id', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead') || role.includes('pm');
 
   if (!isAdmin) return res.status(403).json({ error: 'Unauthorized: Admin access required.' });
 
@@ -16377,7 +17155,7 @@ app.get('/api/assets-stock/summary', verifyToken, async (req, res) => {
 // POST: Add new asset to stock (e.g. company bought new set of assets)
 app.post('/api/assets-stock', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead') || role.includes('pm');
 
   if (!isAdmin) return res.status(403).json({ error: 'Unauthorized: Admin access required.' });
 
@@ -16472,7 +17250,7 @@ app.post('/api/assets-stock', verifyToken, async (req, res) => {
 // PUT: Update stock asset record
 app.put('/api/assets-stock/:id', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead') || role.includes('pm');
 
   if (!isAdmin) return res.status(403).json({ error: 'Unauthorized: Admin access required.' });
 
@@ -16514,7 +17292,7 @@ app.put('/api/assets-stock/:id', verifyToken, async (req, res) => {
 // DELETE: Remove asset from stock
 app.delete('/api/assets-stock/:id', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead') || role.includes('pm');
 
   if (!isAdmin) return res.status(403).json({ error: 'Unauthorized: Admin access required.' });
 
@@ -16532,7 +17310,7 @@ app.delete('/api/assets-stock/:id', verifyToken, async (req, res) => {
 // POST: Assign asset from stock to an employee
 app.post('/api/assets/assign', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead') || role.includes('pm');
 
   if (!isAdmin) return res.status(403).json({ error: 'Unauthorized: Admin access required.' });
 
@@ -16632,7 +17410,7 @@ app.post('/api/assets/assign', verifyToken, async (req, res) => {
 // POST: Release an employee's asset back to stock (e.g. when an employee resigns)
 app.post('/api/assets/release', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead') || role.includes('pm');
 
   if (!isAdmin) return res.status(403).json({ error: 'Unauthorized: Admin access required.' });
 
@@ -16722,7 +17500,9 @@ app.post('/api/assets/release', verifyToken, async (req, res) => {
 app.get('/api/resignations', verifyToken, async (req, res) => {
   const employeeId = sanitizeNumericId(req.query.employee_id);
   const managerId = sanitizeNumericId(req.query.manager_id);
-  const { status } = req.query;
+  const hrStatus = req.query.hr_status || req.query.hrStatus;
+  const pmStatus = req.query.pm_status || req.query.pmStatus;
+  const statusVal = req.query.status;
 
   const role = (req.user.role || '').toLowerCase();
   const isAdmin = role.includes('hr') || role.includes('admin') || role.includes('human resource') || role.includes('ceo');
@@ -16764,14 +17544,26 @@ app.get('/api/resignations', verifyToken, async (req, res) => {
       }
     }
 
-    if (status) {
-      query += ' AND r.status = @status';
-      request.input('status', sql.NVarChar, status);
+    if (hrStatus) {
+      query += ' AND r.hr_status = @hrStatus';
+      request.input('hrStatus', sql.NVarChar, hrStatus);
+    }
+    if (pmStatus) {
+      query += ' AND r.pm_status = @pmStatus';
+      request.input('pmStatus', sql.NVarChar, pmStatus);
+    }
+    if (statusVal) {
+      query += ' AND (r.hr_status = @statusVal OR r.pm_status = @statusVal)';
+      request.input('statusVal', sql.NVarChar, statusVal);
     }
 
     query += ' ORDER BY r.created_at DESC';
     const result = await request.query(query);
-    res.json(result.recordset);
+    const formatted = result.recordset.map(row => ({
+      ...row,
+      status: row.hr_status
+    }));
+    res.json(formatted);
   } catch (err) {
     Log.error('Resignations', 'Failed to fetch resignations', err.message);
     res.status(500).json({ error: 'Failed to fetch resignations' });
@@ -16783,38 +17575,89 @@ app.get('/api/resignations', verifyToken, async (req, res) => {
 // PUT: Update resignation status or remarks (Approval/Rejection)
 app.put('/api/resignations/:id', verifyToken, async (req, res) => {
   const { id } = req.params;
-  const { status, reporting_manager_remark, project_manager_remark, hr_remark, last_working_day } = req.body;
+  const { status, hr_status, pm_status, reporting_manager_remark, project_manager_remark, hr_remark, last_working_day } = req.body;
 
   try {
     const pool = await getPool();
-    const request = pool.request().input('id', sql.Int, id);
+    
+    // Start Transaction
+    const transaction = new sql.Transaction(pool);
+    await transaction.begin();
 
-    let updates = ['updated_at = GETDATE()'];
-    if (status) {
-      updates.push('status = @status');
-      request.input('status', sql.NVarChar, status);
-    }
-    if (reporting_manager_remark) {
-      updates.push('reporting_manager_remark = @rmRemark');
-      request.input('rmRemark', sql.NVarChar, reporting_manager_remark);
-    }
-    if (project_manager_remark) {
-      updates.push('project_manager_remark = @pmRemark');
-      request.input('pmRemark', sql.NVarChar, project_manager_remark);
-    }
-    if (hr_remark) {
-      updates.push('hr_remark = @hrRemark');
-      request.input('hrRemark', sql.NVarChar, hr_remark);
-    }
-    if (last_working_day) {
-      updates.push('last_working_day = @lwd');
-      request.input('lwd', sql.Date, last_working_day);
-    }
+    try {
+      // 1. Get the current resignation request to find the employee_id
+      const checkRes = await new sql.Request(transaction)
+        .input('id', sql.Int, id)
+        .query('SELECT employee_id, hr_status, pm_status FROM resignations WHERE id = @id');
+      
+      if (checkRes.recordset.length === 0) {
+        await transaction.rollback();
+        return res.status(404).json({ error: 'Resignation record not found' });
+      }
 
-    if (updates.length === 1) return res.status(400).json({ error: 'No fields provided for update' });
+      const resignation = checkRes.recordset[0];
+      const employeeId = resignation.employee_id;
 
-    await request.query(`UPDATE resignations SET ${updates.join(', ')} WHERE id = @id`);
-    res.json({ success: true, message: 'Resignation record updated successfully' });
+      // Determine target column for generic 'status' if passed
+      let finalHRStatus = hr_status;
+      let finalPMStatus = pm_status;
+
+      if (status) {
+        const role = (req.user.role || '').toLowerCase();
+        const isHR = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo');
+        if (isHR) {
+          finalHRStatus = status;
+        } else {
+          finalPMStatus = status;
+        }
+      }
+
+      // 2. Perform updates to resignations table
+      const request = new sql.Request(transaction).input('id', sql.Int, id);
+
+      let updates = ['updated_at = GETDATE()'];
+      if (finalHRStatus) {
+        updates.push('hr_status = @hrStatus');
+        request.input('hrStatus', sql.NVarChar, finalHRStatus);
+      }
+      if (finalPMStatus) {
+        updates.push('pm_status = @pmStatus');
+        request.input('pmStatus', sql.NVarChar, finalPMStatus);
+      }
+      if (reporting_manager_remark) {
+        updates.push('reporting_manager_remark = @rmRemark');
+        request.input('rmRemark', sql.NVarChar, reporting_manager_remark);
+      }
+      if (project_manager_remark) {
+        updates.push('project_manager_remark = @pmRemark');
+        request.input('pmRemark', sql.NVarChar, project_manager_remark);
+      }
+      if (hr_remark) {
+        updates.push('hr_remark = @hrRemark');
+        request.input('hrRemark', sql.NVarChar, hr_remark);
+      }
+      if (last_working_day) {
+        updates.push('last_working_day = @lwd');
+        request.input('lwd', sql.Date, last_working_day);
+      }
+
+      if (updates.length > 1) {
+        await request.query(`UPDATE resignations SET ${updates.join(', ')} WHERE id = @id`);
+      } else if (updates.length === 1 && !finalHRStatus && !finalPMStatus) {
+        await transaction.rollback();
+        return res.status(400).json({ error: 'No fields provided for update' });
+      }
+
+      // 3. Trigger check and potential user deactivation
+      await checkAndDeactivateUser(transaction, employeeId);
+
+      await transaction.commit();
+
+      res.json({ success: true, message: 'Resignation record updated successfully' });
+    } catch (err) {
+      await transaction.rollback();
+      throw err;
+    }
   } catch (err) {
     Log.error('Resignations', 'Failed to update resignation', err.message);
     res.status(500).json({ error: 'Failed to update resignation' });
@@ -16827,11 +17670,13 @@ app.put('/api/resignations/:id', verifyToken, async (req, res) => {
 // GET: List certificate requests with role-based access
 app.get('/api/service-certificates', verifyToken, async (req, res) => {
   const employeeId = sanitizeNumericId(req.query.employee_id);
-  const { status } = req.query;
+  const hrStatus = req.query.hr_status || req.query.hrStatus;
+  const pmStatus = req.query.pm_status || req.query.pmStatus;
+  const statusVal = req.query.status;
 
   const role = (req.user.role || '').toLowerCase();
   const isAdmin = role.includes('hr') || role.includes('admin') || role.includes('human resource') || role.includes('ceo');
-  const isManager = role.includes('manager') || role.includes('lead');
+  const isManager = role.includes('manager') || role.includes('lead') || role.includes('pm');
 
   try {
     const pool = await getPool();
@@ -16861,14 +17706,26 @@ app.get('/api/service-certificates', verifyToken, async (req, res) => {
       request.input('employeeId', sql.Int, employeeId);
     }
 
-    if (status) {
-      query += ' AND sc.status = @status';
-      request.input('status', sql.NVarChar, status);
+    if (hrStatus) {
+      query += ' AND sc.hr_status = @hrStatus';
+      request.input('hrStatus', sql.NVarChar, hrStatus);
+    }
+    if (pmStatus) {
+      query += ' AND sc.pm_status = @pmStatus';
+      request.input('pmStatus', sql.NVarChar, pmStatus);
+    }
+    if (statusVal) {
+      query += ' AND (sc.hr_status = @statusVal OR sc.pm_status = @statusVal)';
+      request.input('statusVal', sql.NVarChar, statusVal);
     }
 
     query += ' ORDER BY sc.created_at DESC';
     const result = await request.query(query);
-    res.json(result.recordset);
+    const formatted = result.recordset.map(row => ({
+      ...row,
+      status: row.hr_status
+    }));
+    res.json(formatted);
   } catch (err) {
     Log.error('Certificates', 'Failed to fetch certificates', err.message);
     res.status(500).json({ error: 'Failed to fetch certificate requests' });
@@ -16890,10 +17747,9 @@ app.post('/api/service-certificates', verifyToken, async (req, res) => {
       .input('purpose', sql.NVarChar, purpose)
       .input('laptop', sql.NVarChar, laptopDetails || '')
       .input('serial', sql.NVarChar, serialNumber || '')
-      .input('status', sql.NVarChar, 'Pending')
       .query(`
-        INSERT INTO service_certificate_requests (employee_id, purpose, laptop_details, serial_number, status, created_at, updated_at)
-        VALUES (@empId, @purpose, @laptop, @serial, @status, GETDATE(), GETDATE())
+        INSERT INTO service_certificate_requests (employee_id, purpose, laptop_details, serial_number, hr_status, pm_status, created_at, updated_at)
+        VALUES (@empId, @purpose, @laptop, @serial, 'Pending', 'Pending', GETDATE(), GETDATE())
       `);
     res.status(201).json({ success: true, message: 'Service certificate request submitted successfully' });
   } catch (err) {
@@ -16905,26 +17761,80 @@ app.post('/api/service-certificates', verifyToken, async (req, res) => {
 // PUT: Approve/Reject or update certificate request (Admin/HR Only)
 app.put('/api/service-certificates/:id', verifyToken, async (req, res) => {
   const { id } = req.params;
-  const { status, admin_remark, certificate_url } = req.body;
+  const { status, hr_status, pm_status, admin_remark, certificate_url } = req.body;
 
   const role = (req.user.role || '').toLowerCase();
-  const isAdmin = role.includes('hr') || role.includes('admin') || role.includes('human resource') || role.includes('ceo');
+  const isAdmin = role.includes('hr') || role.includes('admin') || role.includes('human resource') || role.includes('ceo') || role.includes('manager') || role.includes('lead') || role.includes('pm');
 
-  if (!isAdmin) return res.status(403).json({ error: 'Unauthorized: Admin/HR access required for updates.' });
+  if (!isAdmin) return res.status(403).json({ error: 'Unauthorized: Admin/HR/PM access required for updates.' });
 
   try {
     const pool = await getPool();
-    const request = pool.request().input('id', sql.Int, id);
+    
+    // Retrieve certificate request to get employee id
+    let checkRes = await pool.request().input('id', sql.Int, id).query('SELECT employee_id, hr_status, pm_status FROM service_certificate_requests WHERE id = @id');
+    let certificate = checkRes.recordset[0];
 
-    let updates = ['updated_at = GETDATE()'];
-    if (status) { updates.push('status = @status'); request.input('status', sql.NVarChar, status); }
-    if (admin_remark) { updates.push('admin_remark = @remark'); request.input('remark', sql.NVarChar, admin_remark); }
-    if (certificate_url) { updates.push('certificate_url = @url'); request.input('url', sql.NVarChar, certificate_url); }
+    if (!certificate) {
+      // Fallback: Check if the ID matches an asset ID in the assets table
+      console.log(`[CERT UPDATE 2] Certificate Request ID ${id} not found. Checking if it is an Asset ID...`);
+      const assetResult = await pool.request().input('id', sql.Int, id).query('SELECT employee_id FROM assets WHERE id = @id');
+      if (assetResult.recordset.length > 0) {
+        const empId = assetResult.recordset[0].employee_id;
+        console.log(`[CERT UPDATE 2] Resolved asset ID ${id} to employee ${empId}. Searching for their latest request...`);
+        const fallbackResult = await pool.request()
+          .input('empId', sql.NVarChar, String(empId))
+          .query("SELECT TOP 1 * FROM service_certificate_requests WHERE employee_id = TRY_CAST(@empId AS INT) ORDER BY created_at DESC");
+        certificate = fallbackResult.recordset[0];
+      }
+    }
 
-    if (updates.length === 1) return res.status(400).json({ error: 'No data provided for update' });
+    if (!certificate) {
+      return res.status(404).json({ error: 'Service certificate request not found' });
+    }
+    const employeeId = certificate.employee_id;
 
-    await request.query(`UPDATE service_certificate_requests SET ${updates.join(', ')} WHERE id = @id`);
-    res.json({ success: true, message: 'Service certificate request updated' });
+    // Determine target columns based on role
+    let finalHRStatus = hr_status;
+    let finalPMStatus = pm_status;
+
+    if (status) {
+      const isHR = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo');
+      if (isHR) {
+        finalHRStatus = status;
+      } else {
+        finalPMStatus = status;
+      }
+    }
+
+    const transaction = new sql.Transaction(pool);
+    await transaction.begin();
+
+    try {
+      const request = new sql.Request(transaction).input('id', sql.Int, id);
+
+      let updates = ['updated_at = GETDATE()'];
+      if (finalHRStatus) { updates.push('hr_status = @hrStatus'); request.input('hrStatus', sql.NVarChar, finalHRStatus); }
+      if (finalPMStatus) { updates.push('pm_status = @pmStatus'); request.input('pmStatus', sql.NVarChar, finalPMStatus); }
+      if (admin_remark) { updates.push('admin_remark = @remark'); request.input('remark', sql.NVarChar, admin_remark); }
+      if (certificate_url) { updates.push('certificate_url = @url'); request.input('url', sql.NVarChar, certificate_url); }
+
+      if (updates.length === 1) {
+        await transaction.rollback();
+        return res.status(400).json({ error: 'No data provided for update' });
+      }
+
+      await request.query(`UPDATE service_certificate_requests SET ${updates.join(', ')} WHERE id = @id`);
+
+      // Trigger check and potential user deactivation
+      await checkAndDeactivateUser(transaction, employeeId);
+
+      await transaction.commit();
+      res.json({ success: true, message: 'Service certificate request updated' });
+    } catch (err) {
+      await transaction.rollback();
+      throw err;
+    }
   } catch (err) {
     Log.error('Certificates', 'Failed to update request', err.message);
     res.status(500).json({ error: 'Failed to update certificate request' });
@@ -17387,7 +18297,7 @@ const initializeAttendanceTable = async (providedPool) => {
   }
 };
 
-// DB Initialization for Thread Comments (relax FK constraint)
+// DB Initialization for Thread/Comments (relax FK constraints)
 const initializeThreadCommentsTable = async (providedPool) => {
   try {
     const pool = providedPool || await getPool();
@@ -17396,10 +18306,15 @@ const initializeThreadCommentsTable = async (providedPool) => {
       BEGIN
         ALTER TABLE thread_comments DROP CONSTRAINT FK__thread_co__user___5BAD9CC8;
       END
+      
+      IF EXISTS (SELECT * FROM sys.foreign_keys WHERE name = 'FK__threads__user_id__51300E55')
+      BEGIN
+        ALTER TABLE threads DROP CONSTRAINT FK__threads__user_id__51300E55;
+      END
     `);
-    Log.success('Database', 'Thread comments foreign key constraint relaxed');
+    Log.success('Database', 'Thread & comments foreign key constraints relaxed');
   } catch (err) {
-    Log.error('Database', 'Failed to relax thread comments constraint', err.message);
+    Log.error('Database', 'Failed to relax thread/comments constraint', err.message);
   }
 };
 
@@ -17550,28 +18465,30 @@ const ensureJobApplicationsColumns = async (providedPool) => {
 
 // Initialize server ONLY after database is ready
 getPool().then(async (pool) => {
-  console.clear();
-  console.log(BANNER);
+  if (process.env.NODE_APP_INSTANCE === '0' || process.env.NODE_APP_INSTANCE === undefined) {
+    console.log(BANNER);
+  }
 
   const runMigration = async (name, fn) => {
     try { await fn(pool); } catch (err) { Log.error('Migration', `Failed: ${name}`, err.message); }
   };
 
-  await runMigration('PaySlips', initializePayslipsMigration);
-  await runMigration('Profiles', initializeProfilesTable);
-  await runMigration('Pics', fixProfilePictureColumns);
-  await runMigration('Columns', fixEmployeeProfileColumns);
-  await runMigration('Assets', initializeAssetsTable);
-  await runMigration('Docs', initializeDocumentsTable);
-  await runMigration('Attendance', initializeAttendanceTable);
-  await runMigration('Threads', initializeThreadCommentsTable);
-  await runMigration('PostReactions', initializePostReactionsTable);
-  await runMigration('WelcomeColumns', ensureWelcomeSentColumns);
-  await runMigration('JobApplicationsColumns', ensureJobApplicationsColumns);
-  await runMigration('Indexes', initializeDatabaseIndexes);
+  if (process.env.NODE_APP_INSTANCE === '0' || process.env.NODE_APP_INSTANCE === undefined) {
+    await runMigration('PaySlips', initializePayslipsMigration);
+    await runMigration('Profiles', initializeProfilesTable);
+    await runMigration('Pics', fixProfilePictureColumns);
+    await runMigration('Columns', fixEmployeeProfileColumns);
+    await runMigration('Assets', initializeAssetsTable);
+    await runMigration('Docs', initializeDocumentsTable);
+    await runMigration('Attendance', initializeAttendanceTable);
+    await runMigration('Threads', initializeThreadCommentsTable);
+    await runMigration('PostReactions', initializePostReactionsTable);
+    await runMigration('WelcomeColumns', ensureWelcomeSentColumns);
+    await runMigration('JobApplicationsColumns', ensureJobApplicationsColumns);
+    await runMigration('Indexes', initializeDatabaseIndexes);
+  }
   app.listen(PORT, '0.0.0.0', () => {
     Log.ready(`System operational on port ${PORT}`);
-    Log.divider();
   });
 }).catch(err => {
   console.error('\n❌ FATAL: Backend failed to start due to database connectivity issues.');

@@ -33,7 +33,7 @@ const getCertificateEmailHtml = (userName, courseName) => `<!DOCTYPE html>
 <body style="margin:0;padding:10px;background:#f8fafc;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#334155;-webkit-text-size-adjust:100%;">
   <div class="email-container" style="max-width:600px;margin:10px auto;background:#ffffff;padding:40px;border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,0.05);box-sizing:border-box;">
     <div style="text-align: center; margin-bottom: 30px;">
-      <img src="${logoUrl}" alt="NBT Logo" style="width: 130px; max-width: 100%; height: auto; display: block; margin: 0 auto;">
+      <img src="${logoUrl}" alt="NBT Logo" style="width: 130px; max-width: 100%; height: auto; display: block; margin: 0 auto; pointer-events: none; user-select: none; -webkit-user-drag: none;">
     </div>
     <h2 style="color:#1e3a8a;margin-top:0;text-align:center;font-size:24px;">Congratulations, ${userName}! 🎉</h2>
     <p style="font-size:16px;line-height:1.6;margin:16px 0;">

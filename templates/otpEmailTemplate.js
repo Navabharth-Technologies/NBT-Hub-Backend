@@ -32,7 +32,7 @@ const getOtpEmailHtml = (userName, otp) => `<!DOCTYPE html>
 <body style="margin:0;padding:10px;background:#f8fafc;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#334155;-webkit-text-size-adjust:100%;">
   <div class="email-container" style="max-width: 500px; margin: 10px auto; background: #ffffff; padding: 40px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); border: 1px solid #e2e8f0; box-sizing:border-box;">
     <div style="text-align: center; margin-bottom: 25px;">
-      <img src="${logoUrl}" alt="NBT Logo" style="width: 110px; max-width: 100%; height: auto; display: block; margin: 0 auto;">
+      <img src="${logoUrl}" alt="NBT Logo" style="width: 110px; max-width: 100%; height: auto; display: block; margin: 0 auto; pointer-events: none; user-select: none; -webkit-user-drag: none;">
     </div>
     <h2 style="color: #1e3a8a; text-align: center; font-size: 22px; margin-top:0;">Password Reset Request</h2>
     <p style="color: #333; font-size: 16px; margin: 16px 0;">Hello ${userName},</p>

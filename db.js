@@ -11,14 +11,14 @@ const dbConfig = {
         trustServerCertificate: true,
         enableArithAbort: true,
         requestTimeout: 60000,    // Increased to 60s
-        connectionTimeout: 30000, // Increased to 30s
+        connectTimeout: 30000, // Fixed property name for Tedious driver
         cancelTimeout: 30000,
     },
     pool: {
-        max: 150, // Increased pool size
-        min: 10,
+        max: 5,  // Lowered to queue requests in Node.js rather than overwhelm SQL Server (5 * 12 = 60 max)
+        min: 0,  // Allow connections to completely close when idle to save DB memory
         idleTimeoutMillis: 30000,
-        acquireTimeoutMillis: 120000 // Higher buffer for high load
+        acquireTimeoutMillis: 60000 // Queue wait time
     }
 };
 
@@ -59,16 +59,18 @@ async function getPool() {
             
             pool.on('error', err => {
                 console.error('DATABASE POOL ERROR:', err.message);
-                // On fatal pool error, reset so next request tries again
-                pool = null;
-                poolPromise = null;
+                // DO NOT set pool = null here, it leaks connections and pools. The pool will attempt to recover.
             });
 
-            console.log(`[DB] Attempting connection to ${dbConfig.server} as ${dbConfig.user}...`);
-            console.log(`[DB] Using database: ${dbConfig.database}, Port: ${dbConfig.port}`);
+            if (process.env.NODE_APP_INSTANCE === '0' || process.env.NODE_APP_INSTANCE === undefined) {
+                console.log(`[DB] Attempting connection to ${dbConfig.server} as ${dbConfig.user}...`);
+                console.log(`[DB] Using database: ${dbConfig.database}, Port: ${dbConfig.port}`);
+            }
             await pool.connect();
-            console.log('✅ --- DATABASE CONNECTION ESTABLISHED ---');
-            console.log(`✅ Connected to: ${dbConfig.database} on ${dbConfig.server}`);
+            if (process.env.NODE_APP_INSTANCE === '0' || process.env.NODE_APP_INSTANCE === undefined) {
+                console.log('✅ --- DATABASE CONNECTION ESTABLISHED ---');
+                console.log(`✅ Connected to: ${dbConfig.database} on ${dbConfig.server}`);
+            }
             
             return pool;
         } catch (err) {

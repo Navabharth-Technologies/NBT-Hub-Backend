@@ -44,8 +44,8 @@ const getEmploymentConfirmationHtml = (userName, designation, empId, teamName, j
     
     <!-- Hero Header with Brand Colors Gradient -->
     <div style="background: linear-gradient(135deg, #1e3a8a 0%, #3b82f6 100%); padding: 45px 40px; text-align: center; color: #ffffff;">
-      <div style="margin-bottom: 25px;">
-        <img src="${logoUrl}" alt="NBT Logo" style="height: 85px; width: auto; display: inline-block; filter: brightness(0) invert(1);">
+      <div style="margin-bottom: 10px;">
+        <img src="${logoUrl}" alt="NBT Logo" style="height: 130px; width: auto; display: inline-block; filter: brightness(0) invert(1); pointer-events: none; user-select: none; -webkit-user-drag: none;">
       </div>
       <h1 style="font-size: 26px; font-weight: 700; margin: 0 0 8px 0; letter-spacing: -0.025em; line-height: 1.2; text-shadow: 0 2px 4px rgba(0,0,0,0.15);">
         Welcome to the Team! 🎉
