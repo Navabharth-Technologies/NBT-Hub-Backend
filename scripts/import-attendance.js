@@ -4,8 +4,8 @@ const { getPool } = require('../db');
 const sql = require('mssql');
 // Using global fetch (available in Node 18+)
 
-async function importAttendance() {
-    console.log('--- 🚀 STARTING ATTENDANCE BATCH IMPORT ---');
+async function importAttendance(daysToImport = 2) {
+    console.log(`--- 🚀 STARTING ATTENDANCE BATCH IMPORT (last ${daysToImport} day(s)) ---`);
 
     const baseUrl = process.env.TEAM_OFFICE_BASE_URL;
     const authToken = process.env.TEAM_OFFICE_AUTH_TOKEN;
@@ -38,7 +38,8 @@ async function importAttendance() {
         usersRes.recordset.forEach(u => usersMap.set(u.id, u));
         console.log(`\n👥 Loaded ${usersMap.size} users from DB (Including Interns & New Joinees).`);
 
-        const daysToImport = 2;
+        // daysToImport is passed as a parameter (default 2). On server startup after downtime,
+        // the catch-up logic in server.js passes a larger value to backfill missed days.
         const now = new Date();
 
         for (let i = 0; i < daysToImport; i++) {

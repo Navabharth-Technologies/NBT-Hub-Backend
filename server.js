@@ -757,6 +757,21 @@ const isHRRole = (role) => {
   return r.includes('human resource') || r === 'hr' || r.includes('ceo') || r.includes('admin') || r.includes('super') || r.includes('founder');
 };
 
+/**
+ * Centralized PM (Project Manager) role detection.
+ * Matches: 'Project Manager', 'PM', 'projectmanager', etc.
+ */
+const isPMRole = (role) => {
+  if (!role) return false;
+  const r = role.toLowerCase();
+  return r.includes('project') || r.includes('manager') || r === 'pm';
+};
+
+/**
+ * Combined check: HR Team OR Project Manager can perform HR Personnel management.
+ */
+const isHROrPMRole = (role) => isHRRole(role) || isPMRole(role);
+
 // Middleware
 // 1. Corrected CORS (Origin: true allows credentials to sync with any incoming requester)
 app.use(cors({
@@ -974,6 +989,41 @@ const checkAndDeactivateUser = async (poolOrTx, employeeId) => {
   }
 };
 
+const checkAndReactivateUserIfResignationDeleted = async (poolOrTx, employeeId) => {
+  try {
+    // Check if resignation is approved by both PM and HR
+    const checkRes = await poolOrTx.request()
+      .input('empId', sql.Int, employeeId)
+      .query("SELECT id FROM resignations WHERE employee_id = @empId AND hr_status = 'Approved' AND pm_status = 'Approved'");
+
+    // Check if service certificate request is approved by both PM and HR
+    const checkCert = await poolOrTx.request()
+      .input('empId', sql.Int, employeeId)
+      .query("SELECT id FROM service_certificate_requests WHERE employee_id = @empId AND hr_status = 'Approved' AND pm_status = 'Approved'");
+
+    // If either is missing or not fully approved, they should not be considered "Resigned".
+    // So reset status to 'Active'.
+    if (checkRes.recordset.length === 0 || checkCert.recordset.length === 0) {
+      await poolOrTx.request()
+        .input('userId', sql.Int, employeeId)
+        .query("UPDATE users SET status = 'Active' WHERE id = @userId");
+      
+      const cacheKey = `employee_${employeeId}`;
+      tokenVersionCache.delete(cacheKey);
+      
+      allUsersCache = null;
+      lastAllUsersCacheUpdate = 0;
+      
+      console.log(`[OFFBOARDING] Automatically reactivated employee ID ${employeeId} because approved resignation or service certificate records were deleted or altered.`);
+      return true;
+    }
+    return false;
+  } catch (err) {
+    console.error(`[OFFBOARDING ERROR] Failed to check/reactivate employee ID ${employeeId}:`, err);
+    return false;
+  }
+};
+
 const getVerifiedUser = async (token) => {
   if (!token) return { user: null, reason: 'no_token' };
   try {
@@ -1021,8 +1071,13 @@ const getVerifiedUser = async (token) => {
     }
 
     if (table === 'users' && currentStatus === 'Resigned') {
-      Log.auth(`Deactivated Account access attempt: User ID ${decoded.id}`, 'This user is deactivated due to resignation.');
-      return { user: null, reason: 'account_deactivated' };
+      const reactivated = await checkAndReactivateUserIfResignationDeleted(pool, decoded.id);
+      if (reactivated) {
+        currentStatus = 'Active';
+      } else {
+        Log.auth(`Deactivated Account access attempt: User ID ${decoded.id}`, 'This user is deactivated due to resignation.');
+        return { user: null, reason: 'account_deactivated' };
+      }
     }
 
     const tokenVersion = decoded.token_version || 0;
@@ -1541,6 +1596,12 @@ app.post('/api/login', async (req, res) => {
       }
     } else {
       user = userResult.recordset[0];
+      if (user.status === 'Resigned') {
+        const reactivated = await checkAndReactivateUserIfResignationDeleted(pool, user.id);
+        if (reactivated) {
+          user.status = 'Active';
+        }
+      }
       user.isActive = user.status === 'Active';
       if (!user.isActive) {
         return res.status(403).json({ message: "Account disabled." });
@@ -2042,6 +2103,281 @@ app.post('/api/logout/global', verifyToken, async (req, res) => {
     res.status(500).json({ error: 'Failed to perform global logout' });
   }
 });
+
+// --- HR PERSONNEL MANAGEMENT ROUTES --- //
+// These routes manage the relationship between the permanent HR Team account
+// and individual HR persons who have personal accounts (role = 'employee').
+// The HR Team screen reads display_name from hr_personnel, not from the logged-in user.
+
+/**
+ * HR-P1. Register a Personal HR Account
+ * Creates a user with role='employee' (sees Employee Screen) + an hr_personnel record (links to HR Team screen name).
+ * Only SuperAdmin / HR Team can call this.
+ * POST /api/hr-personnel/register
+ */
+app.post('/api/hr-personnel/register', verifyToken, async (req, res) => {
+  if (!isHROrPMRole(req.user.role)) {
+    return res.status(403).json({ error: 'Only HR Team or Project Manager can register HR personnel' });
+  }
+
+  const { name, email, password, displayName } = req.body;
+  if (!name || !email || !password) {
+    return res.status(400).json({ error: 'Name, email, and password are required' });
+  }
+
+  try {
+    const pool = await getPool();
+
+    // 1. Check email uniqueness across all user tables
+    const existing = await pool.request()
+      .input('email', sql.NVarChar, email)
+      .query(`
+        SELECT email FROM users WHERE email = @email
+        UNION ALL
+        SELECT email_id AS email FROM new_joinees WHERE email_id = @email
+        UNION ALL
+        SELECT email FROM interns WHERE email = @email
+      `);
+    if (existing.recordset.length > 0) {
+      return res.status(400).json({ error: 'Email already exists. Please use a different email address.' });
+    }
+
+    // 2. Normalize name and hash password
+    const normalizedName = name.toLowerCase().split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    // 3. Insert into users table with role = 'employee' (personal HR account uses Employee Screen)
+    const insertUser = await pool.request()
+      .input('name',     sql.NVarChar, normalizedName)
+      .input('email',    sql.NVarChar, email)
+      .input('password', sql.NVarChar, hashedPassword)
+      .input('role',     sql.NVarChar, 'employee')
+      .query(`INSERT INTO users (name, email, password, role) OUTPUT INSERTED.id
+              VALUES (@name, @email, @password, @role)`);
+
+    const newUserId = insertUser.recordset[0].id;
+
+    // 4. Insert into employee system table (same as any employee)
+    await pool.request()
+      .input('userId', sql.Int, newUserId)
+      .query(`INSERT INTO employee (user_id) VALUES (@userId)`);
+
+    // 5. Insert into hr_personnel — this is what links their name to the HR Team screen
+    const finalDisplayName = (displayName || normalizedName).trim();
+    await pool.request()
+      .input('userId',      sql.Int,     newUserId)
+      .input('displayName', sql.NVarChar, finalDisplayName)
+      .input('email',       sql.NVarChar, email)
+      .input('assignedBy',  sql.Int,     req.user.id)
+      .query(`INSERT INTO hr_personnel (user_id, display_name, personal_email, assigned_by)
+              VALUES (@userId, @displayName, @email, @assignedBy)`);
+
+    Log.success('HR Personnel', `New HR personal account created for ${normalizedName} (${email}) by ${req.user.name}`);
+    res.status(201).json({
+      message: 'HR personal account created successfully. They can now log in and access the Employee Screen.',
+      userId: newUserId,
+      displayName: finalDisplayName
+    });
+  } catch (err) {
+    console.error('[HR PERSONNEL REGISTER ERROR]:', err);
+    res.status(500).json({ error: 'Server error during HR personnel registration' });
+  }
+});
+
+/**
+ * HR-P2. Get Currently Active HR Personnel (HR Team Screen uses this for display name)
+ * Returns the active HR person's display_name. Falls back to "HR Team" if none assigned.
+ * GET /api/hr-personnel/active
+ */
+app.get('/api/hr-personnel/active', verifyToken, async (req, res) => {
+  try {
+    const pool = await getPool();
+    const result = await pool.request().query(`
+      SELECT TOP 1
+        hp.id,
+        hp.display_name,
+        hp.personal_email,
+        hp.assigned_at,
+        u.profile_picture,
+        u.phone_number,
+        u.id AS user_id
+      FROM hr_personnel hp
+      JOIN users u ON hp.user_id = u.id
+      WHERE hp.is_active = 1
+      ORDER BY hp.assigned_at DESC
+    `);
+
+    if (result.recordset.length === 0) {
+      return res.json({
+        found: false,
+        displayName: 'HR Team',
+        personnel: null
+      });
+    }
+
+    const person = result.recordset[0];
+    res.json({
+      found: true,
+      displayName: person.display_name,
+      personnel: {
+        id:             person.id,
+        display_name:   person.display_name,
+        personal_email: person.personal_email,
+        assigned_at:    person.assigned_at,
+        user_id:        person.user_id,
+        profile_picture: person.profile_picture
+          ? `/api/users/${person.user_id}/photo`
+          : null,
+        phone_number:   person.phone_number
+      }
+    });
+  } catch (err) {
+    console.error('[HR PERSONNEL ACTIVE ERROR]:', err);
+    res.status(500).json({ error: 'Failed to fetch active HR personnel' });
+  }
+});
+
+/**
+ * HR-P3. Get All HR Personnel — Full History (Current + Resigned)
+ * For SuperAdmin panel to see all past and current HRs.
+ * GET /api/hr-personnel/all
+ */
+app.get('/api/hr-personnel/all', verifyToken, async (req, res) => {
+  if (!isHROrPMRole(req.user.role)) {
+    return res.status(403).json({ error: 'Only HR Team or Project Manager can view HR personnel history' });
+  }
+  try {
+    const pool = await getPool();
+    const result = await pool.request().query(`
+      SELECT
+        hp.id,
+        hp.display_name,
+        hp.personal_email,
+        hp.assigned_at,
+        hp.resigned_at,
+        hp.is_active,
+        u.name   AS registered_name,
+        u.status AS account_status,
+        u.id     AS user_id,
+        ab.name  AS assigned_by_name
+      FROM hr_personnel hp
+      JOIN users u  ON hp.user_id    = u.id
+      LEFT JOIN users ab ON hp.assigned_by = ab.id
+      ORDER BY hp.assigned_at DESC
+    `);
+    res.json({ personnel: result.recordset });
+  } catch (err) {
+    console.error('[HR PERSONNEL ALL ERROR]:', err);
+    res.status(500).json({ error: 'Failed to fetch HR personnel list' });
+  }
+});
+
+/**
+ * HR-P4. Resign an HR Person
+ * - Disables their personal account (status = 'Resigned', token invalidated)
+ * - Marks hr_personnel row as resigned (is_active = 0, resigned_at = now)
+ * - The HR Team account (hr@navabharathtechnologies.com) is NEVER touched
+ * - The hr_personnel record is NEVER deleted — kept for audit trail forever
+ * PUT /api/hr-personnel/:id/resign
+ */
+app.put('/api/hr-personnel/:id/resign', verifyToken, async (req, res) => {
+  if (!isHROrPMRole(req.user.role)) {
+    return res.status(403).json({ error: 'Only HR Team or Project Manager can resign HR personnel' });
+  }
+
+  const personnelId = parseInt(req.params.id, 10);
+  if (isNaN(personnelId)) {
+    return res.status(400).json({ error: 'Invalid personnel ID' });
+  }
+
+  try {
+    const pool = await getPool();
+
+    // Get the hr_personnel record
+    const hrRecord = await pool.request()
+      .input('id', sql.Int, personnelId)
+      .query(`SELECT user_id, display_name, is_active FROM hr_personnel WHERE id = @id`);
+
+    if (hrRecord.recordset.length === 0) {
+      return res.status(404).json({ error: 'HR personnel record not found' });
+    }
+
+    const { user_id, display_name, is_active } = hrRecord.recordset[0];
+
+    if (!is_active) {
+      return res.status(400).json({ error: `${display_name} has already been marked as resigned.` });
+    }
+
+    // 1. Disable the personal user account (prevents login)
+    await pool.request()
+      .input('uid', sql.Int, user_id)
+      .query(`UPDATE users
+              SET status = 'Resigned',
+                  token_version = ISNULL(token_version, 0) + 1
+              WHERE id = @uid`);
+
+    // Invalidate token cache for this user
+    tokenVersionCache.delete(`employee_${user_id}`);
+
+    // 2. Mark hr_personnel record as resigned — NEVER deleted
+    await pool.request()
+      .input('id', sql.Int, personnelId)
+      .query(`UPDATE hr_personnel
+              SET is_active   = 0,
+                  resigned_at = GETDATE()
+              WHERE id = @id`);
+
+    Log.success('HR Personnel', `${display_name} (user_id: ${user_id}) marked as resigned by ${req.user.name}. Personal account disabled. HR Team account unaffected.`);
+    res.json({
+      message: `${display_name}'s personal account has been disabled. HR Team account is unaffected. Record preserved for audit.`,
+      resigned: true
+    });
+  } catch (err) {
+    console.error('[HR PERSONNEL RESIGN ERROR]:', err);
+    res.status(500).json({ error: 'Failed to process HR resignation' });
+  }
+});
+
+/**
+ * HR-P5. Update Display Name shown on HR Team Screen
+ * Useful if there's a name correction or after assigning a new HR person.
+ * PUT /api/hr-personnel/:id/display-name
+ */
+app.put('/api/hr-personnel/:id/display-name', verifyToken, async (req, res) => {
+  if (!isHROrPMRole(req.user.role)) {
+    return res.status(403).json({ error: 'Only HR Team or Project Manager can update HR display name' });
+  }
+
+  const personnelId = parseInt(req.params.id, 10);
+  if (isNaN(personnelId)) {
+    return res.status(400).json({ error: 'Invalid personnel ID' });
+  }
+
+  const { display_name } = req.body;
+  if (!display_name || !display_name.trim()) {
+    return res.status(400).json({ error: 'display_name is required' });
+  }
+
+  try {
+    const pool = await getPool();
+    const result = await pool.request()
+      .input('id',   sql.Int,     personnelId)
+      .input('name', sql.NVarChar, display_name.trim())
+      .query(`UPDATE hr_personnel SET display_name = @name WHERE id = @id`);
+
+    if (result.rowsAffected[0] === 0) {
+      return res.status(404).json({ error: 'HR personnel record not found' });
+    }
+
+    Log.success('HR Personnel', `Display name updated to "${display_name.trim()}" for record ${personnelId} by ${req.user.name}`);
+    res.json({ message: 'HR display name updated successfully', display_name: display_name.trim() });
+  } catch (err) {
+    console.error('[HR PERSONNEL DISPLAY NAME ERROR]:', err);
+    res.status(500).json({ error: 'Failed to update HR display name' });
+  }
+});
+
+// --- END HR PERSONNEL MANAGEMENT ROUTES --- //
 
 // 3A. Get Reporting Manager Profile (Must securely intercept before dynamic :email wildcard)
 app.get('/api/profile/manager', async (req, res) => {
@@ -3810,11 +4146,24 @@ app.get('/api/manager/leaves/:managerId', async (req, res) => {
 // 1. Get today's attendance for the authenticated user
 app.get(['/api/attendance', '/api/attendance ', '/api/attendance%20'], verifyToken, async (req, res) => {
   const userId = req.user.id;
+  // Determine which table to query based on how the user logged in
+  const userType = req.user.userType || 'employee';
   try {
     const pool = await getPool();
+
+    // Build the correct lookup query based on login type
+    let userLookupQuery;
+    if (userType === 'new_joinee') {
+      userLookupQuery = 'SELECT id, name FROM new_joinees WHERE id = @userId';
+    } else if (userType === 'intern') {
+      userLookupQuery = 'SELECT id, name FROM interns WHERE id = @userId';
+    } else {
+      userLookupQuery = 'SELECT id, name FROM users WHERE id = @userId';
+    }
+
     const userResult = await pool.request()
       .input('userId', sql.Int, userId)
-      .query('SELECT id, name FROM users WHERE id = @userId');
+      .query(userLookupQuery);
 
     if (userResult.recordset.length === 0) {
       return res.status(404).json({ error: 'User not found in system.' });
@@ -12143,7 +12492,9 @@ app.post(['/api/leaves/balance/update', '/api/leaves/stats/update'], verifyToken
 const triggerAttendanceSync = async (timeLabel) => {
   console.log(`[SCHEDULED TASK - ${timeLabel}] Triggering Biometric Attendance Sync...`);
   try {
-    await importAttendance();
+    // Use 3 days to always cover the Fri→Sat→Sun→Mon weekend gap.
+    // Monday's first cron run will automatically pull Saturday's data.
+    await importAttendance(3);
     console.log(`[SCHEDULED TASK - ${timeLabel}] Biometric Sync Successful.`);
   } catch (err) {
     console.error(`[SCHEDULED TASK ERROR - ${timeLabel}] Biometric Sync Failed:`, err.message);
@@ -15521,7 +15872,7 @@ app.get('/api/admin/resignations', verifyToken, async (req, res) => {
  */
 app.put('/api/admin/resignations/:id/review', verifyToken, async (req, res) => {
   const { id } = req.params;
-  const { status, hr_status, pm_status, reporting_manager_remark, project_manager_remark, hr_remark } = req.body;
+  const { status, hr_status, pm_status, reporting_manager_remark, project_manager_remark, hr_remark, notice_period_reason_by_pm, notice_period_from_date, notice_period_to_date, reviewed_by_tl, notice_period_applicable } = req.body;
 
   try {
     const pool = await getPool();
@@ -15582,6 +15933,26 @@ app.put('/api/admin/resignations/:id/review', verifyToken, async (req, res) => {
         sets.push("hr_remark = @hr_remark");
         request.input('hr_remark', sql.NVarChar, hr_remark);
       }
+      if (notice_period_reason_by_pm !== undefined) {
+        sets.push("notice_period_reason_by_pm = @noticePeriodReasonByPm");
+        request.input('noticePeriodReasonByPm', sql.NVarChar, notice_period_reason_by_pm || null);
+      }
+      if (notice_period_from_date !== undefined) {
+        sets.push("notice_period_from_date = @noticePeriodFromDate");
+        request.input('noticePeriodFromDate', sql.Date, notice_period_from_date || null);
+      }
+      if (notice_period_to_date !== undefined) {
+        sets.push("notice_period_to_date = @noticePeriodToDate");
+        request.input('noticePeriodToDate', sql.Date, notice_period_to_date || null);
+      }
+      if (reviewed_by_tl !== undefined) {
+        sets.push("reviewed_by_tl = @reviewedByTl");
+        request.input('reviewedByTl', sql.NVarChar, reviewed_by_tl || null);
+      }
+      if (notice_period_applicable !== undefined) {
+        sets.push("notice_period_applicable = @noticePeriodApplicable");
+        request.input('noticePeriodApplicable', sql.NVarChar, notice_period_applicable || null);
+      }
 
       if (sets.length > 0) {
         updateQuery += ", " + sets.join(", ");
@@ -15595,6 +15966,31 @@ app.put('/api/admin/resignations/:id/review', verifyToken, async (req, res) => {
 
       // 3. Trigger check and potential user deactivation
       await checkAndDeactivateUser(transaction, employeeId);
+
+      // 4. Send resignation status update notification to the employee
+      const statusRes = await new sql.Request(transaction)
+        .input('id', sql.Int, id)
+        .query("SELECT hr_status, pm_status, employee_id FROM resignations WHERE id = @id");
+      if (statusRes.recordset.length > 0) {
+        const updatedRow = statusRes.recordset[0];
+        const newHR = updatedRow.hr_status;
+        const newPM = updatedRow.pm_status;
+        const targetEmpId = updatedRow.employee_id;
+
+        let notificationMsg = '';
+        if (newHR === 'Approved' && newPM === 'Approved') {
+          notificationMsg = 'Your resignation is approved';
+        } else if (newHR === 'Rejected' || newPM === 'Rejected') {
+          notificationMsg = 'Your resignation is rejected';
+        } else {
+          notificationMsg = 'Your resignation is in waiting';
+        }
+
+        await new sql.Request(transaction)
+          .input('uid', sql.Int, targetEmpId)
+          .input('msg', sql.NVarChar, notificationMsg)
+          .query("INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@uid, @msg, 'Resignation', 0, DATEADD(MINUTE, 330, GETUTCDATE()))");
+      }
 
       await transaction.commit();
 
@@ -15939,6 +16335,7 @@ app.put(['/api/admin/service-certificates/:id', '/api/service-certificates/:id',
   // Resolve ID from URL or Body (Supporting multiple naming conventions)
   const id = req.params.id || req.body.id || req.body.certificateId || req.body.requestId;
   const admin_remark = req.body.admin_remark || req.body.admin_remarks;
+  const pm_remark = req.body.pm_remark || req.body.pm_remarks;
   const { status, hr_status, pm_status, certificate_url, purpose } = req.body;
 
   try {
@@ -15988,21 +16385,27 @@ app.put(['/api/admin/service-certificates/:id', '/api/service-certificates/:id',
       return res.status(403).json({ error: 'Unauthorized: Access denied.' });
     }
 
-    // Security: Only Admin/HR/PM can update status or remarks on existing records
-    if (certificate && (status !== undefined || hr_status !== undefined || pm_status !== undefined || admin_remark !== undefined || certificate_url !== undefined) && !isAdmin) {
-      return res.status(403).json({ error: 'Unauthorized: Only Admin/HR/PM can approve or comment on certificates.' });
-    }
-
-    // Determine target columns based on role
+    // Security: Only Admin/HR/PM can update status or remarks. For regular employees, we ignore any status/remark updates they send.
     let finalHRStatus = hr_status;
     let finalPMStatus = pm_status;
+    let finalAdminRemark = admin_remark;
+    let finalPmRemark = pm_remark;
+    let finalCertificateUrl = certificate_url;
 
-    if (status) {
-      const isHR = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo');
-      if (isHR) {
-        finalHRStatus = status;
-      } else {
-        finalPMStatus = status;
+    if (!isAdmin) {
+      finalHRStatus = undefined;
+      finalPMStatus = undefined;
+      finalAdminRemark = undefined;
+      finalPmRemark = undefined;
+      finalCertificateUrl = undefined;
+    } else {
+      if (status) {
+        const isHR = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo');
+        if (isHR) {
+          finalHRStatus = status;
+        } else {
+          finalPMStatus = status;
+        }
       }
     }
 
@@ -16043,8 +16446,9 @@ app.put(['/api/admin/service-certificates/:id', '/api/service-certificates/:id',
 
         if (finalHRStatus) { sets.push("hr_status = @hrStatus"); request.input('hrStatus', sql.NVarChar, finalHRStatus); }
         if (finalPMStatus) { sets.push("pm_status = @pmStatus"); request.input('pmStatus', sql.NVarChar, finalPMStatus); }
-        if (admin_remark !== undefined) { sets.push("admin_remark = @admin_remark"); request.input('admin_remark', sql.NVarChar, admin_remark); }
-        if (certificate_url !== undefined) { sets.push("certificate_url = @certificate_url"); request.input('certificate_url', sql.NVarChar, certificate_url); }
+        if (finalAdminRemark !== undefined) { sets.push("admin_remark = @admin_remark"); request.input('admin_remark', sql.NVarChar, finalAdminRemark); }
+        if (finalPmRemark !== undefined) { sets.push("pm_remark = @pm_remark"); request.input('pm_remark', sql.NVarChar, finalPmRemark); }
+        if (finalCertificateUrl !== undefined) { sets.push("certificate_url = @certificate_url"); request.input('certificate_url', sql.NVarChar, finalCertificateUrl); }
 
         Object.keys(fieldMapping).forEach(key => {
           if (req.body[key] !== undefined) {
@@ -16109,6 +16513,17 @@ app.put(['/api/admin/service-certificates/:id', '/api/service-certificates/:id',
         let cols = ['employee_id', 'purpose', 'hr_status', 'pm_status', 'designation_at_request', 'created_at', 'updated_at'];
         let vals = ['@emp_id', '@purpose', '@hr_status', '@pm_status', '@designation_at_request', 'DATEADD(MINUTE, 330, GETUTCDATE())', 'DATEADD(MINUTE, 330, GETUTCDATE())'];
 
+        if (finalAdminRemark !== undefined) {
+          cols.push('admin_remark');
+          vals.push('@admin_remark');
+          request.input('admin_remark', sql.NVarChar, finalAdminRemark);
+        }
+        if (finalPmRemark !== undefined) {
+          cols.push('pm_remark');
+          vals.push('@pm_remark');
+          request.input('pm_remark', sql.NVarChar, finalPmRemark);
+        }
+
         Object.keys(fieldMapping).forEach(key => {
           const col = fieldMapping[key];
           if (req.body[key] !== undefined && !cols.includes(col) && col !== 'purpose') {
@@ -16147,6 +16562,1426 @@ app.put(['/api/admin/service-certificates/:id', '/api/service-certificates/:id',
   } catch (err) {
     console.error('[SERVICE CERTIFICATE UPSERT ERROR]:', err);
     res.status(500).json({ error: 'Failed to process service certificate request' });
+  }
+});
+
+// =========================================================================
+// --- EXIT FORMALITIES MANAGEMENT --- //
+// =========================================================================
+
+/**
+ * Helper to fetch a complete exit formalities template with joined employee details
+ */
+async function fetchExitFormalitiesRecord(pool, whereClause, inputs = {}) {
+  const request = pool.request();
+  Object.keys(inputs).forEach(key => {
+    request.input(key, inputs[key].type, inputs[key].val);
+  });
+
+  const query = `
+    SELECT 
+      ef.id,
+      ef.employee_id,
+      ef.resignation_id,
+      ef.reason_type,
+      ef.reason_other_specify,
+      ef.handover_completed,
+      ef.handover_to_employee_id,
+      ef.handover_to_name,
+      ef.pending_tasks,
+      ef.asset_id_card_status,
+      ef.asset_id_card_remarks,
+      ef.asset_laptop_status,
+      ef.asset_laptop_remarks,
+      ef.asset_mobile_status,
+      ef.asset_mobile_remarks,
+      ef.asset_access_card_status,
+      ef.asset_access_card_remarks,
+      ef.asset_other_status,
+      ef.asset_other_remarks,
+      ef.clearance_hr_status,
+      ef.clearance_hr_remarks,
+      ef.clearance_it_status,
+      ef.clearance_it_remarks,
+      ef.clearance_finance_status,
+      ef.clearance_finance_remarks,
+      ef.clearance_admin_status,
+      ef.clearance_admin_remarks,
+      ef.notice_period_served,
+      ef.recovery_details,
+      ef.final_settlement_date,
+      ef.created_at,
+      ef.updated_at,
+      ISNULL(ef.employee_name, u.name) AS employee_name,
+      ISNULL(ef.department, u.team) AS department,
+      ISNULL(ef.designation, u.role) AS designation,
+      ISNULL(ef.date_of_joining, u.joining_date) AS date_of_joining,
+      ISNULL(ef.company_employee_id, CAST(e.emp_id AS NVARCHAR)) AS company_employee_id,
+      ISNULL(ef.reporting_manager, m.name) AS reporting_manager,
+      ISNULL(ef.reporting_manager, m.name) AS reporting_manager_name,
+      ISNULL(ef.resignation_submitted_date, r.resignation_date) AS resignation_submitted_date,
+      ISNULL(ef.resignation_submitted_date, r.resignation_date) AS resignation_date,
+      ISNULL(ef.last_working_day, r.last_working_day) AS last_working_day,
+      ISNULL(ef.hr_name, 'HR Department') AS hr_name,
+      hto.name AS handover_to_employee_name
+    FROM exit_formalities ef
+    JOIN users u ON ef.employee_id = u.id
+    LEFT JOIN employee e ON u.id = e.user_id
+    LEFT JOIN users m ON u.reporting_manager_id = m.id
+    LEFT JOIN resignations r ON ef.resignation_id = r.id
+    LEFT JOIN users hto ON ef.handover_to_employee_id = hto.id
+    WHERE ${whereClause}
+  `;
+  const result = await request.query(query);
+  return result.recordset[0] || null;
+}
+
+/**
+ * Helper to fetch default pre-filled mock details when no exit_formalities record exists
+ */
+async function fetchMockExitFormalities(pool, employeeId) {
+  const result = await pool.request()
+    .input('employeeId', sql.Int, employeeId)
+    .query(`
+      SELECT TOP 1
+        u.id AS employee_id,
+        u.name AS employee_name,
+        u.team AS department,
+        u.role AS designation,
+        u.joining_date,
+        e.emp_id AS company_employee_id,
+        m.name AS reporting_manager_name,
+        r.id AS resignation_id,
+        r.resignation_date,
+        r.last_working_day
+      FROM users u
+      LEFT JOIN employee e ON u.id = e.user_id
+      LEFT JOIN users m ON u.reporting_manager_id = m.id
+      LEFT JOIN resignations r ON r.employee_id = u.id
+      WHERE u.id = @employeeId
+      ORDER BY r.created_at DESC
+    `);
+  
+  if (result.recordset.length === 0) return null;
+  const data = result.recordset[0];
+  return {
+    id: null,
+    employee_id: data.employee_id,
+    resignation_id: data.resignation_id || null,
+    employee_name: data.employee_name,
+    department: data.department,
+    designation: data.designation,
+    date_of_joining: data.joining_date,
+    company_employee_id: data.company_employee_id,
+    reporting_manager_name: data.reporting_manager_name,
+    resignation_date: data.resignation_date || null,
+    last_working_day: data.last_working_day || null,
+    reason_type: null,
+    reason_other_specify: null,
+    handover_completed: "Pending",
+    handover_to_employee_id: null,
+    handover_to_name: null,
+    pending_tasks: null,
+    asset_id_card_status: "Pending",
+    asset_id_card_remarks: null,
+    asset_laptop_status: "Pending",
+    asset_laptop_remarks: null,
+    asset_mobile_status: "Pending",
+    asset_mobile_remarks: null,
+    asset_access_card_status: "Pending",
+    asset_access_card_remarks: null,
+    asset_other_status: "Pending",
+    asset_other_remarks: null,
+    clearance_hr_status: "Pending",
+    clearance_hr_remarks: null,
+    clearance_it_status: "Pending",
+    clearance_it_remarks: null,
+    clearance_finance_status: "Pending",
+    clearance_finance_remarks: null,
+    clearance_admin_status: "Pending",
+    clearance_admin_remarks: null,
+    notice_period_served: null,
+    recovery_details: null,
+    final_settlement_date: null
+  };
+}
+
+/**
+ * 56.1 GET: Fetch authenticated user's own exit formalities
+ */
+app.get('/api/exit-formalities/my', verifyToken, async (req, res) => {
+  const userId = req.user.id;
+  try {
+    const pool = await getPool();
+    const record = await fetchExitFormalitiesRecord(pool, 'ef.employee_id = @userId', {
+      userId: { type: sql.Int, val: userId }
+    });
+
+    if (record) {
+      return res.json(record);
+    }
+
+    // Default template if no record exists
+    const mockRecord = await fetchMockExitFormalities(pool, userId);
+    if (!mockRecord) {
+      return res.status(404).json({ error: 'Employee details not found' });
+    }
+    res.json(mockRecord);
+  } catch (err) {
+    Log.error('ExitFormalities', 'Failed to fetch personal exit formalities', err.message);
+    res.status(500).json({ error: 'Failed to fetch exit formalities details' });
+  }
+});
+
+/**
+ * 56.2 GET: Fetch exit formalities by resignation request ID
+ */
+app.get('/api/exit-formalities/resignation/:id', verifyToken, async (req, res) => {
+  const resignationId = parseInt(req.params.id);
+  if (isNaN(resignationId)) {
+    return res.status(400).json({ error: 'Invalid resignation ID' });
+  }
+
+  try {
+    const pool = await getPool();
+    const record = await fetchExitFormalitiesRecord(pool, 'ef.resignation_id = @resignationId', {
+      resignationId: { type: sql.Int, val: resignationId }
+    });
+
+    if (record) {
+      // Access check: Admin/HR/CEO or direct manager or the employee themself
+      const role = (req.user.role || '').toLowerCase();
+      const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo');
+      if (!isAdmin && record.employee_id !== req.user.id) {
+        // Check if direct manager
+        const userRes = await pool.request()
+          .input('empId', sql.Int, record.employee_id)
+          .query('SELECT reporting_manager_id FROM users WHERE id = @empId');
+        const managerId = userRes.recordset[0]?.reporting_manager_id;
+        if (managerId !== req.user.id) {
+          return res.status(403).json({ error: 'Unauthorized to view this record' });
+        }
+      }
+      return res.json(record);
+    }
+
+    // Try to fall back to mock record if resignation exists
+    const resRes = await pool.request()
+      .input('resId', sql.Int, resignationId)
+      .query('SELECT employee_id FROM resignations WHERE id = @resId');
+    if (resRes.recordset.length === 0) {
+      return res.status(404).json({ error: 'Resignation record not found' });
+    }
+
+    const employeeId = resRes.recordset[0].employee_id;
+    const mockRecord = await fetchMockExitFormalities(pool, employeeId);
+    if (!mockRecord) {
+      return res.status(404).json({ error: 'Employee details not found' });
+    }
+    res.json(mockRecord);
+  } catch (err) {
+    Log.error('ExitFormalities', 'Failed to fetch exit formalities by resignation ID', err.message);
+    res.status(500).json({ error: 'Failed to fetch exit formalities' });
+  }
+});
+
+/**
+ * 56.3 GET: Fetch exit formalities of a specific employee (Admin/HR/Manager/Self)
+ */
+app.get('/api/exit-formalities/employee/:id', verifyToken, async (req, res) => {
+  const targetEmployeeId = parseInt(req.params.id);
+  if (isNaN(targetEmployeeId)) {
+    return res.status(400).json({ error: 'Invalid employee ID' });
+  }
+
+  // Access check
+  const role = (req.user.role || '').toLowerCase();
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo');
+  if (!isAdmin && targetEmployeeId !== req.user.id) {
+    try {
+      const pool = await getPool();
+      const userRes = await pool.request()
+        .input('empId', sql.Int, targetEmployeeId)
+        .query('SELECT reporting_manager_id FROM users WHERE id = @empId');
+      const managerId = userRes.recordset[0]?.reporting_manager_id;
+      if (managerId !== req.user.id) {
+        return res.status(403).json({ error: 'Unauthorized to view this record' });
+      }
+    } catch (e) {
+      return res.status(500).json({ error: 'Auth check failed' });
+    }
+  }
+
+  try {
+    const pool = await getPool();
+    const record = await fetchExitFormalitiesRecord(pool, 'ef.employee_id = @targetEmployeeId', {
+      targetEmployeeId: { type: sql.Int, val: targetEmployeeId }
+    });
+
+    if (record) {
+      return res.json(record);
+    }
+
+    const mockRecord = await fetchMockExitFormalities(pool, targetEmployeeId);
+    if (!mockRecord) {
+      return res.status(404).json({ error: 'Employee details not found' });
+    }
+    res.json(mockRecord);
+  } catch (err) {
+    Log.error('ExitFormalities', 'Failed to fetch employee exit formalities', err.message);
+    res.status(500).json({ error: 'Failed to fetch employee exit formalities' });
+  }
+});
+
+/**
+ * 56.4 GET: List all exit formalities records (Admin/HR only)
+ */
+app.get('/api/admin/exit-formalities', verifyToken, async (req, res) => {
+  const role = (req.user.role || '').toLowerCase();
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo');
+  if (!isAdmin) {
+    return res.status(403).json({ error: 'Unauthorized: Administrative access required.' });
+  }
+
+  try {
+    const pool = await getPool();
+    const result = await pool.request().query(`
+      SELECT 
+        ef.id,
+        ef.employee_id,
+        ef.resignation_id,
+        ef.reason_type,
+        ef.reason_other_specify,
+        ef.handover_completed,
+        ef.handover_to_employee_id,
+        ef.handover_to_name,
+        ef.pending_tasks,
+        ef.asset_id_card_status,
+        ef.asset_id_card_remarks,
+        ef.asset_laptop_status,
+        ef.asset_laptop_remarks,
+        ef.asset_mobile_status,
+        ef.asset_mobile_remarks,
+        ef.asset_access_card_status,
+        ef.asset_access_card_remarks,
+        ef.asset_other_status,
+        ef.asset_other_remarks,
+        ef.clearance_hr_status,
+        ef.clearance_hr_remarks,
+        ef.clearance_it_status,
+        ef.clearance_it_remarks,
+        ef.clearance_finance_status,
+        ef.clearance_finance_remarks,
+        ef.clearance_admin_status,
+        ef.clearance_admin_remarks,
+        ef.notice_period_served,
+        ef.recovery_details,
+        ef.final_settlement_date,
+        ef.created_at,
+        ef.updated_at,
+        ISNULL(ef.employee_name, u.name) AS employee_name,
+        ISNULL(ef.department, u.team) AS department,
+        ISNULL(ef.designation, u.role) AS designation,
+        ISNULL(ef.date_of_joining, u.joining_date) AS date_of_joining,
+        ISNULL(ef.company_employee_id, CAST(e.emp_id AS NVARCHAR)) AS company_employee_id,
+        ISNULL(ef.reporting_manager, m.name) AS reporting_manager,
+        ISNULL(ef.reporting_manager, m.name) AS reporting_manager_name,
+        ISNULL(ef.resignation_submitted_date, r.resignation_date) AS resignation_submitted_date,
+        ISNULL(ef.resignation_submitted_date, r.resignation_date) AS resignation_date,
+        ISNULL(ef.last_working_day, r.last_working_day) AS last_working_day,
+        ISNULL(ef.hr_name, 'HR Department') AS hr_name,
+        hto.name AS handover_to_employee_name
+      FROM exit_formalities ef
+      JOIN users u ON ef.employee_id = u.id
+      LEFT JOIN employee e ON u.id = e.user_id
+      LEFT JOIN users m ON u.reporting_manager_id = m.id
+      LEFT JOIN resignations r ON ef.resignation_id = r.id
+      LEFT JOIN users hto ON ef.handover_to_employee_id = hto.id
+      ORDER BY ef.created_at DESC
+    `);
+    res.json(result.recordset);
+  } catch (err) {
+    Log.error('ExitFormalities', 'Failed to fetch exit formalities list', err.message);
+    res.status(500).json({ error: 'Failed to extract exit formalities list' });
+  }
+});
+
+/**
+ * 56.5 POST: Submit/Create exit formalities (Smart UPSERT)
+ */
+app.post('/api/exit-formalities', verifyToken, async (req, res) => {
+  const role = (req.user.role || '').toLowerCase();
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo');
+  
+  const targetEmployeeId = req.body.employee_id ? parseInt(req.body.employee_id) : req.user.id;
+  if (isNaN(targetEmployeeId)) {
+    return res.status(400).json({ error: 'Invalid employee ID' });
+  }
+
+  if (!isAdmin && targetEmployeeId !== req.user.id) {
+    return res.status(403).json({ error: 'Unauthorized: You can only submit your own exit formalities.' });
+  }
+
+  const {
+    resignation_id, employee_name, department, last_working_day,
+    company_employee_id, reporting_manager, resignation_submitted_date,
+    designation, date_of_joining, hr_name,
+    reason_type, reason_other_specify,
+    handover_completed, handover_to_employee_id, handover_to_name, pending_tasks,
+    asset_id_card_status, asset_id_card_remarks,
+    asset_laptop_status, asset_laptop_remarks,
+    asset_mobile_status, asset_mobile_remarks,
+    asset_access_card_status, asset_access_card_remarks,
+    asset_other_status, asset_other_remarks,
+    clearance_hr_status, clearance_hr_remarks,
+    clearance_it_status, clearance_it_remarks,
+    clearance_finance_status, clearance_finance_remarks,
+    clearance_admin_status, clearance_admin_remarks,
+    notice_period_served, recovery_details, final_settlement_date
+  } = req.body;
+
+  try {
+    const pool = await getPool();
+
+    // Check if record already exists
+    const existing = await pool.request()
+      .input('empId', sql.Int, targetEmployeeId)
+      .query('SELECT id FROM exit_formalities WHERE employee_id = @empId');
+
+    // Auto-resolve latest resignation ID if not provided
+    let resolvedResignationId = resignation_id ? parseInt(resignation_id) : null;
+    if (!resolvedResignationId) {
+      const resRes = await pool.request()
+        .input('empId', sql.Int, targetEmployeeId)
+        .query('SELECT TOP 1 id FROM resignations WHERE employee_id = @empId ORDER BY created_at DESC');
+      if (resRes.recordset.length > 0) {
+        resolvedResignationId = resRes.recordset[0].id;
+      }
+    }
+
+    // Auto-resolve dynamic employee details if missing
+    let resolvedEmpName = employee_name;
+    let resolvedDept = department;
+    let resolvedLwd = last_working_day;
+    let resolvedCompEmpId = company_employee_id;
+    let resolvedRepManager = reporting_manager;
+    let resolvedResigDate = resignation_submitted_date;
+    let resolvedDesig = designation;
+    let resolvedDoj = date_of_joining;
+    let resolvedHrName = hr_name;
+
+    if (!resolvedEmpName || !resolvedDept || !resolvedLwd || !resolvedCompEmpId || !resolvedRepManager || !resolvedResigDate || !resolvedDesig || !resolvedDoj || !resolvedHrName) {
+      const detailQuery = `
+        SELECT TOP 1
+          u.name AS employee_name,
+          u.team AS department,
+          u.role AS designation,
+          u.joining_date,
+          e.emp_id AS company_employee_id,
+          m.name AS reporting_manager_name,
+          r.resignation_date,
+          r.last_working_day
+        FROM users u
+        LEFT JOIN employee e ON u.id = e.user_id
+        LEFT JOIN users m ON u.reporting_manager_id = m.id
+        LEFT JOIN resignations r ON r.id = @resId
+        WHERE u.id = @empId
+      `;
+      const detailsResult = await pool.request()
+        .input('empId', sql.Int, targetEmployeeId)
+        .input('resId', sql.Int, resolvedResignationId)
+        .query(detailQuery);
+
+      if (detailsResult.recordset.length > 0) {
+        const d = detailsResult.recordset[0];
+        if (!resolvedEmpName) resolvedEmpName = d.employee_name;
+        if (!resolvedDept) resolvedDept = d.department;
+        if (!resolvedLwd) resolvedLwd = d.last_working_day || (resolvedResignationId ? d.last_working_day : null);
+        if (!resolvedCompEmpId) resolvedCompEmpId = d.company_employee_id ? String(d.company_employee_id) : null;
+        if (!resolvedRepManager) resolvedRepManager = d.reporting_manager_name;
+        if (!resolvedResigDate) resolvedResigDate = d.resignation_date || (resolvedResignationId ? d.resignation_date : null);
+        if (!resolvedDesig) resolvedDesig = d.designation;
+        if (!resolvedDoj) resolvedDoj = d.joining_date;
+        if (!resolvedHrName) resolvedHrName = 'HR Department';
+      }
+    }
+
+    const request = pool.request();
+    request.input('employee_id', sql.Int, targetEmployeeId);
+    request.input('resignation_id', sql.Int, resolvedResignationId);
+    
+    // Explicit Details columns bindings
+    request.input('employee_name', sql.NVarChar, resolvedEmpName || null);
+    request.input('department', sql.NVarChar, resolvedDept || null);
+    request.input('last_working_day', sql.Date, resolvedLwd ? new Date(resolvedLwd) : null);
+    request.input('company_employee_id', sql.NVarChar, resolvedCompEmpId ? String(resolvedCompEmpId) : null);
+    request.input('reporting_manager', sql.NVarChar, resolvedRepManager || null);
+    request.input('resignation_submitted_date', sql.Date, resolvedResigDate ? new Date(resolvedResigDate) : null);
+    request.input('designation', sql.NVarChar, resolvedDesig || null);
+    request.input('date_of_joining', sql.Date, resolvedDoj ? new Date(resolvedDoj) : null);
+    request.input('hr_name', sql.NVarChar, resolvedHrName || null);
+
+    request.input('reason_type', sql.NVarChar, reason_type || null);
+    request.input('reason_other_specify', sql.NVarChar, reason_other_specify || null);
+    request.input('handover_completed', sql.NVarChar, handover_completed || 'Pending');
+    request.input('handover_to_employee_id', sql.Int, handover_to_employee_id ? parseInt(handover_to_employee_id) : null);
+    request.input('handover_to_name', sql.NVarChar, handover_to_name || null);
+    request.input('pending_tasks', sql.NVarChar, pending_tasks || null);
+    
+    // Assets defaults to 'Pending' if not provided
+    request.input('asset_id_card_status', sql.NVarChar, asset_id_card_status || 'Pending');
+    request.input('asset_id_card_remarks', sql.NVarChar, asset_id_card_remarks || null);
+    request.input('asset_laptop_status', sql.NVarChar, asset_laptop_status || 'Pending');
+    request.input('asset_laptop_remarks', sql.NVarChar, asset_laptop_remarks || null);
+    request.input('asset_mobile_status', sql.NVarChar, asset_mobile_status || 'Pending');
+    request.input('asset_mobile_remarks', sql.NVarChar, asset_mobile_remarks || null);
+    request.input('asset_access_card_status', sql.NVarChar, asset_access_card_status || 'Pending');
+    request.input('asset_access_card_remarks', sql.NVarChar, asset_access_card_remarks || null);
+    request.input('asset_other_status', sql.NVarChar, asset_other_status || 'Pending');
+    request.input('asset_other_remarks', sql.NVarChar, asset_other_remarks || null);
+
+    // Clearances defaults to 'Pending' if not provided
+    request.input('clearance_hr_status', sql.NVarChar, clearance_hr_status || 'Pending');
+    request.input('clearance_hr_remarks', sql.NVarChar, clearance_hr_remarks || null);
+    request.input('clearance_it_status', sql.NVarChar, clearance_it_status || 'Pending');
+    request.input('clearance_it_remarks', sql.NVarChar, clearance_it_remarks || null);
+    request.input('clearance_finance_status', sql.NVarChar, clearance_finance_status || 'Pending');
+    request.input('clearance_finance_remarks', sql.NVarChar, clearance_finance_remarks || null);
+    request.input('clearance_admin_status', sql.NVarChar, clearance_admin_status || 'Pending');
+    request.input('clearance_admin_remarks', sql.NVarChar, clearance_admin_remarks || null);
+
+    request.input('notice_period_served', sql.NVarChar, notice_period_served || null);
+    request.input('recovery_details', sql.NVarChar, recovery_details || null);
+    request.input('final_settlement_date', sql.Date, final_settlement_date ? new Date(final_settlement_date) : null);
+
+    if (existing.recordset.length > 0) {
+      // Update logic (UPSERT support)
+      const recordId = existing.recordset[0].id;
+      request.input('id', sql.Int, recordId);
+
+      // Secure fields if NOT HR/Admin
+      if (!isAdmin) {
+        const existingData = await fetchExitFormalitiesRecord(pool, 'ef.id = @id', {
+          id: { type: sql.Int, val: recordId }
+        });
+        if (existingData) {
+          request.input('employee_name', sql.NVarChar, existingData.employee_name);
+          request.input('department', sql.NVarChar, existingData.department);
+          request.input('last_working_day', sql.Date, existingData.last_working_day);
+          request.input('company_employee_id', sql.NVarChar, existingData.company_employee_id);
+          request.input('reporting_manager', sql.NVarChar, existingData.reporting_manager);
+          request.input('resignation_submitted_date', sql.Date, existingData.resignation_submitted_date);
+          request.input('designation', sql.NVarChar, existingData.designation);
+          request.input('date_of_joining', sql.Date, existingData.date_of_joining);
+          request.input('hr_name', sql.NVarChar, existingData.hr_name);
+
+          request.input('asset_id_card_status', sql.NVarChar, existingData.asset_id_card_status);
+          request.input('asset_id_card_remarks', sql.NVarChar, existingData.asset_id_card_remarks);
+          request.input('asset_laptop_status', sql.NVarChar, existingData.asset_laptop_status);
+          request.input('asset_laptop_remarks', sql.NVarChar, existingData.asset_laptop_remarks);
+          request.input('asset_mobile_status', sql.NVarChar, existingData.asset_mobile_status);
+          request.input('asset_mobile_remarks', sql.NVarChar, existingData.asset_mobile_remarks);
+          request.input('asset_access_card_status', sql.NVarChar, existingData.asset_access_card_status);
+          request.input('asset_access_card_remarks', sql.NVarChar, existingData.asset_access_card_remarks);
+          request.input('asset_other_status', sql.NVarChar, existingData.asset_other_status);
+          request.input('asset_other_remarks', sql.NVarChar, existingData.asset_other_remarks);
+
+          request.input('clearance_hr_status', sql.NVarChar, existingData.clearance_hr_status);
+          request.input('clearance_hr_remarks', sql.NVarChar, existingData.clearance_hr_remarks);
+          request.input('clearance_it_status', sql.NVarChar, existingData.clearance_it_status);
+          request.input('clearance_it_remarks', sql.NVarChar, existingData.clearance_it_remarks);
+          request.input('clearance_finance_status', sql.NVarChar, existingData.clearance_finance_status);
+          request.input('clearance_finance_remarks', sql.NVarChar, existingData.clearance_finance_remarks);
+          request.input('clearance_admin_status', sql.NVarChar, existingData.clearance_admin_status);
+          request.input('clearance_admin_remarks', sql.NVarChar, existingData.clearance_admin_remarks);
+
+          request.input('notice_period_served', sql.NVarChar, existingData.notice_period_served);
+          request.input('recovery_details', sql.NVarChar, existingData.recovery_details);
+          request.input('final_settlement_date', sql.Date, existingData.final_settlement_date);
+        }
+      }
+
+      await request.query(`
+        UPDATE exit_formalities
+        SET 
+          resignation_id = @resignation_id,
+          employee_name = @employee_name,
+          department = @department,
+          last_working_day = @last_working_day,
+          company_employee_id = @company_employee_id,
+          reporting_manager = @reporting_manager,
+          resignation_submitted_date = @resignation_submitted_date,
+          designation = @designation,
+          date_of_joining = @date_of_joining,
+          hr_name = @hr_name,
+          reason_type = @reason_type,
+          reason_other_specify = @reason_other_specify,
+          handover_completed = @handover_completed,
+          handover_to_employee_id = @handover_to_employee_id,
+          handover_to_name = @handover_to_name,
+          pending_tasks = @pending_tasks,
+          asset_id_card_status = @asset_id_card_status,
+          asset_id_card_remarks = @asset_id_card_remarks,
+          asset_laptop_status = @asset_laptop_status,
+          asset_laptop_remarks = @asset_laptop_remarks,
+          asset_mobile_status = @asset_mobile_status,
+          asset_mobile_remarks = @asset_mobile_remarks,
+          asset_access_card_status = @asset_access_card_status,
+          asset_access_card_remarks = @asset_access_card_remarks,
+          asset_other_status = @asset_other_status,
+          asset_other_remarks = @asset_other_remarks,
+          clearance_hr_status = @clearance_hr_status,
+          clearance_hr_remarks = @clearance_hr_remarks,
+          clearance_it_status = @clearance_it_status,
+          clearance_it_remarks = @clearance_it_remarks,
+          clearance_finance_status = @clearance_finance_status,
+          clearance_finance_remarks = @clearance_finance_remarks,
+          clearance_admin_status = @clearance_admin_status,
+          clearance_admin_remarks = @clearance_admin_remarks,
+          notice_period_served = @notice_period_served,
+          recovery_details = @recovery_details,
+          final_settlement_date = @final_settlement_date,
+          updated_at = DATEADD(MINUTE, 330, GETUTCDATE())
+        WHERE id = @id
+      `);
+      
+      const targetRecordId = recordId;
+      
+      // Send exit formalities status notification to the employee
+      const efQuery = await pool.request()
+        .input('id', sql.Int, targetRecordId)
+        .query("SELECT clearance_hr_status, clearance_it_status, clearance_finance_status, clearance_admin_status, employee_id FROM exit_formalities WHERE id = @id");
+      const efRec = efQuery.recordset[0];
+      
+      if (efRec) {
+        const isComplete = (status) => {
+          if (!status) return false;
+          const s = status.trim().toLowerCase();
+          return s === 'yes' || s === 'approved' || s === 'completed';
+        };
+        
+        const allCompleted = isComplete(efRec.clearance_hr_status) &&
+                             isComplete(efRec.clearance_it_status) &&
+                             isComplete(efRec.clearance_finance_status) &&
+                             isComplete(efRec.clearance_admin_status);
+        
+        let notificationMsg = '';
+        if (allCompleted) {
+          notificationMsg = 'Your exit formalities are completed so view the Feedback form and fill out this';
+        } else {
+          notificationMsg = 'Your exit formalities are in waiting';
+        }
+
+        await pool.request()
+          .input('uid', sql.Int, efRec.employee_id)
+          .input('msg', sql.NVarChar, notificationMsg)
+          .query("INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@uid, @msg, 'Exit Formalities', 0, DATEADD(MINUTE, 330, GETUTCDATE()))");
+      }
+
+      res.json({ success: true, message: 'Exit formalities record updated successfully.', id: recordId });
+    } else {
+      // Insert logic
+      const result = await request.query(`
+        INSERT INTO exit_formalities (
+          employee_id, resignation_id, 
+          employee_name, department, last_working_day, company_employee_id, reporting_manager, resignation_submitted_date, designation, date_of_joining, hr_name,
+          reason_type, reason_other_specify,
+          handover_completed, handover_to_employee_id, handover_to_name, pending_tasks,
+          asset_id_card_status, asset_id_card_remarks,
+          asset_laptop_status, asset_laptop_remarks,
+          asset_mobile_status, asset_mobile_remarks,
+          asset_access_card_status, asset_access_card_remarks,
+          asset_other_status, asset_other_remarks,
+          clearance_hr_status, clearance_hr_remarks,
+          clearance_it_status, clearance_it_remarks,
+          clearance_finance_status, clearance_finance_remarks,
+          clearance_admin_status, clearance_admin_remarks,
+          notice_period_served, recovery_details, final_settlement_date,
+          created_at, updated_at
+        )
+        OUTPUT INSERTED.id
+        VALUES (
+          @employee_id, @resignation_id,
+          @employee_name, @department, @last_working_day, @company_employee_id, @reporting_manager, @resignation_submitted_date, @designation, @date_of_joining, @hr_name,
+          @reason_type, @reason_other_specify,
+          @handover_completed, @handover_to_employee_id, @handover_to_name, @pending_tasks,
+          @asset_id_card_status, @asset_id_card_remarks,
+          @asset_laptop_status, @asset_laptop_remarks,
+          @asset_mobile_status, @asset_mobile_remarks,
+          @asset_access_card_status, @asset_access_card_remarks,
+          @asset_other_status, @asset_other_remarks,
+          @clearance_hr_status, @clearance_hr_remarks,
+          @clearance_it_status, @clearance_it_remarks,
+          @clearance_finance_status, @clearance_finance_remarks,
+          @clearance_admin_status, @clearance_admin_remarks,
+          @notice_period_served, @recovery_details, @final_settlement_date,
+          DATEADD(MINUTE, 330, GETUTCDATE()), DATEADD(MINUTE, 330, GETUTCDATE())
+        )
+      `);
+      const newId = result.recordset[0].id;
+
+      // Send exit formalities status notification to the employee
+      const efQuery = await pool.request()
+        .input('id', sql.Int, newId)
+        .query("SELECT clearance_hr_status, clearance_it_status, clearance_finance_status, clearance_admin_status, employee_id FROM exit_formalities WHERE id = @id");
+      const efRec = efQuery.recordset[0];
+      
+      if (efRec) {
+        const isComplete = (status) => {
+          if (!status) return false;
+          const s = status.trim().toLowerCase();
+          return s === 'yes' || s === 'approved' || s === 'completed';
+        };
+        
+        const allCompleted = isComplete(efRec.clearance_hr_status) &&
+                             isComplete(efRec.clearance_it_status) &&
+                             isComplete(efRec.clearance_finance_status) &&
+                             isComplete(efRec.clearance_admin_status);
+        
+        let notificationMsg = '';
+        if (allCompleted) {
+          notificationMsg = 'Your exit formalities are completed so view the Feedback form and fill out this';
+        } else {
+          notificationMsg = 'Your exit formalities are in waiting';
+        }
+
+        await pool.request()
+          .input('uid', sql.Int, efRec.employee_id)
+          .input('msg', sql.NVarChar, notificationMsg)
+          .query("INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@uid, @msg, 'Exit Formalities', 0, DATEADD(MINUTE, 330, GETUTCDATE()))");
+      }
+
+      res.status(201).json({ success: true, message: 'Exit formalities record created successfully.', id: newId });
+    }
+  } catch (err) {
+    Log.error('ExitFormalities', 'Failed to submit exit formalities', err.message);
+    res.status(500).json({ error: 'Failed to process exit formalities submission' });
+  }
+});
+
+/**
+ * 56.6 PUT: Update/Review exit formalities (Admin/HR/Manager/Self)
+ */
+app.put('/api/exit-formalities/:id', verifyToken, async (req, res) => {
+  const recordId = parseInt(req.params.id);
+  if (isNaN(recordId)) {
+    return res.status(400).json({ error: 'Invalid record ID' });
+  }
+
+  const role = (req.user.role || '').toLowerCase();
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo');
+
+  try {
+    const pool = await getPool();
+
+    // Check if record exists
+    const verifyResult = await pool.request()
+      .input('id', sql.Int, recordId)
+      .query('SELECT employee_id FROM exit_formalities WHERE id = @id');
+    
+    if (verifyResult.recordset.length === 0) {
+      return res.status(404).json({ error: 'Exit formalities record not found' });
+    }
+
+    const employeeId = verifyResult.recordset[0].employee_id;
+
+    // Access check: Admin/HR/CEO or direct manager or the employee themself
+    if (!isAdmin && employeeId !== req.user.id) {
+      const userRes = await pool.request()
+        .input('empId', sql.Int, employeeId)
+        .query('SELECT reporting_manager_id FROM users WHERE id = @empId');
+      const managerId = userRes.recordset[0]?.reporting_manager_id;
+      if (managerId !== req.user.id) {
+        return res.status(403).json({ error: 'Unauthorized to modify this record' });
+      }
+    }
+
+    const {
+      resignation_id, employee_name, department, last_working_day,
+      company_employee_id, reporting_manager, resignation_submitted_date,
+      designation, date_of_joining, hr_name,
+      reason_type, reason_other_specify,
+      handover_completed, handover_to_employee_id, handover_to_name, pending_tasks,
+      asset_id_card_status, asset_id_card_remarks,
+      asset_laptop_status, asset_laptop_remarks,
+      asset_mobile_status, asset_mobile_remarks,
+      asset_access_card_status, asset_access_card_remarks,
+      asset_other_status, asset_other_remarks,
+      clearance_hr_status, clearance_hr_remarks,
+      clearance_it_status, clearance_it_remarks,
+      clearance_finance_status, clearance_finance_remarks,
+      clearance_admin_status, clearance_admin_remarks,
+      notice_period_served, recovery_details, final_settlement_date
+    } = req.body;
+
+    const request = pool.request();
+    request.input('id', sql.Int, recordId);
+
+    // Dynamic field mapping
+    let sets = ["updated_at = DATEADD(MINUTE, 330, GETUTCDATE())"];
+
+    if (resignation_id !== undefined) {
+      sets.push("resignation_id = @resignation_id");
+      request.input('resignation_id', sql.Int, resignation_id ? parseInt(resignation_id) : null);
+    }
+    if (handover_completed !== undefined) {
+      sets.push("handover_completed = @handover_completed");
+      request.input('handover_completed', sql.NVarChar, handover_completed || null);
+    }
+    if (handover_to_employee_id !== undefined) {
+      sets.push("handover_to_employee_id = @handover_to_employee_id");
+      request.input('handover_to_employee_id', sql.Int, handover_to_employee_id ? parseInt(handover_to_employee_id) : null);
+    }
+    if (handover_to_name !== undefined) {
+      sets.push("handover_to_name = @handover_to_name");
+      request.input('handover_to_name', sql.NVarChar, handover_to_name || null);
+    }
+    if (pending_tasks !== undefined) {
+      sets.push("pending_tasks = @pending_tasks");
+      request.input('pending_tasks', sql.NVarChar, pending_tasks || null);
+    }
+    if (reason_type !== undefined) {
+      sets.push("reason_type = @reason_type");
+      request.input('reason_type', sql.NVarChar, reason_type || null);
+    }
+    if (reason_other_specify !== undefined) {
+      sets.push("reason_other_specify = @reason_other_specify");
+      request.input('reason_other_specify', sql.NVarChar, reason_other_specify || null);
+    }
+
+    // Secured fields: clearances, asset checklists, settlement details, employee details
+    if (isAdmin) {
+      if (employee_name !== undefined) {
+        sets.push("employee_name = @employee_name");
+        request.input('employee_name', sql.NVarChar, employee_name || null);
+      }
+      if (department !== undefined) {
+        sets.push("department = @department");
+        request.input('department', sql.NVarChar, department || null);
+      }
+      if (last_working_day !== undefined) {
+        sets.push("last_working_day = @last_working_day");
+        request.input('last_working_day', sql.Date, last_working_day ? new Date(last_working_day) : null);
+      }
+      if (company_employee_id !== undefined) {
+        sets.push("company_employee_id = @company_employee_id");
+        request.input('company_employee_id', sql.NVarChar, company_employee_id ? String(company_employee_id) : null);
+      }
+      if (reporting_manager !== undefined) {
+        sets.push("reporting_manager = @reporting_manager");
+        request.input('reporting_manager', sql.NVarChar, reporting_manager || null);
+      }
+      if (resignation_submitted_date !== undefined) {
+        sets.push("resignation_submitted_date = @resignation_submitted_date");
+        request.input('resignation_submitted_date', sql.Date, resignation_submitted_date ? new Date(resignation_submitted_date) : null);
+      }
+      if (designation !== undefined) {
+        sets.push("designation = @designation");
+        request.input('designation', sql.NVarChar, designation || null);
+      }
+      if (date_of_joining !== undefined) {
+        sets.push("date_of_joining = @date_of_joining");
+        request.input('date_of_joining', sql.Date, date_of_joining ? new Date(date_of_joining) : null);
+      }
+      if (hr_name !== undefined) {
+        sets.push("hr_name = @hr_name");
+        request.input('hr_name', sql.NVarChar, hr_name || null);
+      }
+
+      if (asset_id_card_status !== undefined) {
+        sets.push("asset_id_card_status = @asset_id_card_status");
+        request.input('asset_id_card_status', sql.NVarChar, asset_id_card_status || null);
+      }
+      if (asset_id_card_remarks !== undefined) {
+        sets.push("asset_id_card_remarks = @asset_id_card_remarks");
+        request.input('asset_id_card_remarks', sql.NVarChar, asset_id_card_remarks || null);
+      }
+      if (asset_laptop_status !== undefined) {
+        sets.push("asset_laptop_status = @asset_laptop_status");
+        request.input('asset_laptop_status', sql.NVarChar, asset_laptop_status || null);
+      }
+      if (asset_laptop_remarks !== undefined) {
+        sets.push("asset_laptop_remarks = @asset_laptop_remarks");
+        request.input('asset_laptop_remarks', sql.NVarChar, asset_laptop_remarks || null);
+      }
+      if (asset_mobile_status !== undefined) {
+        sets.push("asset_mobile_status = @asset_mobile_status");
+        request.input('asset_mobile_status', sql.NVarChar, asset_mobile_status || null);
+      }
+      if (asset_mobile_remarks !== undefined) {
+        sets.push("asset_mobile_remarks = @asset_mobile_remarks");
+        request.input('asset_mobile_remarks', sql.NVarChar, asset_mobile_remarks || null);
+      }
+      if (asset_access_card_status !== undefined) {
+        sets.push("asset_access_card_status = @asset_access_card_status");
+        request.input('asset_access_card_status', sql.NVarChar, asset_access_card_status || null);
+      }
+      if (asset_access_card_remarks !== undefined) {
+        sets.push("asset_access_card_remarks = @asset_access_card_remarks");
+        request.input('asset_access_card_remarks', sql.NVarChar, asset_access_card_remarks || null);
+      }
+      if (asset_other_status !== undefined) {
+        sets.push("asset_other_status = @asset_other_status");
+        request.input('asset_other_status', sql.NVarChar, asset_other_status || null);
+      }
+      if (asset_other_remarks !== undefined) {
+        sets.push("asset_other_remarks = @asset_other_remarks");
+        request.input('asset_other_remarks', sql.NVarChar, asset_other_remarks || null);
+      }
+
+      if (clearance_hr_status !== undefined) {
+        sets.push("clearance_hr_status = @clearance_hr_status");
+        request.input('clearance_hr_status', sql.NVarChar, clearance_hr_status || null);
+      }
+      if (clearance_hr_remarks !== undefined) {
+        sets.push("clearance_hr_remarks = @clearance_hr_remarks");
+        request.input('clearance_hr_remarks', sql.NVarChar, clearance_hr_remarks || null);
+      }
+      if (clearance_it_status !== undefined) {
+        sets.push("clearance_it_status = @clearance_it_status");
+        request.input('clearance_it_status', sql.NVarChar, clearance_it_status || null);
+      }
+      if (clearance_it_remarks !== undefined) {
+        sets.push("clearance_it_remarks = @clearance_it_remarks");
+        request.input('clearance_it_remarks', sql.NVarChar, clearance_it_remarks || null);
+      }
+      if (clearance_finance_status !== undefined) {
+        sets.push("clearance_finance_status = @clearance_finance_status");
+        request.input('clearance_finance_status', sql.NVarChar, clearance_finance_status || null);
+      }
+      if (clearance_finance_remarks !== undefined) {
+        sets.push("clearance_finance_remarks = @clearance_finance_remarks");
+        request.input('clearance_finance_remarks', sql.NVarChar, clearance_finance_remarks || null);
+      }
+      if (clearance_admin_status !== undefined) {
+        sets.push("clearance_admin_status = @clearance_admin_status");
+        request.input('clearance_admin_status', sql.NVarChar, clearance_admin_status || null);
+      }
+      if (clearance_admin_remarks !== undefined) {
+        sets.push("clearance_admin_remarks = @clearance_admin_remarks");
+        request.input('clearance_admin_remarks', sql.NVarChar, clearance_admin_remarks || null);
+      }
+
+      if (notice_period_served !== undefined) {
+        sets.push("notice_period_served = @notice_period_served");
+        request.input('notice_period_served', sql.NVarChar, notice_period_served || null);
+      }
+      if (recovery_details !== undefined) {
+        sets.push("recovery_details = @recovery_details");
+        request.input('recovery_details', sql.NVarChar, recovery_details || null);
+      }
+      if (final_settlement_date !== undefined) {
+        sets.push("final_settlement_date = @final_settlement_date");
+        request.input('final_settlement_date', sql.Date, final_settlement_date ? new Date(final_settlement_date) : null);
+      }
+    }
+
+    const query = `UPDATE exit_formalities SET ${sets.join(', ')} WHERE id = @id`;
+    await request.query(query);
+
+    // Send exit formalities status notification to the employee
+    const efQuery = await pool.request()
+      .input('id', sql.Int, recordId)
+      .query("SELECT clearance_hr_status, clearance_it_status, clearance_finance_status, clearance_admin_status, employee_id FROM exit_formalities WHERE id = @id");
+    const efRec = efQuery.recordset[0];
+    
+    if (efRec) {
+      const isComplete = (status) => {
+        if (!status) return false;
+        const s = status.trim().toLowerCase();
+        return s === 'yes' || s === 'approved' || s === 'completed';
+      };
+      
+      const allCompleted = isComplete(efRec.clearance_hr_status) &&
+                           isComplete(efRec.clearance_it_status) &&
+                           isComplete(efRec.clearance_finance_status) &&
+                           isComplete(efRec.clearance_admin_status);
+      
+      let notificationMsg = '';
+      if (allCompleted) {
+        notificationMsg = 'Your exit formalities are completed so view the Feedback form and fill out this';
+      } else {
+        notificationMsg = 'Your exit formalities are in waiting';
+      }
+
+      await pool.request()
+        .input('uid', sql.Int, efRec.employee_id)
+        .input('msg', sql.NVarChar, notificationMsg)
+        .query("INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@uid, @msg, 'Exit Formalities', 0, DATEADD(MINUTE, 330, GETUTCDATE()))");
+    }
+
+    res.json({ success: true, message: 'Exit formalities record updated successfully.' });
+  } catch (err) {
+    Log.error('ExitFormalities', 'Failed to update exit formalities record', err.message);
+    res.status(500).json({ error: 'Failed to update exit formalities record' });
+  }
+});
+
+// =========================================================================
+// 56.7 EXIT FEEDBACK SYSTEM
+// =========================================================================
+
+/**
+ * 56.7a POST: Submit/Create exit feedback (Smart UPSERT)
+ */
+app.post('/api/exit-feedback', verifyToken, async (req, res) => {
+  const role = (req.user.role || '').toLowerCase();
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo');
+  
+  const targetEmployeeId = req.body.employee_id ? parseInt(req.body.employee_id) : req.user.id;
+  if (isNaN(targetEmployeeId)) {
+    return res.status(400).json({ error: 'Invalid employee ID' });
+  }
+
+  if (!isAdmin && targetEmployeeId !== req.user.id) {
+    return res.status(403).json({ error: 'Unauthorized: You can only submit your own exit feedback.' });
+  }
+
+  const {
+    like_most, improve_company,
+    employee_signature, employee_signature_date,
+    hr_signature, hr_signature_date,
+    manager_signature, manager_signature_date
+  } = req.body;
+
+  try {
+    const pool = await getPool();
+
+    // Check if record already exists
+    const existing = await pool.request()
+      .input('empId', sql.Int, targetEmployeeId)
+      .query('SELECT id FROM exit_feedback WHERE employee_id = @empId');
+
+    // Auto-resolve resignation_id and exit_formality_id if not existing/provided
+    let resolvedResignationId = req.body.resignation_id ? parseInt(req.body.resignation_id) : null;
+    if (!resolvedResignationId) {
+      const resRes = await pool.request()
+        .input('empId', sql.Int, targetEmployeeId)
+        .query('SELECT TOP 1 id FROM resignations WHERE employee_id = @empId ORDER BY created_at DESC');
+      if (resRes.recordset.length > 0) {
+        resolvedResignationId = resRes.recordset[0].id;
+      }
+    }
+
+    let resolvedExitFormalityId = req.body.exit_formality_id ? parseInt(req.body.exit_formality_id) : null;
+    if (!resolvedExitFormalityId) {
+      const efRes = await pool.request()
+        .input('empId', sql.Int, targetEmployeeId)
+        .query('SELECT TOP 1 id FROM exit_formalities WHERE employee_id = @empId ORDER BY created_at DESC');
+      if (efRes.recordset.length > 0) {
+        resolvedExitFormalityId = efRes.recordset[0].id;
+      }
+    }
+
+    const request = pool.request();
+    request.input('employee_id', sql.Int, targetEmployeeId);
+    request.input('resignation_id', sql.Int, resolvedResignationId);
+    request.input('exit_formality_id', sql.Int, resolvedExitFormalityId);
+    
+    request.input('like_most', sql.NVarChar, like_most || null);
+    request.input('improve_company', sql.NVarChar, improve_company || null);
+    
+    request.input('employee_signature', sql.NVarChar, employee_signature || null);
+    request.input('employee_signature_date', sql.Date, employee_signature_date ? new Date(employee_signature_date) : null);
+    
+    request.input('hr_signature', sql.NVarChar, hr_signature || null);
+    request.input('hr_signature_date', sql.Date, hr_signature_date ? new Date(hr_signature_date) : null);
+    
+    request.input('manager_signature', sql.NVarChar, manager_signature || null);
+    request.input('manager_signature_date', sql.Date, manager_signature_date ? new Date(manager_signature_date) : null);
+
+    if (existing.recordset.length > 0) {
+      const recordId = existing.recordset[0].id;
+      request.input('id', sql.Int, recordId);
+
+      // Security check: non-admin cannot overwrite admin signatures (HR / Manager signatures)
+      if (!isAdmin) {
+        const existingDataRes = await pool.request()
+          .input('id', sql.Int, recordId)
+          .query('SELECT hr_signature, hr_signature_date, manager_signature, manager_signature_date FROM exit_feedback WHERE id = @id');
+        const existingData = existingDataRes.recordset[0];
+        if (existingData) {
+          request.input('hr_signature', sql.NVarChar, existingData.hr_signature);
+          request.input('hr_signature_date', sql.Date, existingData.hr_signature_date);
+          request.input('manager_signature', sql.NVarChar, existingData.manager_signature);
+          request.input('manager_signature_date', sql.Date, existingData.manager_signature_date);
+        }
+      }
+
+      await request.query(`
+        UPDATE exit_feedback
+        SET 
+          resignation_id = @resignation_id,
+          exit_formality_id = @exit_formality_id,
+          like_most = @like_most,
+          improve_company = @improve_company,
+          employee_signature = @employee_signature,
+          employee_signature_date = @employee_signature_date,
+          hr_signature = @hr_signature,
+          hr_signature_date = @hr_signature_date,
+          manager_signature = @manager_signature,
+          manager_signature_date = @manager_signature_date,
+          updated_at = DATEADD(MINUTE, 330, GETUTCDATE())
+        WHERE id = @id
+      `);
+
+      res.json({ success: true, message: 'Exit feedback record updated successfully.', id: recordId });
+    } else {
+      const result = await request.query(`
+        INSERT INTO exit_feedback (
+          employee_id, resignation_id, exit_formality_id,
+          like_most, improve_company,
+          employee_signature, employee_signature_date,
+          hr_signature, hr_signature_date,
+          manager_signature, manager_signature_date,
+          created_at, updated_at
+        )
+        OUTPUT INSERTED.id
+        VALUES (
+          @employee_id, @resignation_id, @exit_formality_id,
+          @like_most, @improve_company,
+          @employee_signature, @employee_signature_date,
+          @hr_signature, @hr_signature_date,
+          @manager_signature, @manager_signature_date,
+          DATEADD(MINUTE, 330, GETUTCDATE()), DATEADD(MINUTE, 330, GETUTCDATE())
+        )
+      `);
+      const newId = result.recordset[0].id;
+      res.status(201).json({ success: true, message: 'Exit feedback record created successfully.', id: newId });
+    }
+  } catch (err) {
+    Log.error('ExitFeedback', 'Failed to submit exit feedback', err.message);
+    res.status(500).json({ error: 'Failed to process exit feedback submission' });
+  }
+});
+
+/**
+ * 56.7b GET: Fetch authenticated user's own exit feedback
+ */
+app.get('/api/exit-feedback/my', verifyToken, async (req, res) => {
+  const userId = req.user.id;
+  try {
+    const pool = await getPool();
+    const result = await pool.request()
+      .input('userId', sql.Int, userId)
+      .query('SELECT * FROM exit_feedback WHERE employee_id = @userId');
+
+    if (result.recordset.length > 0) {
+      return res.json(result.recordset[0]);
+    }
+
+    // Default template if no record exists
+    let resolvedResignationId = null;
+    const resRes = await pool.request()
+      .input('empId', sql.Int, userId)
+      .query('SELECT TOP 1 id FROM resignations WHERE employee_id = @empId ORDER BY created_at DESC');
+    if (resRes.recordset.length > 0) {
+      resolvedResignationId = resRes.recordset[0].id;
+    }
+
+    let resolvedExitFormalityId = null;
+    const efRes = await pool.request()
+      .input('empId', sql.Int, userId)
+      .query('SELECT TOP 1 id FROM exit_formalities WHERE employee_id = @empId ORDER BY created_at DESC');
+    if (efRes.recordset.length > 0) {
+      resolvedExitFormalityId = efRes.recordset[0].id;
+    }
+
+    res.json({
+      id: null,
+      employee_id: userId,
+      resignation_id: resolvedResignationId,
+      exit_formality_id: resolvedExitFormalityId,
+      like_most: null,
+      improve_company: null,
+      employee_signature: req.user.name || null,
+      employee_signature_date: null,
+      hr_signature: null,
+      hr_signature_date: null,
+      manager_signature: null,
+      manager_signature_date: null
+    });
+  } catch (err) {
+    Log.error('ExitFeedback', 'Failed to fetch personal exit feedback', err.message);
+    res.status(500).json({ error: 'Failed to fetch personal exit feedback' });
+  }
+});
+
+/**
+ * 56.7c GET: Fetch exit feedback of a specific employee (HR/Admin/Reporting Manager)
+ */
+app.get('/api/exit-feedback/employee/:id', verifyToken, async (req, res) => {
+  const targetId = parseInt(req.params.id);
+  if (isNaN(targetId)) {
+    return res.status(400).json({ error: 'Invalid employee ID' });
+  }
+
+  const role = (req.user.role || '').toLowerCase();
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo');
+
+  try {
+    const pool = await getPool();
+    
+    // Check if the requester is reporting manager
+    let isManager = false;
+    if (!isAdmin && targetId !== req.user.id) {
+      const managerRes = await pool.request()
+        .input('empId', sql.Int, targetId)
+        .query('SELECT reporting_manager_id FROM users WHERE id = @empId');
+      if (managerRes.recordset.length > 0 && managerRes.recordset[0].reporting_manager_id === req.user.id) {
+        isManager = true;
+      }
+    }
+
+    if (!isAdmin && targetId !== req.user.id && !isManager) {
+      return res.status(403).json({ error: 'Unauthorized to view this record' });
+    }
+
+    const result = await pool.request()
+      .input('empId', sql.Int, targetId)
+      .query('SELECT * FROM exit_feedback WHERE employee_id = @empId');
+
+    if (result.recordset.length === 0) {
+      return res.status(404).json({ error: 'Exit feedback not found for this employee' });
+    }
+
+    res.json(result.recordset[0]);
+  } catch (err) {
+    Log.error('ExitFeedback', 'Failed to fetch employee exit feedback', err.message);
+    res.status(500).json({ error: 'Failed to fetch employee exit feedback' });
+  }
+});
+
+/**
+ * 56.7d GET: Fetch all exit feedbacks (Admin/HR/PM only)
+ */
+app.get('/api/admin/exit-feedback', verifyToken, async (req, res) => {
+  const role = (req.user.role || '').toLowerCase();
+  const isAuthorized = role.includes('hr') || role.includes('human resource') || role.includes('ceo') || role.includes('admin') || role.includes('manager') || role.includes('lead') || role.includes('pm');
+
+  if (!isAuthorized) {
+    return res.status(403).json({ error: 'Unauthorized: Access denied.' });
+  }
+
+  try {
+    const pool = await getPool();
+    const result = await pool.request().query(`
+      SELECT ef.*, u.name as employee_name, u.team as department, u.role as designation
+      FROM exit_feedback ef
+      JOIN users u ON ef.employee_id = u.id
+      ORDER BY ef.created_at DESC
+    `);
+    res.json(result.recordset);
+  } catch (err) {
+    Log.error('ExitFeedback', 'Failed to fetch administrative exit feedback list', err.message);
+    res.status(500).json({ error: 'Failed to extract exit feedback list' });
+  }
+});
+
+/**
+ * 56.7e PUT: Update/Review exit feedback (Admin/HR/Manager/Self)
+ */
+app.put('/api/exit-feedback/:id', verifyToken, async (req, res) => {
+  const recordId = parseInt(req.params.id);
+  if (isNaN(recordId)) {
+    return res.status(400).json({ error: 'Invalid record ID' });
+  }
+
+  const role = (req.user.role || '').toLowerCase();
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('project');
+
+  try {
+    const pool = await getPool();
+
+    // Check if record exists
+    const verifyResult = await pool.request()
+      .input('id', sql.Int, recordId)
+      .query('SELECT employee_id FROM exit_feedback WHERE id = @id');
+    
+    if (verifyResult.recordset.length === 0) {
+      return res.status(404).json({ error: 'Exit feedback record not found' });
+    }
+
+    const employeeId = verifyResult.recordset[0].employee_id;
+
+    // Check if requester is reporting manager
+    let isManager = false;
+    if (!isAdmin && employeeId !== req.user.id) {
+      const managerRes = await pool.request()
+        .input('empId', sql.Int, employeeId)
+        .query('SELECT reporting_manager_id FROM users WHERE id = @empId');
+      if (managerRes.recordset.length > 0 && managerRes.recordset[0].reporting_manager_id === req.user.id) {
+        isManager = true;
+      }
+    }
+
+    if (!isAdmin && employeeId !== req.user.id && !isManager) {
+      return res.status(403).json({ error: 'Unauthorized to modify this record' });
+    }
+
+    const {
+      like_most, improve_company,
+      employee_signature, employee_signature_date,
+      hr_signature, hr_signature_date,
+      manager_signature, manager_signature_date
+    } = req.body;
+
+    const request = pool.request();
+    request.input('id', sql.Int, recordId);
+
+    let sets = ["updated_at = DATEADD(MINUTE, 330, GETUTCDATE())"];
+
+    if (like_most !== undefined) {
+      sets.push("like_most = @like_most");
+      request.input('like_most', sql.NVarChar, like_most || null);
+    }
+    if (improve_company !== undefined) {
+      sets.push("improve_company = @improve_company");
+      request.input('improve_company', sql.NVarChar, improve_company || null);
+    }
+    if (employee_signature !== undefined) {
+      sets.push("employee_signature = @employee_signature");
+      request.input('employee_signature', sql.NVarChar, employee_signature || null);
+    }
+    if (employee_signature_date !== undefined) {
+      sets.push("employee_signature_date = @employee_signature_date");
+      const _esd = (employee_signature_date && String(employee_signature_date).trim()) ? new Date(employee_signature_date) : null;
+      request.input('employee_signature_date', sql.Date, _esd && !isNaN(_esd) ? _esd : null);
+    }
+
+    // Secured fields (only manager/admin/HR can edit)
+    if (isAdmin || isManager) {
+      if (hr_signature !== undefined) {
+        sets.push("hr_signature = @hr_signature");
+        request.input('hr_signature', sql.NVarChar, hr_signature || null);
+      }
+      if (hr_signature_date !== undefined) {
+        sets.push("hr_signature_date = @hr_signature_date");
+        const _hsd = (hr_signature_date && String(hr_signature_date).trim()) ? new Date(hr_signature_date) : null;
+        request.input('hr_signature_date', sql.Date, _hsd && !isNaN(_hsd) ? _hsd : null);
+      }
+      if (manager_signature !== undefined) {
+        sets.push("manager_signature = @manager_signature");
+        request.input('manager_signature', sql.NVarChar, manager_signature || null);
+      }
+      if (manager_signature_date !== undefined) {
+        sets.push("manager_signature_date = @manager_signature_date");
+        const _msd = (manager_signature_date && String(manager_signature_date).trim()) ? new Date(manager_signature_date) : null;
+        request.input('manager_signature_date', sql.Date, _msd && !isNaN(_msd) ? _msd : null);
+      }
+    }
+
+    const query = `UPDATE exit_feedback SET ${sets.join(', ')} WHERE id = @id`;
+    await request.query(query);
+    res.json({ success: true, message: 'Exit feedback record updated successfully.' });
+  } catch (err) {
+    Log.error('ExitFeedback', 'Failed to update exit feedback record', err.message);
+    res.status(500).json({ error: 'Failed to update exit feedback record' });
+  }
+});
+
+/**
+ * 56.7f PUT: Update exit feedback by employee_id (no record ID required)
+ * Used by HR/PM/Manager who edit via employee context without knowing the record ID.
+ */
+app.put('/api/exit-feedback', verifyToken, async (req, res) => {
+  const role = (req.user.role || '').toLowerCase();
+  const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('project');
+
+  // Target employee: from body (HR/PM editing someone else) or self
+  const targetEmployeeId = req.body.employee_id ? parseInt(req.body.employee_id) : req.user.id;
+  if (isNaN(targetEmployeeId)) {
+    return res.status(400).json({ error: 'Invalid employee ID' });
+  }
+
+  try {
+    const pool = await getPool();
+
+    // Resolve record ID from employee_id
+    const existing = await pool.request()
+      .input('empId', sql.Int, targetEmployeeId)
+      .query('SELECT id, employee_id FROM exit_feedback WHERE employee_id = @empId');
+
+    if (existing.recordset.length === 0) {
+      return res.status(404).json({ error: 'Exit feedback record not found for this employee' });
+    }
+
+    const recordId = existing.recordset[0].id;
+    const employeeId = existing.recordset[0].employee_id;
+
+    // Check if requester is reporting manager
+    let isManager = false;
+    if (!isAdmin && employeeId !== req.user.id) {
+      const managerRes = await pool.request()
+        .input('empId', sql.Int, employeeId)
+        .query('SELECT reporting_manager_id FROM users WHERE id = @empId');
+      if (managerRes.recordset.length > 0 && managerRes.recordset[0].reporting_manager_id === req.user.id) {
+        isManager = true;
+      }
+    }
+
+    if (!isAdmin && employeeId !== req.user.id && !isManager) {
+      return res.status(403).json({ error: 'Unauthorized to modify this record' });
+    }
+
+    const {
+      like_most, improve_company,
+      employee_signature, employee_signature_date,
+      hr_signature, hr_signature_date,
+      manager_signature, manager_signature_date
+    } = req.body;
+
+    const request = pool.request();
+    request.input('id', sql.Int, recordId);
+
+    let sets = ["updated_at = DATEADD(MINUTE, 330, GETUTCDATE())"];
+
+    if (like_most !== undefined) {
+      sets.push("like_most = @like_most");
+      request.input('like_most', sql.NVarChar, like_most || null);
+    }
+    if (improve_company !== undefined) {
+      sets.push("improve_company = @improve_company");
+      request.input('improve_company', sql.NVarChar, improve_company || null);
+    }
+    if (employee_signature !== undefined) {
+      sets.push("employee_signature = @employee_signature");
+      request.input('employee_signature', sql.NVarChar, employee_signature || null);
+    }
+    if (employee_signature_date !== undefined) {
+      sets.push("employee_signature_date = @employee_signature_date");
+      const _esd2 = (employee_signature_date && String(employee_signature_date).trim()) ? new Date(employee_signature_date) : null;
+      request.input('employee_signature_date', sql.Date, _esd2 && !isNaN(_esd2) ? _esd2 : null);
+    }
+
+    // Secured fields (only manager/admin/HR/PM can edit)
+    if (isAdmin || isManager) {
+      if (hr_signature !== undefined) {
+        sets.push("hr_signature = @hr_signature");
+        request.input('hr_signature', sql.NVarChar, hr_signature || null);
+      }
+      if (hr_signature_date !== undefined) {
+        sets.push("hr_signature_date = @hr_signature_date");
+        const _hsd2 = (hr_signature_date && String(hr_signature_date).trim()) ? new Date(hr_signature_date) : null;
+        request.input('hr_signature_date', sql.Date, _hsd2 && !isNaN(_hsd2) ? _hsd2 : null);
+      }
+      if (manager_signature !== undefined) {
+        sets.push("manager_signature = @manager_signature");
+        request.input('manager_signature', sql.NVarChar, manager_signature || null);
+      }
+      if (manager_signature_date !== undefined) {
+        sets.push("manager_signature_date = @manager_signature_date");
+        const _msd2 = (manager_signature_date && String(manager_signature_date).trim()) ? new Date(manager_signature_date) : null;
+        request.input('manager_signature_date', sql.Date, _msd2 && !isNaN(_msd2) ? _msd2 : null);
+      }
+    }
+
+    const query = `UPDATE exit_feedback SET ${sets.join(', ')} WHERE id = @id`;
+    await request.query(query);
+    res.json({ success: true, message: 'Exit feedback record updated successfully.', id: recordId });
+  } catch (err) {
+    Log.error('ExitFeedback', 'Failed to update exit feedback record (no-id route)', err.message);
+    res.status(500).json({ error: 'Failed to update exit feedback record' });
   }
 });
 
@@ -17575,7 +19410,7 @@ app.get('/api/resignations', verifyToken, async (req, res) => {
 // PUT: Update resignation status or remarks (Approval/Rejection)
 app.put('/api/resignations/:id', verifyToken, async (req, res) => {
   const { id } = req.params;
-  const { status, hr_status, pm_status, reporting_manager_remark, project_manager_remark, hr_remark, last_working_day } = req.body;
+  const { status, hr_status, pm_status, reporting_manager_remark, project_manager_remark, hr_remark, last_working_day, notice_period_reason_by_pm, notice_period_from_date, notice_period_to_date, reviewed_by_tl, notice_period_applicable } = req.body;
 
   try {
     const pool = await getPool();
@@ -17639,6 +19474,26 @@ app.put('/api/resignations/:id', verifyToken, async (req, res) => {
       if (last_working_day) {
         updates.push('last_working_day = @lwd');
         request.input('lwd', sql.Date, last_working_day);
+      }
+      if (notice_period_reason_by_pm !== undefined) {
+        updates.push('notice_period_reason_by_pm = @noticePeriodReasonByPm');
+        request.input('noticePeriodReasonByPm', sql.NVarChar, notice_period_reason_by_pm || null);
+      }
+      if (notice_period_from_date !== undefined) {
+        updates.push('notice_period_from_date = @noticePeriodFromDate');
+        request.input('noticePeriodFromDate', sql.Date, notice_period_from_date || null);
+      }
+      if (notice_period_to_date !== undefined) {
+        updates.push('notice_period_to_date = @noticePeriodToDate');
+        request.input('noticePeriodToDate', sql.Date, notice_period_to_date || null);
+      }
+      if (reviewed_by_tl !== undefined) {
+        updates.push('reviewed_by_tl = @reviewedByTl');
+        request.input('reviewedByTl', sql.NVarChar, reviewed_by_tl || null);
+      }
+      if (notice_period_applicable !== undefined) {
+        updates.push('notice_period_applicable = @noticePeriodApplicable');
+        request.input('noticePeriodApplicable', sql.NVarChar, notice_period_applicable || null);
       }
 
       if (updates.length > 1) {
@@ -18490,6 +20345,61 @@ getPool().then(async (pool) => {
   app.listen(PORT, '0.0.0.0', () => {
     Log.ready(`System operational on port ${PORT}`);
   });
+
+  // --- STARTUP CATCH-UP ATTENDANCE SYNC ---
+  // Runs once on primary instance startup. Detects missed days (e.g., server was down over a
+  // weekend) by checking the last synced date in attendance_logs, then backfills all missed days.
+  // MINIMUM of 3 days is always synced to cover the Friday→Saturday→Sunday→Monday gap.
+  if (isPrimaryNode) {
+    setTimeout(async () => {
+      try {
+        console.log('[STARTUP SYNC] Checking for missed attendance days...');
+        const syncPool = await getPool();
+
+        // Find the most recent punch_date that was synced via the biometric terminal
+        const lastSyncResult = await syncPool.request().query(`
+          SELECT MAX(punch_date) AS last_sync_date
+          FROM attendance_logs
+          WHERE punchin_location = 'Biometric Terminal' OR punchout_location = 'Biometric Terminal'
+        `);
+
+        const lastSyncDate = lastSyncResult.recordset[0]?.last_sync_date;
+
+        if (!lastSyncDate) {
+          console.log('[STARTUP SYNC] No previous sync found. Running 3-day import.');
+          importAttendance(3).catch(err => console.error('[STARTUP SYNC ERROR]:', err.message));
+          return;
+        }
+
+        // Calculate how many calendar days have passed since last sync (in IST)
+        const nowIST = new Date(Date.now() + (330 * 60 * 1000));
+        const todayIST = new Date(nowIST.toISOString().split('T')[0]);
+        const lastDate = new Date(lastSyncDate);
+        const lastDateIST = new Date(lastDate.toISOString().split('T')[0]);
+
+        const msPerDay = 24 * 60 * 60 * 1000;
+        const daysMissed = Math.round((todayIST - lastDateIST) / msPerDay);
+
+        // Always fetch at minimum 3 days so that a Monday startup catches Saturday even
+        // when Sunday's WO records exist (making MAX(punch_date) = yesterday, not Saturday).
+        // Cap at 14 days to avoid excessive API load.
+        const daysToFetch = Math.min(Math.max(daysMissed + 1, 3), 14);
+
+        if (daysMissed <= 1) {
+          console.log(`[STARTUP SYNC] ✅ Up-to-date. Running ${daysToFetch}-day refresh to cover any weekend gaps...`);
+        } else {
+          console.log(`[STARTUP SYNC] ⚠️  Server was down! Last sync: ${lastDateIST.toISOString().split('T')[0]}. Backfilling ${daysToFetch} days...`);
+        }
+        importAttendance(daysToFetch).catch(err => console.error('[STARTUP SYNC ERROR]:', err.message));
+
+      } catch (err) {
+        console.error('[STARTUP SYNC ERROR] Could not determine missed days:', err.message);
+        // Fallback: run 3-day sync
+        importAttendance(3).catch(e => console.error('[STARTUP SYNC FALLBACK ERROR]:', e.message));
+      }
+    }, 5000); // 5-second delay to let migrations complete first
+  }
+
 }).catch(err => {
   console.error('\n❌ FATAL: Backend failed to start due to database connectivity issues.');
   console.error('❌ Error Details:', err.message);
