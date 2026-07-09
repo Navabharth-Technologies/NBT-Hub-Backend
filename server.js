@@ -15826,7 +15826,10 @@ app.get(['/api/resignations/team', '/api/resignations/team/:userId'], verifyToke
         SELECT r.*, u.name as employee_name, u.role as employee_role, u.team
         FROM resignations r
         JOIN users u ON r.employee_id = u.id
-        WHERE u.reporting_manager_id = @managerId
+        WHERE (
+          u.reporting_manager_id = @managerId
+          OR u.reporting_manager_id IN (SELECT id FROM users WHERE reporting_manager_id = @managerId)
+        )
         ORDER BY r.created_at DESC
       `);
     const formatted = result.recordset.map(row => ({
@@ -19359,8 +19362,12 @@ app.get('/api/resignations', verifyToken, async (req, res) => {
     // --- Role-Based Security Filter ---
     if (!isAdmin) {
       if (isManager) {
-        // Managers/Leads: See their direct team members OR their own resignation
-        query += ' AND (u.reporting_manager_id = @currentUserId OR r.employee_id = @currentUserId)';
+        // Managers/Leads: See their direct team members, hierarchy subordinates, or their own resignation
+        query += ` AND (
+          u.reporting_manager_id = @currentUserId 
+          OR u.reporting_manager_id IN (SELECT id FROM users WHERE reporting_manager_id = @currentUserId)
+          OR r.employee_id = @currentUserId
+        )`;
         request.input('currentUserId', sql.Int, req.user.id);
       } else {
         // Regular Employees: See only their own resignation

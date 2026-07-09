@@ -5,10 +5,9 @@ const dbConfig = {
     password: process.env.DB_PASSWORD || 'sa#7744',
     server: process.env.DB_SERVER || 'localhost',
     database: process.env.DB_NAME || 'NBT Hub',
-    port: 1433,
     options: {
-        encrypt: false,
-        trustServerCertificate: true,
+        encrypt: process.env.DB_ENCRYPT === 'true',
+        trustServerCertificate: process.env.DB_TRUST_SERVER_CERT !== 'false', // Default to true
         enableArithAbort: true,
         requestTimeout: 60000,    // Increased to 60s
         connectTimeout: 30000, // Fixed property name for Tedious driver
@@ -21,6 +20,17 @@ const dbConfig = {
         acquireTimeoutMillis: 60000 // Queue wait time
     }
 };
+
+if (process.env.DB_PORT) {
+    dbConfig.port = parseInt(process.env.DB_PORT, 10);
+} else if (!process.env.DB_INSTANCE) {
+    // Default port if no instance name is provided
+    dbConfig.port = 1433;
+}
+
+if (process.env.DB_INSTANCE) {
+    dbConfig.options.instanceName = process.env.DB_INSTANCE;
+}
 
 let pool = null;
 let poolPromise = null;
