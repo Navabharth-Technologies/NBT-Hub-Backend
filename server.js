@@ -14259,7 +14259,7 @@ app.get(['/api/rewards/leaderboard', '/api/quizzes/leaderboard', '/api/admin/rew
         SELECT employee_id, total_points as points, 0 as is_award FROM quiz_completions WITH (NOLOCK) ${quizWhere}
       ),
       AllParticipants AS (
-        SELECT id, name, role, team, profile_picture FROM users WITH (NOLOCK)
+        SELECT id, name, role, team, profile_picture FROM users WITH (NOLOCK) WHERE ISNULL(status, 'Active') != 'Resigned'
         UNION ALL
         SELECT id, name, role, 'New Joinee' as team, profile_picture FROM new_joinees WITH (NOLOCK)
         UNION ALL
@@ -14403,7 +14403,7 @@ app.get('/api/employees/leaderboard/all', verifyToken, async (req, res) => {
         SELECT employee_id, total_points as points, 0 as is_award FROM quiz_completions WITH (NOLOCK)
       ),
       AllParticipants AS (
-        SELECT id, name, role, team, profile_picture FROM users WITH (NOLOCK)
+        SELECT id, name, role, team, profile_picture FROM users WITH (NOLOCK) WHERE ISNULL(status, 'Active') != 'Resigned'
         UNION ALL
         SELECT id, name, role, 'New Joinee' as team, profile_picture FROM new_joinees WITH (NOLOCK)
         UNION ALL
@@ -14528,7 +14528,7 @@ app.get('/api/public/employees/leaderboard/all', async (req, res) => {
 
     const query = `
       WITH AllParticipants AS (
-        SELECT id, name, role, team, profile_picture FROM users WITH (NOLOCK)
+        SELECT id, name, role, team, profile_picture FROM users WITH (NOLOCK) WHERE ISNULL(status, 'Active') != 'Resigned'
         UNION ALL
         SELECT id, name, role, 'New Joinee' as team, profile_picture FROM new_joinees WITH (NOLOCK)
         UNION ALL
@@ -15588,6 +15588,7 @@ app.get(['/api/fun-quizzes/leaderboard', '/api/quizzes/leaderboard/daily'], veri
         FROM quiz_attempts qa
         JOIN fun_quizzes fq ON qa.quiz_id = fq.id
         WHERE qa.is_correct = 1
+        AND qa.employee_id NOT IN (SELECT id FROM users WHERE status = 'Resigned')
         AND CAST(qa.created_at AS DATE) = CAST(DATEADD(MINUTE, 330, GETUTCDATE()) AS DATE)
         GROUP BY qa.employee_id
         ORDER BY points DESC
