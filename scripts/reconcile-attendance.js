@@ -107,18 +107,18 @@ async function calculateUserMonthlyStats(userId, month, year) {
             return acc;
         }, {});
 
-        const joiningDate = new Date(user.joining_date);
+        const jDate = new Date(user.joining_date);
+        const joiningDate = new Date(Date.UTC(jDate.getUTCFullYear(), jDate.getUTCMonth(), jDate.getUTCDate()));
         const probationEndDate = new Date(joiningDate);
-        probationEndDate.setDate(joiningDate.getDate() + 90);
+        probationEndDate.setUTCDate(joiningDate.getUTCDate() + 90);
         
         const today = new Date();
-        const auditEnd = new Date(today);
-        auditEnd.setDate(today.getDate() - 1);
+        const auditEnd = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() - 1));
 
         // Accrual Calculation (1 day per month post-90 days)
         let totalAccrued = 0;
         if (today > probationEndDate) {
-            const monthsDiff = (today.getFullYear() - probationEndDate.getFullYear()) * 12 + (today.getMonth() - probationEndDate.getMonth());
+            const monthsDiff = (today.getUTCFullYear() - probationEndDate.getUTCFullYear()) * 12 + (today.getUTCMonth() - probationEndDate.getUTCMonth());
             totalAccrued = Math.max(0, monthsDiff);
         }
 
@@ -134,11 +134,11 @@ async function calculateUserMonthlyStats(userId, month, year) {
         const ABSENT_DEDUCTION_START = new Date('2026-04-01');
 
         // Historical Audit Loop (calculates leaves used/unaccounted gaps since joining)
-        for (let d = new Date(joiningDate); d <= auditEnd; d.setDate(d.getDate() + 1)) {
+        for (let d = new Date(joiningDate); d <= auditEnd; d.setUTCDate(d.getUTCDate() + 1)) {
             const dateStr = d.toISOString().split('T')[0];
             const dayStatus = logMap[dateStr];
 
-            if (d.getDay() === 0) continue; 
+            if (d.getUTCDay() === 0) continue; 
             if (holidays.includes(dateStr)) continue;
 
             const isOnApprovedLeave = userLeaves.some(l => {
@@ -176,13 +176,13 @@ async function calculateUserMonthlyStats(userId, month, year) {
         let totalOTMinutes = 0;
 
         for (let day = 1; day <= totalDaysInTargetMonth; day++) {
-            const d = new Date(targetYear, targetMonth - 1, day);
+            const d = new Date(Date.UTC(targetYear, targetMonth - 1, day));
             const dateStr = d.toISOString().split('T')[0];
             const dayStatus = logMap[dateStr];
             const dayLog = userLogs.find(l => l.punch_date && l.punch_date.toISOString().split('T')[0] === dateStr);
 
             // Count Weekly Offs (Sundays or specifically marked 'WO' in logs)
-            if (d.getDay() === 0 || dayStatus === 'WO') {
+            if (d.getUTCDay() === 0 || dayStatus === 'WO') {
                 monthlyWeeklyOff++;
             }
 
@@ -207,12 +207,12 @@ async function calculateUserMonthlyStats(userId, month, year) {
                 if (dayStatus === 'Half Day') {
                     monthlyAbsents += 0.5;
                 }
-            } else if (!isOnApprovedLeave && d.getDay() !== 0 && !holidays.includes(dateStr)) {
+            } else if (!isOnApprovedLeave && d.getUTCDay() !== 0 && !holidays.includes(dateStr)) {
                 // If it is in the past or present, count as absent if no log and no leave/holiday/weekly off
                 const todayOnlyDate = new Date();
-                todayOnlyDate.setHours(0,0,0,0);
+                todayOnlyDate.setUTCHours(0,0,0,0);
                 const dOnlyDate = new Date(d);
-                dOnlyDate.setHours(0,0,0,0);
+                dOnlyDate.setUTCHours(0,0,0,0);
                 if (dOnlyDate <= todayOnlyDate) {
                     monthlyAbsents++;
                 }

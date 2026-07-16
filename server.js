@@ -2427,7 +2427,7 @@ app.get('/api/subordinates', verifyToken, async (req, res) => {
     let pool = await getPool();
     const result = await pool.request()
       .input('userId', sql.Int, userId)
-      .query('SELECT id, name, role, profile_picture, team FROM users WHERE reporting_manager_id = @userId');
+      .query("SELECT id, name, role, profile_picture, team, status FROM users WHERE reporting_manager_id = @userId AND status = 'Active'");
     res.json(result.recordset);
   } catch (err) {
     console.error('Failed to fetch subordinates:', err);
@@ -2441,7 +2441,7 @@ app.get('/api/subordinates/:userId', verifyToken, async (req, res) => {
     let pool = await getPool();
     const result = await pool.request()
       .input('userId', sql.Int, userId)
-      .query('SELECT id, name, role, profile_picture, team FROM users WHERE reporting_manager_id = @userId');
+      .query("SELECT id, name, role, profile_picture, team, status FROM users WHERE reporting_manager_id = @userId AND status = 'Active'");
     res.json(result.recordset);
   } catch (err) {
     console.error('Failed to fetch subordinates:', err);
@@ -5989,11 +5989,13 @@ const fetchBirthdaysAsJSON = async (req, res) => {
     const result = await pool.request().query(`
       WITH UserBirthdays AS (
         SELECT id, name, role, team, date_of_birth,
-               TRY_CONVERT(DATE, 
-                 CASE 
-                   WHEN date_of_birth LIKE '%/%/%' THEN date_of_birth 
-                   ELSE NULL 
-                 END, 103) as dob
+               COALESCE(
+                 TRY_CONVERT(DATE, date_of_birth, 103), -- dd/mm/yyyy
+                 TRY_CONVERT(DATE, date_of_birth, 105), -- dd-mm-yyyy
+                 TRY_CONVERT(DATE, date_of_birth, 120), -- yyyy-mm-dd hh:mi:ss
+                 TRY_CONVERT(DATE, date_of_birth, 23),  -- yyyy-mm-dd
+                 TRY_CONVERT(DATE, REPLACE(date_of_birth, '-', '/'), 103)
+               ) as dob
         FROM users WITH (NOLOCK)
         WHERE date_of_birth IS NOT NULL AND date_of_birth <> '' AND status = 'Active'
       ),
@@ -6146,7 +6148,7 @@ app.get('/api/users', async (req, res) => {
 
       try {
         let pool = await getPool();
-        const result = await pool.request().query("SELECT id, name, email, role, team, joining_date FROM users WITH (NOLOCK) WHERE status = 'Active' ORDER BY name ASC");
+        const result = await pool.request().query("SELECT u.id, u.name, u.email, u.role, ep.designation, u.team, u.joining_date FROM users u WITH (NOLOCK) LEFT JOIN employee_profiles ep WITH (NOLOCK) ON u.id = ep.employee_id WHERE u.status = 'Active' ORDER BY u.name ASC");
         allUsersCache = result.recordset;
         lastAllUsersCacheUpdate = now;
         return res.json(allUsersCache);
@@ -6157,7 +6159,7 @@ app.get('/api/users', async (req, res) => {
     } else {
       try {
         let pool = await getPool();
-        const result = await pool.request().query("SELECT id, name, email, role, team, joining_date FROM users WITH (NOLOCK) ORDER BY name ASC");
+        const result = await pool.request().query("SELECT u.id, u.name, u.email, u.role, ep.designation, u.team, u.joining_date FROM users u WITH (NOLOCK) LEFT JOIN employee_profiles ep WITH (NOLOCK) ON u.id = ep.employee_id ORDER BY u.name ASC");
         return res.json(result.recordset);
       } catch (err) {
         return res.status(500).json({ error: 'Failed to fetch users' });
@@ -6175,9 +6177,10 @@ app.get('/api/users', async (req, res) => {
 
     let countQuery = 'SELECT COUNT(*) as total FROM users WITH (NOLOCK)';
     let selectQuery = `
-      SELECT id, name, email, role, team, joining_date 
-      FROM users WITH (NOLOCK) 
-      ORDER BY name ASC 
+      SELECT u.id, u.name, u.email, u.role, ep.designation, u.team, u.joining_date 
+      FROM users u WITH (NOLOCK) 
+      LEFT JOIN employee_profiles ep WITH (NOLOCK) ON u.id = ep.employee_id 
+      ORDER BY u.name ASC 
       OFFSET @offset ROWS 
       FETCH NEXT @limit ROWS ONLY
     `;
@@ -6185,10 +6188,11 @@ app.get('/api/users', async (req, res) => {
     if (!includeInactive) {
       countQuery = "SELECT COUNT(*) as total FROM users WITH (NOLOCK) WHERE status = 'Active'";
       selectQuery = `
-        SELECT id, name, email, role, team, joining_date 
-        FROM users WITH (NOLOCK) 
-        WHERE status = 'Active'
-        ORDER BY name ASC 
+        SELECT u.id, u.name, u.email, u.role, ep.designation, u.team, u.joining_date 
+        FROM users u WITH (NOLOCK) 
+        LEFT JOIN employee_profiles ep WITH (NOLOCK) ON u.id = ep.employee_id 
+        WHERE u.status = 'Active'
+        ORDER BY u.name ASC 
         OFFSET @offset ROWS 
         FETCH NEXT @limit ROWS ONLY
       `;
@@ -8397,18 +8401,22 @@ app.get('/api/threads/:id/reactors', async (req, res) => {
 
   if (!id) return res.status(400).json({ error: 'Thread ID required' });
 
-  // Reaction normalization map (consistent with handleReaction)
-  const reactionMap = {
-    'â¤ï¸': 'heart', 'heart': 'heart', 'love': 'heart',
-    'ðŸ‘': 'thumbsup', 'thumbsup': 'thumbsup', 'thumb': 'thumbsup', 'like': 'like',
-    'ðŸ˜®': 'shocked', 'shocked': 'shocked', 'wow': 'shocked',
-    'ðŸ˜‚': 'laugh', 'laugh': 'laugh', 'haha': 'laugh',
-    'ðŸ”¥': 'fire', 'fire': 'fire', 'lit': 'fire',
-    'ðŸ‘': 'clap', 'clap': 'clap', 'clapping': 'clap',
-    'ðŸŽ‚': 'cake', 'cake': 'cake', 'birthday': 'cake'
+  // Reaction normalization map + emoji codepoint resolver (consistent with handleReaction)
+  const reactionMap = { 'heart': 'heart', 'love': 'heart', 'thumbsup': 'thumbsup', 'thumb': 'thumbsup', 'like': 'thumbsup', 'shocked': 'shocked', 'wow': 'shocked', 'laugh': 'laugh', 'haha': 'laugh', 'fire': 'fire', 'lit': 'fire', 'clap': 'clap', 'clapping': 'clap', 'cake': 'cake', 'birthday': 'cake' };
+  const resolveReactionType = (raw) => {
+    if (!raw) return null;
+    if (reactionMap[raw]) return reactionMap[raw];
+    const cp = raw.codePointAt(0);
+    if (cp === 0x2764 || cp === 0x2765) return 'heart';
+    if (cp === 0x1F44D) return 'thumbsup';
+    if (cp === 0x1F62E) return 'shocked';
+    if (cp === 0x1F602) return 'laugh';
+    if (cp === 0x1F525) return 'fire';
+    if (cp === 0x1F44F) return 'clap';
+    if (cp === 0x1F382) return 'cake';
+    return raw;
   };
-
-  const normalizedType = rawType ? (reactionMap[rawType] || rawType) : null;
+  const normalizedType = resolveReactionType(rawType);
 
   try {
     const pool = await getPool();
@@ -9108,6 +9116,40 @@ app.put(['/api/notifications/:id/read', '/api/notifications/:id'], verifyToken, 
   } catch (err) {
     console.error('[SINGLE NOTIFICATION READ PUT ERROR]', err);
     res.status(500).json({ error: 'Failed to update notification' });
+  }
+});
+
+// DELETE: Delete a notification by ID
+app.delete('/api/notifications/:id', verifyToken, async (req, res) => {
+  const { id } = req.params;
+  const parsedId = parseInt(id);
+  if (isNaN(parsedId)) return res.status(400).json({ error: 'Invalid notification ID' });
+
+  try {
+    const pool = await getPool();
+
+    // First fetch the notification to verify ownership/existence
+    const findRes = await pool.request()
+      .input('id', sql.Int, parsedId)
+      .query('SELECT target_user_id FROM notifications WITH (NOLOCK) WHERE id = @id');
+
+    if (findRes.recordset.length === 0) {
+      return res.status(404).json({ error: 'Notification not found' });
+    }
+
+    // Authorization: Only the target user themselves or an Admin can delete it
+    if (req.user.role !== 'Admin' && req.user.id !== findRes.recordset[0].target_user_id) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    await pool.request()
+      .input('id', sql.Int, parsedId)
+      .query('DELETE FROM notifications WHERE id = @id');
+
+    res.json({ success: true, message: 'Notification deleted successfully' });
+  } catch (err) {
+    console.error('[SINGLE NOTIFICATION DELETE ERROR]', err);
+    res.status(500).json({ error: 'Failed to delete notification' });
   }
 });
 
@@ -11094,7 +11136,13 @@ app.post('/api/newjoinee-courses', verifyToken, memoryUpload.fields([{ name: 'pd
   if (!title) return res.status(400).json({ error: 'Course title is required' });
 
   // Normalize inputs
-  const finalDeadline = (deadline && String(deadline).trim() !== '') ? deadline : null;
+  let finalDeadline = null;
+  if (deadline && String(deadline).trim() !== '' && String(deadline).trim() !== 'null' && String(deadline).trim() !== 'undefined') {
+    const parsedDate = new Date(deadline);
+    if (!isNaN(parsedDate.getTime())) {
+      finalDeadline = parsedDate;
+    }
+  }
   const rawAssignedTo = assignedTo !== undefined ? assignedTo : assigned_to;
   const finalAssignedTo = (rawAssignedTo && String(rawAssignedTo).trim() !== '') ? parseInt(rawAssignedTo) : null;
   const rawUploadedBy = uploadedBy !== undefined ? uploadedBy : uploaded_by;
@@ -11168,7 +11216,17 @@ app.put('/api/newjoinee-courses/:id', verifyToken, memoryUpload.fields([{ name: 
       if (title !== undefined) { query += ', title = @title'; request.input('title', sql.NVarChar, title); }
       if (description !== undefined) { query += ', description = @description'; request.input('description', sql.NVarChar(sql.MAX), description); }
       if (category !== undefined) { query += ', category = @category'; request.input('category', sql.NVarChar, category); }
-      if (deadline !== undefined) { query += ', deadline = @deadline'; request.input('deadline', sql.Date, deadline); }
+      if (deadline !== undefined) {
+        let finalDeadline = null;
+        if (deadline && String(deadline).trim() !== '' && String(deadline).trim() !== 'null' && String(deadline).trim() !== 'undefined') {
+          const parsedDate = new Date(deadline);
+          if (!isNaN(parsedDate.getTime())) {
+            finalDeadline = parsedDate;
+          }
+        }
+        query += ', deadline = @deadline';
+        request.input('deadline', sql.Date, finalDeadline);
+      }
 
       // Handle file uploads (Migrated to Google Drive)
       if (req.files && req.files['pdf']) {
@@ -12060,9 +12118,9 @@ app.get('/api/leaves/stats/my', verifyToken, async (req, res) => {
       ...row,
       takenLeaves: row.leaves_taken,
       totalTaken: row.leaves_taken,
-      availableLeaves: row.leaves_available,
-      leaveBalance: row.leaves_available,
-      availableBalance: row.leaves_available,
+      availableLeaves: Math.max(0, row.leaves_available || 0),
+      leaveBalance: Math.max(0, row.leaves_available || 0),
+      availableBalance: Math.max(0, row.leaves_available || 0),
       halfDays: row.half_days || 0,
       monthName: monthNames[row.month - 1] || 'Unknown',
       month_name: monthNames[row.month - 1] || 'Unknown',
@@ -12323,6 +12381,7 @@ app.get('/api/leaves/balance/:userId', async (req, res) => {
 
     res.json({
       ...balanceData,
+      leave_balance: Math.max(0, balanceData.leave_balance || 0),
       isProbation
     });
   } catch (err) {
@@ -19964,6 +20023,9 @@ const initializeProfilesTable = async (providedPool) => {
           ug_pg_percentage NVARCHAR(50),
           ug_pg_markscard NVARCHAR(MAX),
           resume NVARCHAR(MAX),
+          gender NVARCHAR(50),
+          blood_group NVARCHAR(50),
+          marital_status NVARCHAR(50),
           created_at DATETIME DEFAULT GETUTCDATE(),
           updated_at DATETIME DEFAULT GETUTCDATE()
         );
@@ -20000,6 +20062,12 @@ const initializeProfilesTable = async (providedPool) => {
           ALTER TABLE employee_profiles ADD ug_pg_markscard NVARCHAR(MAX);
         IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('employee_profiles') AND name = 'resume')
           ALTER TABLE employee_profiles ADD resume NVARCHAR(MAX);
+        IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('employee_profiles') AND name = 'gender')
+          ALTER TABLE employee_profiles ADD gender NVARCHAR(50);
+        IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('employee_profiles') AND name = 'blood_group')
+          ALTER TABLE employee_profiles ADD blood_group NVARCHAR(50);
+        IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('employee_profiles') AND name = 'marital_status')
+          ALTER TABLE employee_profiles ADD marital_status NVARCHAR(50);
       END
     `);
     Log.success('Database', 'Employee Profiles table ensures/ready');
