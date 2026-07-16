@@ -2779,13 +2779,13 @@ const handleProfileGet = async (req, res) => {
       // 3C. FALLBACK: Check New Joinees table if not in core Users
       const joineeResult = await pool.request()
         .input('identifier', sql.NVarChar, identifier)
-        .query('SELECT id, name, email_id, role FROM new_joinees WHERE email_id = @identifier OR CAST(id AS NVARCHAR) = @identifier');
+        .query('SELECT id, name, email_id, role, profile_picture FROM new_joinees WHERE email_id = @identifier OR CAST(id AS NVARCHAR) = @identifier');
 
       if (joineeResult.recordset.length === 0) {
         // Final fallback: Check Interns
         const internResult = await pool.request()
           .input('identifier', sql.NVarChar, identifier)
-          .query('SELECT id, name, email, role FROM interns WHERE email = @identifier OR CAST(id AS NVARCHAR) = @identifier');
+          .query('SELECT id, name, email, role, profile_picture FROM interns WHERE email = @identifier OR CAST(id AS NVARCHAR) = @identifier');
 
         if (internResult.recordset.length === 0) {
           return res.status(404).json({ error: 'User not found in any directory' });
@@ -2811,11 +2811,12 @@ const handleProfileGet = async (req, res) => {
         id: nj.id,
         name: nj.name,
         email: nj.email_id,
-        role: 'new_joinee',
+        role: nj.role || 'new_joinee',
         userType: 'new_joinee',
         employee_id: nj.id,
         team: 'Onboarding',
         aboutMe: 'New Joinee - Profile Pending',
+        profile_picture: nj.profile_picture || null,
         rewardPoints: '0',
         quizPoints: '0',
         totalPoints: '0',
@@ -18074,9 +18075,43 @@ app.get('/api/employee-profile/my', verifyToken, async (req, res) => {
         WHERE u.id = @userId
       `);
 
-    if (result.recordset.length > 0) {
-      const profile = result.recordset[0];
+    let profile = null;
 
+    if (result.recordset.length > 0) {
+      profile = result.recordset[0];
+    } else {
+      // Fallback: Check new_joinees
+      let fallbackRes = await pool.request()
+        .input('userId', sql.Int, req.user.id)
+        .query(`
+          SELECT id as user_id, name as base_name, email_id as base_email, role as base_role, joining_date,
+                 phone_number, profile_picture, NULL as date_of_birth, 'New Joinee - Profile Pending' as about_me, 
+                 'Onboarding' as team, NULL as reporting_manager_id, NULL as reporting_manager_name,
+                 id as emp_id, role as base_designation, 'Onboarding' as base_team
+          FROM new_joinees
+          WHERE id = @userId
+        `);
+      
+      if (fallbackRes.recordset.length === 0) {
+        // Fallback: Check interns
+        fallbackRes = await pool.request()
+          .input('userId', sql.Int, req.user.id)
+          .query(`
+            SELECT id as user_id, name as base_name, email as base_email, role as base_role, NULL as joining_date,
+                   NULL as phone_number, profile_picture, NULL as date_of_birth, 'Intern' as about_me, 
+                   'Onboarding' as team, NULL as reporting_manager_id, NULL as reporting_manager_name,
+                   id as emp_id, role as base_designation, 'Onboarding' as base_team
+            FROM interns
+            WHERE id = @userId
+          `);
+      }
+
+      if (fallbackRes.recordset.length > 0) {
+        profile = fallbackRes.recordset[0];
+      }
+    }
+
+    if (profile) {
       // Fetch Assets for this employee (Check both HR ID and DB internal ID fallback)
       let assets = [];
       const assetTargetId = profile.emp_id || profile.user_id;
@@ -18090,7 +18125,7 @@ app.get('/api/employee-profile/my', verifyToken, async (req, res) => {
       profile.assets = assets;
       res.json({ success: true, data: normalizeProfile(profile) });
     } else {
-      res.status(404).json({ error: 'User not found in primary records.' });
+      res.status(404).json({ error: 'User not found in primary or onboarding records.' });
     }
   } catch (err) {
     console.error('[GET MY PROFILE ERROR]:', err);
@@ -18162,9 +18197,43 @@ app.get('/api/employee-profile/:id', verifyToken, async (req, res) => {
         WHERE u.id = @id OR e.emp_id = @id
       `);
 
-    if (result.recordset.length > 0) {
-      const profile = result.recordset[0];
+    let profile = null;
 
+    if (result.recordset.length > 0) {
+      profile = result.recordset[0];
+    } else {
+      // Fallback: Check new_joinees
+      let fallbackRes = await pool.request()
+        .input('id', sql.Int, targetId)
+        .query(`
+          SELECT id as user_id, name as base_name, email_id as base_email, role as base_role, joining_date,
+                 phone_number, profile_picture, NULL as date_of_birth, 'New Joinee - Profile Pending' as about_me, 
+                 'Onboarding' as team, NULL as reporting_manager_id, NULL as reporting_manager_name,
+                 id as emp_id, role as base_designation, 'Onboarding' as base_team
+          FROM new_joinees
+          WHERE id = @id
+        `);
+      
+      if (fallbackRes.recordset.length === 0) {
+        // Fallback: Check interns
+        fallbackRes = await pool.request()
+          .input('id', sql.Int, targetId)
+          .query(`
+            SELECT id as user_id, name as base_name, email as base_email, role as base_role, NULL as joining_date,
+                   NULL as phone_number, profile_picture, NULL as date_of_birth, 'Intern' as about_me, 
+                   'Onboarding' as team, NULL as reporting_manager_id, NULL as reporting_manager_name,
+                   id as emp_id, role as base_designation, 'Onboarding' as base_team
+            FROM interns
+            WHERE id = @id
+          `);
+      }
+
+      if (fallbackRes.recordset.length > 0) {
+        profile = fallbackRes.recordset[0];
+      }
+    }
+
+    if (profile) {
       // Authorization Enforcement
       if (!isAdmin && profile.user_id !== req.user.id) {
         return res.status(403).json({ error: 'Unauthorized: You can only view your own profile.' });
@@ -18183,7 +18252,7 @@ app.get('/api/employee-profile/:id', verifyToken, async (req, res) => {
       profile.assets = assets;
       res.json({ success: true, data: normalizeProfile(profile) });
     } else {
-      res.status(404).json({ error: 'Employee not found in primary system records.' });
+      res.status(404).json({ error: 'Employee not found in primary or onboarding records.' });
     }
   } catch (err) {
     console.error('[GET SPECIFIC PROFILE ERROR]:', err);
