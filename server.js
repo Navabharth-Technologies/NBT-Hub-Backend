@@ -1,4 +1,4 @@
-require('dotenv').config();
+﻿require('dotenv').config();
 const cron = require('node-cron');
 
 // PM2 Load Balancer / Cluster Mode Support
@@ -78,7 +78,7 @@ const sendCertificateEmail = async (toEmail, userName, courseName) => {
 
   return sendAppEmail({
     to: toEmail,
-    subject: `🎓 Certificate of Completion – ${courseName}`,
+    subject: `ðŸŽ“ Certificate of Completion â€“ ${courseName}`,
     html,
     text: `Congratulations ${userName}! You have successfully completed the "${courseName}" course. Please find your official certificate attached to this email.`,
     attachments: generatedCertBuffer ? [
@@ -92,10 +92,10 @@ const sendCertificateEmail = async (toEmail, userName, courseName) => {
 
 // --- CRITICAL ERROR LOGGING --- //
 process.on('unhandledRejection', (reason, promise) => {
-  console.error('\n🚨 [FATAL] UNHANDLED REJECTION:', reason);
+  console.error('\nðŸš¨ [FATAL] UNHANDLED REJECTION:', reason);
 });
 process.on('uncaughtException', (err) => {
-  console.error('\n🚨 [FATAL] UNCAUGHT EXCEPTION:', err.message);
+  console.error('\nðŸš¨ [FATAL] UNCAUGHT EXCEPTION:', err.message);
   console.error(err.stack);
   // Give logs time to flush before exiting
   setTimeout(() => process.exit(1), 1000);
@@ -135,19 +135,19 @@ const Log = {
     
     if (instanceId !== undefined) {
       const iColor = getInstanceColor();
-      return `\x1b[1m${iColor}● Node-${instanceId.toString().padEnd(2)}\x1b[0m \x1b[90m│\x1b[0m \x1b[37m${timeStr.padEnd(11)}\x1b[0m \x1b[90m│\x1b[0m`;
+      return `\x1b[1m${iColor}â— Node-${instanceId.toString().padEnd(2)}\x1b[0m \x1b[90mâ”‚\x1b[0m \x1b[37m${timeStr.padEnd(11)}\x1b[0m \x1b[90mâ”‚\x1b[0m`;
     }
     
-    return `\x1b[90m● System  │ ${timeStr.padEnd(11)} │\x1b[0m`;
+    return `\x1b[90mâ— System  â”‚ ${timeStr.padEnd(11)} â”‚\x1b[0m`;
   },
 
   // Semantic Loggers
   ready: (msg) => {
     const instanceId = process.env.NODE_APP_INSTANCE;
     if (instanceId === '0' || instanceId === undefined) {
-      console.log(`\n${Log.emerald}${Log.bold}┌──────────────────────────────────────────────┐${Log.reset}`);
-      console.log(`${Log.emerald}${Log.bold}│  ✅ READY  \x1b[0m ${Log.cyan}${msg.padEnd(41)}\x1b[32m\x1b[1m│${Log.reset}`);
-      console.log(`${Log.emerald}${Log.bold}└──────────────────────────────────────────────┘${Log.reset}\n`);
+      console.log(`\n${Log.emerald}${Log.bold}â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”${Log.reset}`);
+      console.log(`${Log.emerald}${Log.bold}â”‚  âœ… READY  \x1b[0m ${Log.cyan}${msg.padEnd(41)}\x1b[32m\x1b[1mâ”‚${Log.reset}`);
+      console.log(`${Log.emerald}${Log.bold}â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜${Log.reset}\n`);
     }
   },
 
@@ -168,34 +168,34 @@ const Log = {
     if (shortOrigin.length > 25) shortOrigin = shortOrigin.substring(0, 22) + '...';
     
     // Ultra-Premium Layout with Generous Spacing
-    console.log(`${Log.timestamp()}   ${mBadge}   ${iColor}► \x1b[1m${url.padEnd(45)}\x1b[0m \x1b[90m${shortOrigin}\x1b[0m`);
+    console.log(`${Log.timestamp()}   ${mBadge}   ${iColor}â–º \x1b[1m${url.padEnd(45)}\x1b[0m \x1b[90m${shortOrigin}\x1b[0m`);
   },
 
-  success: (area, msg) => console.log(`${Log.timestamp()}   \x1b[42m\x1b[30m\x1b[1m ✔ OK \x1b[0m   \x1b[32m\x1b[1m[${area.toUpperCase()}]\x1b[0m \x1b[32m${msg}\x1b[0m`),
+  success: (area, msg) => console.log(`${Log.timestamp()}   \x1b[42m\x1b[30m\x1b[1m âœ” OK \x1b[0m   \x1b[32m\x1b[1m[${area.toUpperCase()}]\x1b[0m \x1b[32m${msg}\x1b[0m`),
 
   auth: (msg, hint) => {
-    console.log(`${Log.timestamp()}   \x1b[43m\x1b[30m\x1b[1m 🛡️ AUTH \x1b[0m   \x1b[33m\x1b[1m${msg}\x1b[0m`);
-    if (hint) console.log(`                                \x1b[90m↳ 💡 ${hint}\x1b[0m`);
+    console.log(`${Log.timestamp()}   \x1b[43m\x1b[30m\x1b[1m ðŸ›¡ï¸ AUTH \x1b[0m   \x1b[33m\x1b[1m${msg}\x1b[0m`);
+    if (hint) console.log(`                                \x1b[90mâ†³ ðŸ’¡ ${hint}\x1b[0m`);
   },
 
   error: (area, msg, hint) => {
-    console.log(`${Log.timestamp()}   \x1b[41m\x1b[30m\x1b[1m ✖ ERR \x1b[0m   \x1b[31m\x1b[1m[${area.toUpperCase()}]\x1b[0m \x1b[31m${msg}\x1b[0m`);
-    if (hint) console.log(`                                \x1b[90m↳ 💡 ${hint}\x1b[0m`);
+    console.log(`${Log.timestamp()}   \x1b[41m\x1b[30m\x1b[1m âœ– ERR \x1b[0m   \x1b[31m\x1b[1m[${area.toUpperCase()}]\x1b[0m \x1b[31m${msg}\x1b[0m`);
+    if (hint) console.log(`                                \x1b[90mâ†³ ðŸ’¡ ${hint}\x1b[0m`);
   }
 };
 
 const BANNER = `
 \x1b[36m\x1b[1m
-   ███╗   ██╗██████╗ ████████╗     ██╗  ██╗██╗   ██╗██████╗ 
-   ████╗  ██║██╔══██╗╚══██╔══╝     ██║  ██║██║   ██║██╔══██╗
-   ██╔██╗ ██║██████╔╝   ██║        ███████║██║   ██║██████╔╝
-   ██║╚██╗██║██╔══██╗   ██║        ██╔══██║██║   ██║██╔══██╗
-   ██║ ╚████║██████╔╝   ██║        ██║  ██║╚██████╔╝██████╔╝
-   ╚═╝  ╚═══╝╚═════╝    ╚═╝        ╚═╝  ╚═╝ ╚═════╝ ╚═════╝
+   â–ˆâ–ˆâ–ˆâ•—   â–ˆâ–ˆâ•—â–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ•— â–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ•—     â–ˆâ–ˆâ•—  â–ˆâ–ˆâ•—â–ˆâ–ˆâ•—   â–ˆâ–ˆâ•—â–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ•— 
+   â–ˆâ–ˆâ–ˆâ–ˆâ•—  â–ˆâ–ˆâ•‘â–ˆâ–ˆâ•”â•â•â–ˆâ–ˆâ•—â•šâ•â•â–ˆâ–ˆâ•”â•â•â•     â–ˆâ–ˆâ•‘  â–ˆâ–ˆâ•‘â–ˆâ–ˆâ•‘   â–ˆâ–ˆâ•‘â–ˆâ–ˆâ•”â•â•â–ˆâ–ˆâ•—
+   â–ˆâ–ˆâ•”â–ˆâ–ˆâ•— â–ˆâ–ˆâ•‘â–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ•”â•   â–ˆâ–ˆâ•‘        â–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ•‘â–ˆâ–ˆâ•‘   â–ˆâ–ˆâ•‘â–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ•”â•
+   â–ˆâ–ˆâ•‘â•šâ–ˆâ–ˆâ•—â–ˆâ–ˆâ•‘â–ˆâ–ˆâ•”â•â•â–ˆâ–ˆâ•—   â–ˆâ–ˆâ•‘        â–ˆâ–ˆâ•”â•â•â–ˆâ–ˆâ•‘â–ˆâ–ˆâ•‘   â–ˆâ–ˆâ•‘â–ˆâ–ˆâ•”â•â•â–ˆâ–ˆâ•—
+   â–ˆâ–ˆâ•‘ â•šâ–ˆâ–ˆâ–ˆâ–ˆâ•‘â–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ•”â•   â–ˆâ–ˆâ•‘        â–ˆâ–ˆâ•‘  â–ˆâ–ˆâ•‘â•šâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ•”â•â–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ•”â•
+   â•šâ•â•  â•šâ•â•â•â•â•šâ•â•â•â•â•â•    â•šâ•â•        â•šâ•â•  â•šâ•â• â•šâ•â•â•â•â•â• â•šâ•â•â•â•â•â•
 \x1b[0m
 
-\x1b[94m💎  PREMIUM BACKEND OPERATIONAL\x1b[0m
-\x1b[90m──────────────────────────────────────────────\x1b[0m
+\x1b[94mðŸ’Ž  PREMIUM BACKEND OPERATIONAL\x1b[0m
+\x1b[90mâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\x1b[0m
 `;
 
 app.use(compression()); // 0. Enable Gzip Compression for high-performance dashboard analytics
@@ -286,7 +286,7 @@ const getPool = async () => {
           [employee_name] NVARCHAR(255),
           [suggestion] NVARCHAR(MAX),
           [requirement] NVARCHAR(MAX),
-          [created_at] DATETIME DEFAULT DATEADD(MINUTE, 330, GETUTCDATE()),
+          [created_at] DATETIME DEFAULT GETDATE(),
           FOREIGN KEY ([employee_id]) REFERENCES [users](id)
         )
       END
@@ -327,8 +327,8 @@ const getPool = async () => {
           [returned_by_name] NVARCHAR(255) NULL,
           [returned_by_designation] NVARCHAR(255) NULL,
           [returned_date] DATETIME NULL,
-          [created_at] DATETIME DEFAULT DATEADD(MINUTE, 330, GETUTCDATE()),
-          [updated_at] DATETIME DEFAULT DATEADD(MINUTE, 330, GETUTCDATE())
+          [created_at] DATETIME DEFAULT GETDATE(),
+          [updated_at] DATETIME DEFAULT GETDATE()
         )
       END
       ELSE
@@ -354,7 +354,7 @@ const getPool = async () => {
         END
       `);
     } catch (migErr) {
-      console.warn('⚠️ Non-critical fun_quizzes migration warning:', migErr.message);
+      console.warn('âš ï¸ Non-critical fun_quizzes migration warning:', migErr.message);
     }
 
     // RECONCILE UNSTAGE/UNSUBMITTED QUIZ ATTEMPTS INTO COMPLETIONS
@@ -396,14 +396,14 @@ const getPool = async () => {
 
         DROP TABLE #UnsubmittedCompletions;
       `);
-      console.log('✅ Reconciled any pending quiz attempts into quiz completions.');
+      console.log('âœ… Reconciled any pending quiz attempts into quiz completions.');
     } catch (recErr) {
-      console.warn('⚠️ Pending quiz reconciliation warning:', recErr.message);
+      console.warn('âš ï¸ Pending quiz reconciliation warning:', recErr.message);
     }
 
-    console.log('✅ Suggestions and Quizzes tracking systems initialized.');
+    console.log('âœ… Suggestions and Quizzes tracking systems initialized.');
   } catch (err) {
-    console.error('❌ Failed to initialize database migrations:', err.message);
+    console.error('âŒ Failed to initialize database migrations:', err.message);
   }
 
   return _pool;
@@ -743,13 +743,13 @@ const mapAssetStockRow = (row) => {
  * Shared emoji reaction type map (extracted from 4+ inline copies)
  */
 const emojiMap = {
-  heart: '❤️',
-  thumbsup: '👍',
-  shocked: '😮',
-  laugh: '😂',
-  fire: '🔥',
-  clap: '👏',
-  cake: '🎂'
+  heart: 'â¤ï¸',
+  thumbsup: 'ðŸ‘',
+  shocked: 'ðŸ˜®',
+  laugh: 'ðŸ˜‚',
+  fire: 'ðŸ”¥',
+  clap: 'ðŸ‘',
+  cake: 'ðŸŽ‚'
 };
 
 /**
@@ -926,7 +926,7 @@ app.get('/api/test-db', async (req, res) => {
   try {
     let pool = await getPool();
     if (!pool) throw new Error('Pool not initialized');
-    const result = await pool.request().query('SELECT DATEADD(MINUTE, 330, GETUTCDATE()) as serverTime');
+    const result = await pool.request().query('SELECT GETDATE() as serverTime');
     Log.success('Database', 'Health check passed: Connection to MSSQL alive.');
     res.json({ status: 'Connected', time: result.recordset[0].serverTime, timezone: 'IST (UTC+5:30)' });
   } catch (err) {
@@ -946,13 +946,13 @@ app.get('/api/status', (req, res) => {
 
 /**
  * Central Security Utility: Verifies a JWT and checks for revocation (Global Logout).
- * Returns { user, reason } — user is the decoded payload if valid, null otherwise.
+ * Returns { user, reason } â€” user is the decoded payload if valid, null otherwise.
  * 'reason' provides a machine-readable rejection code for the frontend.
- *   - 'password_changed'  → token_version mismatch (password was changed or global logout triggered)
- *   - 'account_deleted'   → user no longer exists in the database
- *   - 'token_expired'     → JWT expiry reached
- *   - 'token_invalid'     → JWT signature mismatch or tampering
- *   - 'server_error'      → database or internal error during verification
+ *   - 'password_changed'  â†’ token_version mismatch (password was changed or global logout triggered)
+ *   - 'account_deleted'   â†’ user no longer exists in the database
+ *   - 'token_expired'     â†’ JWT expiry reached
+ *   - 'token_invalid'     â†’ JWT signature mismatch or tampering
+ *   - 'server_error'      â†’ database or internal error during verification
  */
 // --- PERFORMANCE CACHE: Token Version Cache to prevent DB bottlenecks ---
 const tokenVersionCache = new Map();
@@ -1089,7 +1089,7 @@ const getVerifiedUser = async (token) => {
 
     // REJECTION LOGIC: If DB has a newer version, the token is stale/revoked
     if (tokenVersion < currentVersion) {
-      Log.auth(`Revoked Token for ${decoded.email}`, `Session invalidated — token v${tokenVersion} < DB v${currentVersion} (password changed or global logout).`);
+      Log.auth(`Revoked Token for ${decoded.email}`, `Session invalidated â€” token v${tokenVersion} < DB v${currentVersion} (password changed or global logout).`);
       return { user: null, reason: 'password_changed' };
     }
 
@@ -1204,7 +1204,7 @@ app.post('/api/job-postings', verifyToken, async (req, res) => {
       .query(`
         INSERT INTO job_postings (title, department, location, job_type, experience, description, requirements, status, created_at, updated_at)
         OUTPUT INSERTED.id
-        VALUES (@title, @dept, @loc, @type, @exp, @desc, @reqs, @status, DATEADD(MINUTE, 330, GETUTCDATE()), DATEADD(MINUTE, 330, GETUTCDATE()))
+        VALUES (@title, @dept, @loc, @type, @exp, @desc, @reqs, @status, GETDATE(), GETDATE())
       `);
 
     const localJobId = localResult.recordset[0].id;
@@ -1265,7 +1265,7 @@ app.put('/api/job-postings/:id', verifyToken, async (req, res) => {
         UPDATE job_postings 
         SET title = @title, department = @dept, location = @loc, job_type = @type, 
             experience = @exp, description = @desc, requirements = @reqs, status = @status,
-            updated_at = DATEADD(MINUTE, 330, GETUTCDATE())
+            updated_at = GETDATE()
         WHERE id = @id
       `);
 
@@ -1410,7 +1410,7 @@ app.put('/api/job-applications/:id', verifyToken, async (req, res) => {
     await pool.request()
       .input('id', sql.Int, id)
       .input('status', sql.NVarChar, status)
-      .query('UPDATE job_applications SET status = @status, updated_at = DATEADD(MINUTE, 330, GETUTCDATE()) WHERE id = @id');
+      .query('UPDATE job_applications SET status = @status, updated_at = GETDATE() WHERE id = @id');
 
     if (webAppId) {
       const { pushStatusUpdate } = require('./nbt-integration');
@@ -1445,7 +1445,7 @@ app.delete('/api/job-applications/:id', verifyToken, async (req, res) => {
     const pool = await getPool();
     const result = await pool.request()
       .input('id', sql.Int, id)
-      .query('UPDATE job_applications SET is_deleted = 1, updated_at = DATEADD(MINUTE, 330, GETUTCDATE()) WHERE id = @id');
+      .query('UPDATE job_applications SET is_deleted = 1, updated_at = GETDATE() WHERE id = @id');
 
     if (result.rowsAffected[0] === 0) {
       return res.status(404).json({ error: 'Job application not found' });
@@ -1555,7 +1555,7 @@ app.post('/api/login', async (req, res) => {
       return res.status(503).json({ error: 'Database is currently offline' });
     }
 
-    // Find user by email — only select needed fields
+    // Find user by email â€” only select needed fields
     let userResult = await pool.request()
       .input('email', sql.NVarChar, email)
       .query('SELECT id, name, email, password, role, phone_number, profile_picture, about_me, team, joining_date, token_version, status FROM users WHERE email = @email');
@@ -1886,12 +1886,12 @@ app.post(['/api/password/request-otp', '/api/auth/request-otp'], async (req, res
     }
 
     // Premium Terminal Output
-    console.log('\n' + Log.gold + Log.bold + '╔══════════════════════════════════════════════╗' + Log.reset);
-    console.log(Log.gold + Log.bold + '║  🔑  PASSWORD RESET OTP GENERATED        ║' + Log.reset);
-    console.log(Log.gold + Log.bold + '╠══════════════════════════════════════════════╣' + Log.reset);
-    console.log(Log.gold + Log.bold + `║  User : ${email.padEnd(31)}  ║` + Log.reset);
-    console.log(Log.gold + Log.bold + `║  Code : ${Log.emerald}${Log.bold}${otp}${Log.gold}${Log.bold}                           ║` + Log.reset);
-    console.log(Log.gold + Log.bold + '╚══════════════════════════════════════════════╝\n' + Log.reset);
+    console.log('\n' + Log.gold + Log.bold + 'â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—' + Log.reset);
+    console.log(Log.gold + Log.bold + 'â•‘  ðŸ”‘  PASSWORD RESET OTP GENERATED        â•‘' + Log.reset);
+    console.log(Log.gold + Log.bold + 'â• â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•£' + Log.reset);
+    console.log(Log.gold + Log.bold + `â•‘  User : ${email.padEnd(31)}  â•‘` + Log.reset);
+    console.log(Log.gold + Log.bold + `â•‘  Code : ${Log.emerald}${Log.bold}${otp}${Log.gold}${Log.bold}                           â•‘` + Log.reset);
+    console.log(Log.gold + Log.bold + 'â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•\n' + Log.reset);
 
     res.json({ success: true, message: 'OTP sent to your email address successfully.' });
   } catch (err) {
@@ -2034,7 +2034,7 @@ app.post(['/api/password/change-password', '/api/profile/update-password'], veri
     const finalValue = (userType === 'new_joinee' || userType === 'intern') ? newPassword : await bcrypt.hash(newPassword, 10);
     const newTokenVersion = currentTokenVersion + 1;
 
-    // SECURITY: Always increment token_version on password change → invalidates ALL existing sessions
+    // SECURITY: Always increment token_version on password change â†’ invalidates ALL existing sessions
     await pool.request()
       .input('pass', sql.NVarChar, finalValue)
       .input('id', sql.Int, userId)
@@ -2060,7 +2060,7 @@ app.post(['/api/password/change-password', '/api/profile/update-password'], veri
       { expiresIn: '365d' }
     );
 
-    Log.success('Auth', `Password changed for ${email} → token_version bumped to v${newTokenVersion} (all other sessions invalidated)`);
+    Log.success('Auth', `Password changed for ${email} â†’ token_version bumped to v${newTokenVersion} (all other sessions invalidated)`);
     res.json({
       success: true,
       message: 'Password changed successfully. All other devices have been logged out.',
@@ -2167,7 +2167,7 @@ app.post('/api/hr-personnel/register', verifyToken, async (req, res) => {
       .input('userId', sql.Int, newUserId)
       .query(`INSERT INTO employee (user_id) VALUES (@userId)`);
 
-    // 5. Insert into hr_personnel — this is what links their name to the HR Team screen
+    // 5. Insert into hr_personnel â€” this is what links their name to the HR Team screen
     const finalDisplayName = (displayName || normalizedName).trim();
     await pool.request()
       .input('userId',      sql.Int,     newUserId)
@@ -2243,7 +2243,7 @@ app.get('/api/hr-personnel/active', verifyToken, async (req, res) => {
 });
 
 /**
- * HR-P3. Get All HR Personnel — Full History (Current + Resigned)
+ * HR-P3. Get All HR Personnel â€” Full History (Current + Resigned)
  * For SuperAdmin panel to see all past and current HRs.
  * GET /api/hr-personnel/all
  */
@@ -2282,7 +2282,7 @@ app.get('/api/hr-personnel/all', verifyToken, async (req, res) => {
  * - Disables their personal account (status = 'Resigned', token invalidated)
  * - Marks hr_personnel row as resigned (is_active = 0, resigned_at = now)
  * - The HR Team account (hr@navabharathtechnologies.com) is NEVER touched
- * - The hr_personnel record is NEVER deleted — kept for audit trail forever
+ * - The hr_personnel record is NEVER deleted â€” kept for audit trail forever
  * PUT /api/hr-personnel/:id/resign
  */
 app.put('/api/hr-personnel/:id/resign', verifyToken, async (req, res) => {
@@ -2324,7 +2324,7 @@ app.put('/api/hr-personnel/:id/resign', verifyToken, async (req, res) => {
     // Invalidate token cache for this user
     tokenVersionCache.delete(`employee_${user_id}`);
 
-    // 2. Mark hr_personnel record as resigned — NEVER deleted
+    // 2. Mark hr_personnel record as resigned â€” NEVER deleted
     await pool.request()
       .input('id', sql.Int, personnelId)
       .query(`UPDATE hr_personnel
@@ -3716,10 +3716,10 @@ app.post('/api/sprint-updates', async (req, res) => {
         UPDATE SET 
           status = @sprintStatus,
           progress = @progressPercentage,
-          updated_at = DATEADD(MINUTE, 330, GETUTCDATE())
+          updated_at = GETDATE()
       WHEN NOT MATCHED THEN
         INSERT (type, title, assignee_id, status, progress, owner_id, updated_at)
-        VALUES ('TASK', source.src_title, source.src_assignee, @sprintStatus, @progressPercentage, 20251, DATEADD(MINUTE, 330, GETUTCDATE()));
+        VALUES ('TASK', source.src_title, source.src_assignee, @sprintStatus, @progressPercentage, 20251, GETDATE());
     `);
 
     res.json({ success: true, message: 'Sprint progress updated successfully' });
@@ -3900,8 +3900,8 @@ app.post(['/api/leaves', '/api/leave'], verifyToken, async (req, res) => {
         FROM users u
         LEFT JOIN users m ON u.reporting_manager_id = m.id
         LEFT JOIN leave_stats ls ON u.id = ls.employee_id 
-             AND ls.month = MONTH(DATEADD(MINUTE, 330, GETUTCDATE())) 
-             AND ls.year = YEAR(DATEADD(MINUTE, 330, GETUTCDATE()))
+             AND ls.month = MONTH(GETDATE()) 
+             AND ls.year = YEAR(GETDATE())
         WHERE u.id = @userId
       `);
 
@@ -4065,7 +4065,7 @@ app.post(['/api/leaves', '/api/leave'], verifyToken, async (req, res) => {
       .query(`
                 INSERT INTO leaves (user_id, employee_name, manager_id, pm_id, leave_type, start_date, end_date, reason, rm_status, pm_status, hr_status, status, is_half_day, half_day_slot, created_at, updated_at)
                 OUTPUT INSERTED.id
-                VALUES (@userId, @employeeName, @managerId, @pmId, @leaveType, @startDate, @endDate, @reason, @rmStatus, @pmStatus, 'Pending', 'Pending', @isHalfDay, @halfDaySlot, DATEADD(MINUTE, 330, GETUTCDATE()), DATEADD(MINUTE, 330, GETUTCDATE()))
+                VALUES (@userId, @employeeName, @managerId, @pmId, @leaveType, @startDate, @endDate, @reason, @rmStatus, @pmStatus, 'Pending', 'Pending', @isHalfDay, @halfDaySlot, GETDATE(), GETDATE())
             `);
 
     console.log(`[LEAVE POST SUCCESS] Leave ID ${insertResult.recordset[0].id} generated for User ${userId}`);
@@ -4089,7 +4089,7 @@ app.post(['/api/leaves', '/api/leave'], verifyToken, async (req, res) => {
         await pool.request()
           .input('targetId', sql.Int, notifierId)
           .input('msg', sql.NVarChar, `New Leave Request from ${name} (${leave_type}): ${start_date} to ${end_date}`)
-          .query('INSERT INTO notifications (target_user_id, message, is_read, created_at) VALUES (@targetId, @msg, 0, DATEADD(MINUTE, 330, GETUTCDATE()))');
+          .query('INSERT INTO notifications (target_user_id, message, is_read, created_at) VALUES (@targetId, @msg, 0, GETDATE())');
       }
     } catch (notifErr) {
       console.error('[LEAVE NOTIFICATION WARNING]:', notifErr.message);
@@ -4628,10 +4628,10 @@ app.get('/api/admin/etime-logs', verifyToken, async (req, res) => {
     for (const log of rawLogs) {
       if (!log.Empcode || !log.DateString) continue;
 
-      // Parse Empcode and auto‑correct 6‑digit IDs like 20250X → 2025X
+      // Parse Empcode and autoâ€‘correct 6â€‘digit IDs like 20250X â†’ 2025X
       let rawEmpId = String(log.Empcode).trim();
       if (!rawEmpId) continue;
-      // Collapse 6‑digit codes starting with '20250' to proper 5‑digit IDs
+      // Collapse 6â€‘digit codes starting with '20250' to proper 5â€‘digit IDs
       if (rawEmpId.length === 6 && rawEmpId.startsWith('20250')) {
         rawEmpId = rawEmpId.replace('20250', '2025');
       }
@@ -4807,7 +4807,7 @@ app.post('/api/admin/sync-user-attendance', verifyToken, async (req, res) => {
     let syncCount = 0;
     for (const log of rawLogs) {
       if (!log.Empcode || !log.DateString) continue;
-      // Ensure this log belongs to the requested userId (after auto‑correct handling)
+      // Ensure this log belongs to the requested userId (after autoâ€‘correct handling)
       let rawEmpId = String(log.Empcode).trim();
       if (rawEmpId.length === 6 && rawEmpId.startsWith('20250')) rawEmpId = rawEmpId.replace('20250', '2025');
       const empId = parseInt(rawEmpId, 10);
@@ -5480,7 +5480,7 @@ app.post('/api/task-updates', async (req, res) => {
       .query(`
         SELECT id FROM task_updates 
         WHERE employee_id = @employee_id 
-        AND CAST(created_at AS DATE) = CAST(DATEADD(minute, 330, GETUTCDATE()) AS DATE)
+        AND CAST(created_at AS DATE) = CAST(GETDATE() AS DATE)
       `);
 
     if (checkToday.recordset.length > 0) {
@@ -5498,7 +5498,7 @@ app.post('/api/task-updates', async (req, res) => {
         UPDATE task_updates 
         SET overall_status = @overall_status, badge = @badge, team = @team, description = @description,
             user_name = @userName, user_role = @userRole,
-            created_at = DATEADD(minute, 330, GETUTCDATE())
+            created_at = GETDATE()
         WHERE id = @id
         `);
 
@@ -5526,7 +5526,7 @@ app.post('/api/task-updates', async (req, res) => {
         .input('userRole', sql.NVarChar, userRole)
         .query(`
           INSERT INTO task_updates (employee_id, email, team, badge, overall_status, description, task_category, user_name, user_role, created_at)
-          VALUES (@userId, @email, @team, @badge, @status, @desc, @categ, @userName, @userRole, DATEADD(minute, 330, GETUTCDATE()))
+          VALUES (@userId, @email, @team, @badge, @status, @desc, @categ, @userName, @userRole, GETDATE())
         `);
     }
 
@@ -6008,14 +6008,14 @@ const fetchBirthdaysAsJSON = async (req, res) => {
       NextBirthdays AS (
         SELECT *,
                CASE 
-                 WHEN DATEFROMPARTS(${currentYear}, MONTH(dob), DAY(dob)) >= CAST(DATEADD(MINUTE, 330, GETUTCDATE()) AS DATE)
+                 WHEN DATEFROMPARTS(${currentYear}, MONTH(dob), DAY(dob)) >= CAST(GETDATE() AS DATE)
                  THEN DATEFROMPARTS(${currentYear}, MONTH(dob), DAY(dob))
                  ELSE DATEFROMPARTS(${currentYear} + 1, MONTH(dob), DAY(dob))
                END AS nextOccurrence
         FROM UserBirthdays
         WHERE dob IS NOT NULL
       )
-      SELECT *, DATEDIFF(day, CAST(DATEADD(MINUTE, 330, GETUTCDATE()) AS DATE), nextOccurrence) as daysUntil
+      SELECT *, DATEDIFF(day, CAST(GETDATE() AS DATE), nextOccurrence) as daysUntil
       FROM NextBirthdays
       ORDER BY daysUntil ASC
     `);
@@ -6609,7 +6609,7 @@ const isDuplicateNotification = async (pool, targetUserId, message) => {
         FROM notifications WITH (NOLOCK)
         WHERE target_user_id = @targetUserId 
           AND message = @message 
-          AND created_at >= DATEADD(SECOND, -5, DATEADD(MINUTE, 330, GETUTCDATE()))
+          AND created_at >= DATEADD(SECOND, -5, GETDATE())
       `);
     return checkQuery.recordset[0].count > 0;
   } catch (err) {
@@ -6680,7 +6680,7 @@ const notifyTaskAssignment = async (pool, assignerId, assigneeId, taskName) => {
       await pool.request()
         .input('assigneeId', sql.Int, parsedAssigneeId)
         .input('msg', sql.NVarChar, assigneeAlert)
-        .query("INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@assigneeId, @msg, 'TASK', 0, DATEADD(MINUTE, 330, GETUTCDATE()))");
+        .query("INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@assigneeId, @msg, 'TASK', 0, GETDATE())");
       console.log(`[NOTIFICATION] Task assignment notification sent to assignee ${parsedAssigneeId}`);
     }
 
@@ -6708,7 +6708,7 @@ const notifyTaskAssignment = async (pool, assignerId, assigneeId, taskName) => {
           if (!isDup) filteredRecipients.push(rid);
         }
         if (filteredRecipients.length > 0) {
-          const valuesClauses = filteredRecipients.map((_, i) => `(@uid${i}, @msg, 'TASK', 0, DATEADD(MINUTE, 330, GETUTCDATE()))`);
+          const valuesClauses = filteredRecipients.map((_, i) => `(@uid${i}, @msg, 'TASK', 0, GETDATE())`);
           const batchRequest = pool.request().input('msg', sql.NVarChar, alertMessage);
           filteredRecipients.forEach((rid, i) => batchRequest.input(`uid${i}`, sql.Int, rid));
           await batchRequest.query(`INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES ${valuesClauses.join(', ')}`);
@@ -6757,7 +6757,7 @@ const notifyTaskCompletion = async (pool, taskId) => {
         if (!isDup) filteredManagers.push(rid);
       }
       if (filteredManagers.length > 0) {
-        const valuesClauses = filteredManagers.map((_, i) => `(@uid${i}, @msg, 'TASK', 0, DATEADD(MINUTE, 330, GETUTCDATE()))`);
+        const valuesClauses = filteredManagers.map((_, i) => `(@uid${i}, @msg, 'TASK', 0, GETDATE())`);
         const batchRequest = pool.request().input('msg', sql.NVarChar, alertMessage);
         filteredManagers.forEach((rid, i) => batchRequest.input(`uid${i}`, sql.Int, rid));
         await batchRequest.query(`INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES ${valuesClauses.join(', ')}`);
@@ -6833,7 +6833,7 @@ const notifyTaskReview = async (pool, taskId, verifyStatus) => {
       }
 
       if (filteredRecipients.length > 0) {
-        const valuesClauses = filteredRecipients.map((_, i) => `(@uid${i}, @msg, 'TASK', 0, DATEADD(MINUTE, 330, GETUTCDATE()))`);
+        const valuesClauses = filteredRecipients.map((_, i) => `(@uid${i}, @msg, 'TASK', 0, GETDATE())`);
         const batchRequest = pool.request().input('msg', sql.NVarChar, alertMessage);
         filteredRecipients.forEach((rid, i) => batchRequest.input(`uid${i}`, sql.Int, rid));
         await batchRequest.query(`INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES ${valuesClauses.join(', ')}`);
@@ -6875,7 +6875,7 @@ const notifyTaskUpdate = async (pool, taskId) => {
         await pool.request()
           .input('targetId', sql.Int, reportingManagerId)
           .input('msg', sql.NVarChar, alertMessage)
-          .query("INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@targetId, @msg, 'TASK', 0, DATEADD(MINUTE, 330, GETUTCDATE()))");
+          .query("INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@targetId, @msg, 'TASK', 0, GETDATE())");
         console.log(`[NOTIFICATION] Task update notification sent to reporting manager ${reportingManagerId}`);
       }
     }
@@ -6930,17 +6930,17 @@ app.post(['/api/assign-task', '/api/tasks', '/api/master-task'], async (req, res
       .input('taskReview', sql.NVarChar(sql.MAX), null)
       .query(`
         INSERT INTO master_tasks (type, title, description, owner_id, assignee_id, attachment_data, attachment_name, deadline, task_review, created_at, updated_at)
-        VALUES ('TASK', @taskName, @description, @assignerId, @assigneeId, @attachment_data, @attachment_name, @deadline, @taskReview, DATEADD(MINUTE, 330, GETUTCDATE()), DATEADD(MINUTE, 330, GETUTCDATE()))
+        VALUES ('TASK', @taskName, @description, @assignerId, @assigneeId, @attachment_data, @attachment_name, @deadline, @taskReview, GETDATE(), GETDATE())
       `);
 
-    console.log('âœ… Task Stored in Database (ID Migration Bridge Applied)!');
+    console.log('Ã¢Å“â€¦ Task Stored in Database (ID Migration Bridge Applied)!');
     notifyTaskAssignment(pool, finalAssignerId, finalAssigneeId, finalTaskName).catch(err => {
       console.error('[NOTIFICATION ASSIGNMENT EXCEPTION]:', err);
     });
     res.json({ success: true, message: 'Saved successfully!' });
   } catch (err) {
 
-    console.error('âŒ SQL ERROR:', err.message);
+    console.error('Ã¢ÂÅ’ SQL ERROR:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -6997,7 +6997,7 @@ app.get(['/api/admin/tasks/team-status', '/api/tasks/team-status'], verifyToken,
       data: grouped
     });
   } catch (err) {
-    console.error('❌ SQL ERROR in team-status:', err.message);
+    console.error('âŒ SQL ERROR in team-status:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -7055,7 +7055,7 @@ app.get('/api/admin/tasks/running', verifyToken, async (req, res) => {
       tasks: result.recordset
     });
   } catch (err) {
-    console.error('❌ SQL ERROR in admin/tasks/running:', err.message);
+    console.error('âŒ SQL ERROR in admin/tasks/running:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -7112,7 +7112,7 @@ app.get('/api/admin/tasks/completed', verifyToken, async (req, res) => {
       tasks: result.recordset
     });
   } catch (err) {
-    console.error('❌ SQL ERROR in admin/tasks/completed:', err.message);
+    console.error('âŒ SQL ERROR in admin/tasks/completed:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -7167,7 +7167,7 @@ app.get([
     `);
     res.json(result.recordset);
   } catch (err) {
-    console.error('❌ SQL ERROR in all-assigned:', err.message);
+    console.error('âŒ SQL ERROR in all-assigned:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -7299,7 +7299,7 @@ app.put(['/api/assign-task/review/:id', '/api/assigned-task/review/:id', '/api/m
       return res.status(503).json({ error: 'Database is currently offline' });
     }
 
-    let query = 'UPDATE master_tasks SET updated_at = DATEADD(MINUTE, 330, GETUTCDATE())';
+    let query = 'UPDATE master_tasks SET updated_at = GETDATE()';
     const request = pool.request().input('id', sql.Int, id);
 
     if (finalReview !== undefined) {
@@ -7322,13 +7322,13 @@ app.put(['/api/assign-task/review/:id', '/api/assigned-task/review/:id', '/api/m
       return res.status(404).json({ error: 'Task not found' });
     }
 
-    console.log(`âœ… [TASK REVIEW] Successfully updated task ${id}`);
+    console.log(`Ã¢Å“â€¦ [TASK REVIEW] Successfully updated task ${id}`);
     if (finalVerify !== undefined) {
       notifyTaskReview(pool, id, finalVerify).catch(err => {
         console.error('[NOTIFICATION REVIEW EXCEPTION]:', err);
       });
     }
-    res.json({ success: true, message: 'Review successfully submitted! âœ…' });
+    res.json({ success: true, message: 'Review successfully submitted! Ã¢Å“â€¦' });
   } catch (err) {
     console.error('[TASK REVIEW UPDATE ERROR]:', err);
     res.status(500).json({ error: 'Failed to process task evaluation' });
@@ -7445,7 +7445,7 @@ app.put(['/api/tasks/:id', '/api/tasks/status/:taskId', '/api/task-updates/:id',
     }
 
     const request = pool.request().input('taskId', sql.Int, taskId);
-    let query = 'UPDATE master_tasks SET updated_at = DATEADD(MINUTE, 330, GETUTCDATE())';
+    let query = 'UPDATE master_tasks SET updated_at = GETDATE()';
 
     if (status !== undefined) {
       query += ', status = @status';
@@ -7612,7 +7612,7 @@ app.post('/api/threads', async (req, res) => {
       .input('mediaType', sql.NVarChar(50), mediaType || 'image')
       .query(`
         INSERT INTO threads (user_id, employee_name, role, content, media_url, media_type, created_at)
-        VALUES (@userId, @name, @role, @content, @mediaUrl, @mediaType, DATEADD(MINUTE, 330, GETUTCDATE()))
+        VALUES (@userId, @name, @role, @content, @mediaUrl, @mediaType, GETDATE())
       `);
 
     console.log(`[THREAD POST] Success: Post created for ${employeeName} (${postRole}) with media: ${mediaUrl ? 'YES' : 'NO'}`);
@@ -7785,13 +7785,13 @@ const handlePostReaction = async (req, res) => {
 
   // Map literal emojis OR common names to standardized database strings
   const reactionMap = {
-    '❤️': 'heart', 'heart': 'heart', 'love': 'heart',
-    '👍': 'thumbsup', 'thumbsup': 'thumbsup', 'thumb': 'thumbsup',
-    '😮': 'shocked', 'shocked': 'shocked', 'wow': 'shocked',
-    '😂': 'laugh', 'laugh': 'laugh', 'haha': 'laugh',
-    '🔥': 'fire', 'fire': 'fire', 'lit': 'fire',
-    '👏': 'clap', 'clap': 'clap', 'clapping': 'clap',
-    '🎂': 'cake', 'cake': 'cake', 'birthday': 'cake',
+    'â¤ï¸': 'heart', 'heart': 'heart', 'love': 'heart',
+    'ðŸ‘': 'thumbsup', 'thumbsup': 'thumbsup', 'thumb': 'thumbsup',
+    'ðŸ˜®': 'shocked', 'shocked': 'shocked', 'wow': 'shocked',
+    'ðŸ˜‚': 'laugh', 'laugh': 'laugh', 'haha': 'laugh',
+    'ðŸ”¥': 'fire', 'fire': 'fire', 'lit': 'fire',
+    'ðŸ‘': 'clap', 'clap': 'clap', 'clapping': 'clap',
+    'ðŸŽ‚': 'cake', 'cake': 'cake', 'birthday': 'cake',
     'like': 'like'
   };
 
@@ -8092,7 +8092,7 @@ app.post('/api/threads/:id/comment', async (req, res) => {
       .input('name', sql.NVarChar, employeeName)
       .input('role', sql.NVarChar, userRole)
       .input('comment', sql.NVarChar(sql.MAX), commentText)
-      .query('INSERT INTO thread_comments (thread_id, user_id, employee_name, role, comment, created_at) VALUES (@threadId, @userId, @name, @role, @comment, DATEADD(MINUTE, 330, GETUTCDATE()))');
+      .query('INSERT INTO thread_comments (thread_id, user_id, employee_name, role, comment, created_at) VALUES (@threadId, @userId, @name, @role, @comment, GETDATE())');
 
     // Atomic increment of comments_count
     await pool.request().input('tid', sql.Int, id).query('UPDATE threads SET comments_count = comments_count + 1 WHERE id = @tid');
@@ -8711,7 +8711,7 @@ app.post('/api/new-joinees', async (req, res) => {
     if (finalEmail) {
       sendAppEmail({
         to: finalEmail,
-        subject: `Welcome to Navabharath Technologies, ${name}! 🎉`,
+        subject: `Welcome to Navabharath Technologies, ${name}! ðŸŽ‰`,
         html: getWelcomeDayOneHtml(name, 'New Joinee', role || 'Employee', finalEmail, finalPassword),
         text: `Welcome to the team, ${name}! Your email: ${finalEmail}, password: ${finalPassword}`
       }).catch(e => console.error('Failed to send welcome email:', e));
@@ -9190,7 +9190,7 @@ app.post('/api/notifications', async (req, res) => {
       .input('uid', sql.Int, target_user_id)
       .input('msg', sql.NVarChar, message)
       .input('type', sql.NVarChar, type || 'General')
-      .query('INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@uid, @msg, @type, 0, DATEADD(MINUTE, 330, GETUTCDATE()))');
+      .query('INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@uid, @msg, @type, 0, GETDATE())');
     res.json({ success: true, message: 'Notification created successfully' });
   } catch (err) {
     console.error('[NOTIFICATIONS CREATE ERROR]', err);
@@ -9308,7 +9308,7 @@ app.get('/api/admin/onboarding/audit-now', verifyToken, async (req, res) => {
     if (adminEmails.length > 0) {
       await sendAppEmail({
         to: adminEmails.join(','),
-        subject: `📋 Manual Onboarding Alert: ${candidates.length} Promotions Pending`,
+        subject: `ðŸ“‹ Manual Onboarding Alert: ${candidates.length} Promotions Pending`,
         html: getPromotionReminderHtml(candidates),
         text: `Daily Alert: There are ${candidates.length} team members eligible for promotion to full-time status.`
       });
@@ -9583,7 +9583,7 @@ app.post('/api/interns', async (req, res) => {
     if (email) {
       sendAppEmail({
         to: email,
-        subject: `Welcome to Navabharath Technologies, ${name}! 🎉`,
+        subject: `Welcome to Navabharath Technologies, ${name}! ðŸŽ‰`,
         html: getWelcomeDayOneHtml(name, 'Intern', role || 'Intern', email, finalPassword),
         text: `Welcome to the team, ${name}! Your email: ${email}, password: ${finalPassword}`
       }).catch(e => console.error('Failed to send welcome email:', e));
@@ -9755,7 +9755,7 @@ app.post('/api/admin/onboarding/promote', verifyToken, async (req, res) => {
         try {
           await sendAppEmail({
             to: finalEmail,
-            subject: `💼 Confirmation of Employment - Congratulations!`,
+            subject: `ðŸ’¼ Confirmation of Employment - Congratulations!`,
             html: getEmploymentConfirmationHtml(person.name, finalDesignation, finalEmpId, finalTeam, person.joining_date, plainPassword, finalEmail),
             text: `Dear ${person.name}, your transition has been officially approved! We confirm your appointment as a permanent, full-time employee at Navabharath Technologies. Your new login password is: ${plainPassword}`
           });
@@ -10014,7 +10014,7 @@ app.post('/api/support-tickets', async (req, res) => {
           await pool.request()
             .input('targetId', sql.Int, hrId)
             .input('msg', sql.NVarChar, `New Support Ticket #${ticketNum} (${routingDept}) from ${creatorName || 'Anonymous'}: ${subject}`)
-            .query('INSERT INTO notifications (target_user_id, message, is_read, created_at) VALUES (@targetId, @msg, 0, DATEADD(MINUTE, 330, GETUTCDATE()))');
+            .query('INSERT INTO notifications (target_user_id, message, is_read, created_at) VALUES (@targetId, @msg, 0, GETDATE())');
         }
       } else if (selectedDept === 'technical' || selectedDept === 'tichnical') {
         // As per requirements, do not send notifications to the team leader when technical tickets are raised.
@@ -10049,7 +10049,7 @@ app.put('/api/support-tickets/:id', async (req, res) => {
     }
     const ticketInfo = ticketRes.recordset[0];
 
-    let query = 'UPDATE support_tickets SET updated_at = DATEADD(MINUTE, 330, GETUTCDATE())';
+    let query = 'UPDATE support_tickets SET updated_at = GETDATE()';
     const request = pool.request().input('id', sql.Int, id);
 
     if (status) {
@@ -10085,7 +10085,7 @@ app.put('/api/support-tickets/:id', async (req, res) => {
         await pool.request()
           .input('uid', sql.Int, ticketInfo.user_id)
           .input('msg', sql.NVarChar, `Your ticket #${ticketNum} ("${ticketInfo.subject}") status has been updated to "${status}".`)
-          .query('INSERT INTO notifications (target_user_id, message, is_read, created_at) VALUES (@uid, @msg, 0, DATEADD(MINUTE, 330, GETUTCDATE()))');
+          .query('INSERT INTO notifications (target_user_id, message, is_read, created_at) VALUES (@uid, @msg, 0, GETDATE())');
       } catch (notifErr) {
         console.error('[TICKET NOTIFICATION WARNING]:', notifErr.message);
       }
@@ -10299,12 +10299,12 @@ const handleUserCourseSync = async (req, res) => {
               completed = @comp, 
               user_email = @email,
               course_title = @title,
-              completed_at = CASE WHEN @comp = 1 THEN DATEADD(MINUTE, 330, GETUTCDATE()) ELSE completed_at END, 
-              updated_at = DATEADD(MINUTE, 330, GETUTCDATE()) 
+              completed_at = CASE WHEN @comp = 1 THEN GETDATE() ELSE completed_at END, 
+              updated_at = GETDATE() 
             WHERE user_id = @uid AND course_id = @cid
           ELSE
             INSERT INTO user_courses (user_id, user_email, course_id, course_title, completed, completed_at, updated_at) 
-            VALUES (@uid, @email, @cid, @title, @comp, CASE WHEN @comp = 1 THEN DATEADD(MINUTE, 330, GETUTCDATE()) ELSE NULL END, DATEADD(MINUTE, 330, GETUTCDATE()))
+            VALUES (@uid, @email, @cid, @title, @comp, CASE WHEN @comp = 1 THEN GETDATE() ELSE NULL END, GETDATE())
         `);
 
       // Send Email if newly completed and not already sent
@@ -10315,7 +10315,7 @@ const handleUserCourseSync = async (req, res) => {
           await pool.request()
             .input('uid', sql.Int, userId)
             .input('cid', sql.Int, courseId)
-            .query('UPDATE user_courses SET email_sent = 1, email_sent_at = DATEADD(MINUTE, 330, GETUTCDATE()) WHERE user_id = @uid AND course_id = @cid');
+            .query('UPDATE user_courses SET email_sent = 1, email_sent_at = GETDATE() WHERE user_id = @uid AND course_id = @cid');
         } catch (e) { console.error('[USER COURSES SYNC EMAIL ERROR]:', e); }
       }
 
@@ -10350,7 +10350,7 @@ const handleUserCourseSync = async (req, res) => {
         .input('status', sql.NVarChar, finalStatus)
         .query(`
           IF EXISTS (SELECT 1 FROM joinee_course_progress WHERE joinee_id = @jid AND course_id = @cid)
-            UPDATE joinee_course_progress SET is_completed = @comp, status = @status, updated_at = DATEADD(MINUTE, 330, GETUTCDATE()) WHERE joinee_id = @jid AND course_id = @cid
+            UPDATE joinee_course_progress SET is_completed = @comp, status = @status, updated_at = GETDATE() WHERE joinee_id = @jid AND course_id = @cid
           ELSE
             INSERT INTO joinee_course_progress (joinee_id, course_id, is_completed, status) VALUES (@jid, @cid, @comp, @status)
         `);
@@ -10483,7 +10483,7 @@ app.post('/api/send-certificate', verifyToken, async (req, res) => {
           .input('cid', sql.Int, resolvedCourseId)
           .query(`
             UPDATE user_courses 
-            SET email_sent = 1, email_sent_at = DATEADD(MINUTE, 330, GETUTCDATE())
+            SET email_sent = 1, email_sent_at = GETDATE()
             WHERE user_id = @uid AND course_id = @cid
           `);
       } else {
@@ -10511,10 +10511,10 @@ app.post('/api/send-certificate', verifyToken, async (req, res) => {
             .input('email', sql.NVarChar, finalEmail)
             .query(`
               IF EXISTS (SELECT 1 FROM user_courses WHERE user_id = @uid AND course_id = @cid)
-                UPDATE user_courses SET email_sent = 1, email_sent_at = DATEADD(MINUTE, 330, GETUTCDATE()) WHERE user_id = @uid AND course_id = @cid
+                UPDATE user_courses SET email_sent = 1, email_sent_at = GETDATE() WHERE user_id = @uid AND course_id = @cid
               ELSE
                 INSERT INTO user_courses (user_id, user_email, course_id, course_title, completed, email_sent, email_sent_at, completed_at, updated_at)
-                VALUES (@uid, @email, @cid, @title, 1, 1, DATEADD(MINUTE, 330, GETUTCDATE()), DATEADD(MINUTE, 330, GETUTCDATE()), DATEADD(MINUTE, 330, GETUTCDATE()))
+                VALUES (@uid, @email, @cid, @title, 1, 1, GETDATE(), GETDATE(), GETDATE())
             `);
         }
       }
@@ -10616,7 +10616,7 @@ app.post('/api/courses', verifyToken, memoryUpload.fields([{ name: 'pdf', maxCou
           deadline, created_at, updated_at
         ) VALUES (
           @title, @description, @category, @pdf_url, @video_url, 
-          @deadline, DATEADD(MINUTE, 330, GETUTCDATE()), DATEADD(MINUTE, 330, GETUTCDATE())
+          @deadline, GETDATE(), GETDATE()
         )
       `);
     res.status(201).json({ message: 'Course successfully published to academic catalog' });
@@ -10658,7 +10658,7 @@ app.put('/api/courses/:id', verifyToken, memoryUpload.fields([{ name: 'pdf', max
 
   try {
     const pool = await getPool();
-    let query = 'UPDATE courses SET updated_at = DATEADD(MINUTE, 330, GETUTCDATE())';
+    let query = 'UPDATE courses SET updated_at = GETDATE()';
     const request = pool.request().input('id', sql.Int, id);
 
     if (title !== undefined) {
@@ -10739,12 +10739,12 @@ app.put('/api/courses/:id', verifyToken, memoryUpload.fields([{ name: 'pdf', max
                 completed = @comp, 
                 user_email = @email,
                 course_title = @title,
-                completed_at = CASE WHEN @comp = 1 THEN DATEADD(MINUTE, 330, GETUTCDATE()) ELSE NULL END,
-                updated_at = DATEADD(MINUTE, 330, GETUTCDATE())
+                completed_at = CASE WHEN @comp = 1 THEN GETDATE() ELSE NULL END,
+                updated_at = GETDATE()
               WHERE user_id = @uid AND course_id = @cid
             ELSE
               INSERT INTO user_courses (user_id, user_email, course_id, course_title, completed, completed_at, updated_at) 
-              VALUES (@uid, @email, @cid, @title, @comp, CASE WHEN @comp = 1 THEN DATEADD(MINUTE, 330, GETUTCDATE()) ELSE NULL END, DATEADD(MINUTE, 330, GETUTCDATE()))
+              VALUES (@uid, @email, @cid, @title, @comp, CASE WHEN @comp = 1 THEN GETDATE() ELSE NULL END, GETDATE())
           `);
 
         // Trigger certificate if newly completed
@@ -10754,7 +10754,7 @@ app.put('/api/courses/:id', verifyToken, memoryUpload.fields([{ name: 'pdf', max
             const mailCheck = await pool.request().input('uid', sql.Int, userId).input('cid', sql.Int, id).query('SELECT email_sent FROM user_courses WHERE user_id = @uid AND course_id = @cid');
             if (mailCheck.recordset.length > 0 && !mailCheck.recordset[0].email_sent) {
               await sendCertificateEmail(userEmail, userName, courseTitle);
-              await pool.request().input('uid', sql.Int, userId).input('cid', sql.Int, id).query('UPDATE user_courses SET email_sent = 1, email_sent_at = DATEADD(MINUTE, 330, GETUTCDATE()) WHERE user_id = @uid AND course_id = @cid');
+              await pool.request().input('uid', sql.Int, userId).input('cid', sql.Int, id).query('UPDATE user_courses SET email_sent = 1, email_sent_at = GETDATE() WHERE user_id = @uid AND course_id = @cid');
             }
           } catch (e) { console.error('PUT completion email fail:', e); }
         }
@@ -10824,12 +10824,12 @@ app.post('/api/courses/:courseId/complete', verifyToken, async (req, res) => {
             completed = 1, 
             user_email = @email,
             course_title = @title,
-            completed_at = DATEADD(MINUTE, 330, GETUTCDATE()), 
-            updated_at = DATEADD(MINUTE, 330, GETUTCDATE()) 
+            completed_at = GETDATE(), 
+            updated_at = GETDATE() 
           WHERE user_id = @uid AND course_id = @cid
         ELSE
           INSERT INTO user_courses (user_id, user_email, course_id, course_title, completed, completed_at, updated_at) 
-          VALUES (@uid, @email, @cid, @title, 1, DATEADD(MINUTE, 330, GETUTCDATE()), DATEADD(MINUTE, 330, GETUTCDATE()))
+          VALUES (@uid, @email, @cid, @title, 1, GETDATE(), GETDATE())
       `);
 
     // 3. Send Email if not already sent
@@ -10840,7 +10840,7 @@ app.post('/api/courses/:courseId/complete', verifyToken, async (req, res) => {
         await pool.request()
           .input('uid', sql.Int, userId)
           .input('cid', sql.Int, courseId)
-          .query('UPDATE user_courses SET email_sent = 1, email_sent_at = DATEADD(MINUTE, 330, GETUTCDATE()) WHERE user_id = @uid AND course_id = @cid');
+          .query('UPDATE user_courses SET email_sent = 1, email_sent_at = GETDATE() WHERE user_id = @uid AND course_id = @cid');
       } catch (e) { console.error('Email fail:', e); }
     }
 
@@ -10877,7 +10877,7 @@ app.post('/api/courses/progress', verifyToken, async (req, res) => {
         .input('status', sql.NVarChar, isComp ? 'Completed' : 'In Progress')
         .query(`
           IF EXISTS (SELECT 1 FROM joinee_course_progress WHERE joinee_id = @jid AND course_id = @cid)
-            UPDATE joinee_course_progress SET is_completed = @comp, status = @status, updated_at = DATEADD(MINUTE, 330, GETUTCDATE()) WHERE joinee_id = @jid AND course_id = @cid
+            UPDATE joinee_course_progress SET is_completed = @comp, status = @status, updated_at = GETDATE() WHERE joinee_id = @jid AND course_id = @cid
           ELSE
             INSERT INTO joinee_course_progress (joinee_id, course_id, is_completed, status) VALUES (@jid, @cid, @comp, @status)
         `);
@@ -10930,12 +10930,12 @@ app.post('/api/courses/progress', verifyToken, async (req, res) => {
             completed = @comp, 
             user_email = @email,
             course_title = @title,
-            completed_at = CASE WHEN @comp = 1 THEN DATEADD(MINUTE, 330, GETUTCDATE()) ELSE completed_at END, 
-            updated_at = DATEADD(MINUTE, 330, GETUTCDATE()) 
+            completed_at = CASE WHEN @comp = 1 THEN GETDATE() ELSE completed_at END, 
+            updated_at = GETDATE() 
           WHERE user_id = @uid AND course_id = @cid
         ELSE
           INSERT INTO user_courses (user_id, user_email, course_id, course_title, completed, completed_at, updated_at) 
-          VALUES (@uid, @email, @cid, @title, @comp, CASE WHEN @comp = 1 THEN DATEADD(MINUTE, 330, GETUTCDATE()) ELSE NULL END, DATEADD(MINUTE, 330, GETUTCDATE()))
+          VALUES (@uid, @email, @cid, @title, @comp, CASE WHEN @comp = 1 THEN GETDATE() ELSE NULL END, GETDATE())
       `);
 
     // Send Email if newly completed and not already sent
@@ -10946,7 +10946,7 @@ app.post('/api/courses/progress', verifyToken, async (req, res) => {
         await pool.request()
           .input('uid', sql.Int, userId)
           .input('cid', sql.Int, finalCourseId)
-          .query('UPDATE user_courses SET email_sent = 1, email_sent_at = DATEADD(MINUTE, 330, GETUTCDATE()) WHERE user_id = @uid AND course_id = @cid');
+          .query('UPDATE user_courses SET email_sent = 1, email_sent_at = GETDATE() WHERE user_id = @uid AND course_id = @cid');
       } catch (e) { console.error('Progress email fail:', e); }
     }
 
@@ -11184,7 +11184,7 @@ app.post('/api/newjoinee-courses', verifyToken, memoryUpload.fields([{ name: 'pd
           deadline, uploaded_by, created_at, updated_at
         ) VALUES (
           @title, @description, @category, @pdf_url, @pdf_data, @pdf_name, @video_url, @video_data, 
-          @deadline, @uploadedBy, DATEADD(MINUTE, 330, GETUTCDATE()), DATEADD(MINUTE, 330, GETUTCDATE())
+          @deadline, @uploadedBy, GETDATE(), GETDATE()
         )
       `);
     res.status(201).json({ message: 'Course successfully added to global onboarding curriculum' });
@@ -11216,7 +11216,7 @@ app.put('/api/newjoinee-courses/:id', verifyToken, memoryUpload.fields([{ name: 
       if (!isAuthorized) {
         return res.status(403).json({ error: 'Unauthorized: Only HR, PM, and Admins can update course metadata' });
       }
-      let query = 'UPDATE newjoinee_courses SET updated_at = DATEADD(MINUTE, 330, GETUTCDATE())';
+      let query = 'UPDATE newjoinee_courses SET updated_at = GETDATE()';
       const request = pool.request().input('id', sql.Int, id);
 
       if (title !== undefined) { query += ', title = @title'; request.input('title', sql.NVarChar, title); }
@@ -11288,7 +11288,7 @@ app.put('/api/newjoinee-courses/:id', verifyToken, memoryUpload.fields([{ name: 
         .input('status', sql.NVarChar, finalStatus)
         .query(`
           IF EXISTS (SELECT 1 FROM joinee_course_progress WHERE joinee_id = @jid AND course_id = @cid)
-            UPDATE joinee_course_progress SET is_completed = @comp, status = @status, updated_at = DATEADD(MINUTE, 330, GETUTCDATE()) WHERE joinee_id = @jid AND course_id = @cid
+            UPDATE joinee_course_progress SET is_completed = @comp, status = @status, updated_at = GETDATE() WHERE joinee_id = @jid AND course_id = @cid
           ELSE
             INSERT INTO joinee_course_progress (joinee_id, course_id, is_completed, status) VALUES (@jid, @cid, @comp, @status)
         `);
@@ -11438,8 +11438,8 @@ app.post('/api/leaves/request', verifyToken, async (req, res) => {
         FROM users u
         LEFT JOIN users m ON u.reporting_manager_id = m.id
         LEFT JOIN leave_stats ls ON u.id = ls.employee_id 
-             AND ls.month = MONTH(DATEADD(MINUTE, 330, GETUTCDATE())) 
-             AND ls.year = YEAR(DATEADD(MINUTE, 330, GETUTCDATE()))
+             AND ls.month = MONTH(GETDATE()) 
+             AND ls.year = YEAR(GETDATE())
         WHERE u.id = @id
       `);
 
@@ -11632,7 +11632,7 @@ app.post('/api/leaves/request', verifyToken, async (req, res) => {
       await pool.request()
         .input('targetId', sql.Int, notifierId)
         .input('msg', sql.NVarChar, `New Leave Request from ${employee.name} (${leaveType}): ${startDate} to ${endDate}`)
-        .query('INSERT INTO notifications (target_user_id, message, is_read, created_at) VALUES (@targetId, @msg, 0, DATEADD(MINUTE, 330, GETUTCDATE()))');
+        .query('INSERT INTO notifications (target_user_id, message, is_read, created_at) VALUES (@targetId, @msg, 0, GETDATE())');
     }
 
     res.json({ success: true, message: 'Leave application submitted and authorities notified', leaveId });
@@ -11990,7 +11990,7 @@ app.put(['/api/admin/leaves/stats', '/api/admin/leave_stats'], verifyToken, asyn
         .input('hd', sql.Int, half_days || 0)
         .query(`
           INSERT INTO leave_stats (employee_id, month, year, leaves_available, leaves_taken, LOP, half_days, updated_at)
-          VALUES (@eid, @m, @y, @av, @tk, @lop, @hd, DATEADD(MINUTE, 330, GETUTCDATE()))
+          VALUES (@eid, @m, @y, @av, @tk, @lop, @hd, GETDATE())
         `);
       return res.json({ success: true, message: 'Leave stats record created.' });
     } else {
@@ -12009,7 +12009,7 @@ app.put(['/api/admin/leaves/stats', '/api/admin/leave_stats'], verifyToken, asyn
             leaves_taken = COALESCE(@tk, leaves_taken),
             LOP = COALESCE(@lop, LOP),
             half_days = COALESCE(@hd, half_days),
-            updated_at = DATEADD(MINUTE, 330, GETUTCDATE())
+            updated_at = GETDATE()
           WHERE employee_id = @eid AND month = @m AND year = @y
         `);
       return res.json({ success: true, message: 'Leave stats updated successfully.' });
@@ -12312,8 +12312,8 @@ app.put(['/api/leaves/:id/status', '/api/ceo/leaves/:id/status'], verifyToken, a
             SELECT leaves_available 
             FROM leave_stats 
             WHERE employee_id = @uid 
-            AND month = MONTH(DATEADD(MINUTE, 330, GETUTCDATE())) 
-            AND year = YEAR(DATEADD(MINUTE, 330, GETUTCDATE()))
+            AND month = MONTH(GETDATE()) 
+            AND year = YEAR(GETDATE())
           `);
         const oldBalance = userRes.recordset[0]?.leaves_available || 0;
 
@@ -12366,7 +12366,7 @@ app.put(['/api/leaves/:id/status', '/api/ceo/leaves/:id/status'], verifyToken, a
       await pool.request()
         .input('userId', sql.Int, leave.user_id)
         .input('msg', sql.NVarChar, notifMsg)
-        .query('INSERT INTO notifications (target_user_id, message, is_read, created_at) VALUES (@userId, @msg, 0, DATEADD(MINUTE, 330, GETUTCDATE()))');
+        .query('INSERT INTO notifications (target_user_id, message, is_read, created_at) VALUES (@userId, @msg, 0, GETDATE())');
 
       res.json({ success: true, message: `Leave ${status} successfully by ${isRM ? 'RM' : isPM ? 'PM' : 'HR'}`, finalStatus });
     } catch (innerErr) {
@@ -12393,8 +12393,8 @@ app.get('/api/leaves/balance/:userId', async (req, res) => {
         SELECT ISNULL(ls.leaves_available, 0) as leave_balance, u.name, u.joining_date 
         FROM users u
         LEFT JOIN leave_stats ls ON u.id = ls.employee_id 
-             AND ls.month = MONTH(DATEADD(MINUTE, 330, GETUTCDATE())) 
-             AND ls.year = YEAR(DATEADD(MINUTE, 330, GETUTCDATE()))
+             AND ls.month = MONTH(GETDATE()) 
+             AND ls.year = YEAR(GETDATE())
         WHERE u.id = @id
       `);
 
@@ -12571,7 +12571,7 @@ app.post(['/api/leaves/balance/update', '/api/leaves/stats/update'], verifyToken
     await pool.request()
       .input('id', sql.Int, userId)
       .input('msg', sql.NVarChar, logMsg)
-      .query('INSERT INTO notifications (target_user_id, message, is_read, created_at) VALUES (@id, @msg, 0, DATEADD(MINUTE, 330, GETUTCDATE()))');
+      .query('INSERT INTO notifications (target_user_id, message, is_read, created_at) VALUES (@id, @msg, 0, GETDATE())');
 
     res.json({ success: true, message: 'Monthly stats updated successfully' });
   } catch (err) {
@@ -12588,7 +12588,7 @@ app.post(['/api/leaves/balance/update', '/api/leaves/stats/update'], verifyToken
 const triggerAttendanceSync = async (timeLabel) => {
   console.log(`[SCHEDULED TASK - ${timeLabel}] Triggering Biometric Attendance Sync...`);
   try {
-    // Use 3 days to always cover the Fri→Sat→Sun→Mon weekend gap.
+    // Use 3 days to always cover the Friâ†’Satâ†’Sunâ†’Mon weekend gap.
     // Monday's first cron run will automatically pull Saturday's data.
     await importAttendance(3);
     console.log(`[SCHEDULED TASK - ${timeLabel}] Biometric Sync Successful.`);
@@ -12631,8 +12631,8 @@ const autoPostBirthdays = async () => {
     const birthdayBoys = await pool.request().query(`
       SELECT id, name, role FROM users 
       WHERE date_of_birth IS NOT NULL AND status = 'Active'
-      AND MONTH(date_of_birth) = MONTH(DATEADD(MINUTE, 330, GETUTCDATE()))
-      AND DAY(date_of_birth) = DAY(DATEADD(MINUTE, 330, GETUTCDATE()))
+      AND MONTH(date_of_birth) = MONTH(GETDATE())
+      AND DAY(date_of_birth) = DAY(GETDATE())
     `);
 
     if (birthdayBoys.recordset.length === 0) {
@@ -12652,11 +12652,11 @@ const autoPostBirthdays = async () => {
         .query(`
           SELECT 1 FROM threads 
           WHERE content LIKE @contentPart 
-          AND CAST(DATEADD(MINUTE, 330, created_at) AS DATE) = CAST(DATEADD(MINUTE, 330, GETUTCDATE()) AS DATE)
+          AND CAST(DATEADD(MINUTE, 330, created_at) AS DATE) = CAST(GETDATE() AS DATE)
         `);
 
       if (checkResult.recordset.length === 0) {
-        const wishMessage = `Happy Birthday ${user.name} from Navabharath Technologies Mysuru! 🎂🎉 Wish you a great year ahead!`;
+        const wishMessage = `Happy Birthday ${user.name} from Navabharath Technologies Mysuru! ðŸŽ‚ðŸŽ‰ Wish you a great year ahead!`;
 
         await pool.request()
           .input('userId', sql.Int, systemId)
@@ -12665,7 +12665,7 @@ const autoPostBirthdays = async () => {
           .input('content', sql.NVarChar, wishMessage)
           .query(`
             INSERT INTO threads (user_id, employee_name, role, content, media_url, media_type, created_at)
-            VALUES (@userId, @name, @role, @content, NULL, 'text', DATEADD(MINUTE, 330, GETUTCDATE()))
+            VALUES (@userId, @name, @role, @content, NULL, 'text', GETDATE())
           `);
 
         console.log(`[BIRTHDAY SYSTEM] Posted wish for ${user.name} as ${systemName}`);
@@ -12708,20 +12708,20 @@ cron.schedule('1 0 1 * *', async () => {
     await pool.request().query(`
       INSERT INTO leave_stats (employee_id, month, year, leaves_taken, leaves_available, LOP, updated_at)
       SELECT employee_id, 
-             MONTH(DATEADD(MINUTE, 330, GETUTCDATE())), 
-             YEAR(DATEADD(MINUTE, 330, GETUTCDATE())), 
+             MONTH(GETDATE()), 
+             YEAR(GETDATE()), 
              0, 
              leaves_available, 
              0, 
              GETDATE()
       FROM leave_stats prev
-      WHERE prev.month = MONTH(DATEADD(MONTH, -1, DATEADD(MINUTE, 330, GETUTCDATE())))
-      AND prev.year = YEAR(DATEADD(MONTH, -1, DATEADD(MINUTE, 330, GETUTCDATE())))
+      WHERE prev.month = MONTH(DATEADD(MONTH, -1, GETDATE()))
+      AND prev.year = YEAR(DATEADD(MONTH, -1, GETDATE()))
       AND NOT EXISTS (
         SELECT 1 FROM leave_stats curr 
         WHERE curr.employee_id = prev.employee_id 
-        AND curr.month = MONTH(DATEADD(MINUTE, 330, GETUTCDATE()))
-        AND curr.year = YEAR(DATEADD(MINUTE, 330, GETUTCDATE()))
+        AND curr.month = MONTH(GETDATE())
+        AND curr.year = YEAR(GETDATE())
       )
     `);
     console.log('[SCHEDULED TASK] Monthly leave stats snapshots updated with carry-forward.');
@@ -12731,12 +12731,12 @@ cron.schedule('1 0 1 * *', async () => {
     const result = await pool.request().query(`
       UPDATE leave_stats 
       SET leaves_available = leaves_available + 1, updated_at = GETDATE()
-      WHERE month = MONTH(DATEADD(MINUTE, 330, GETUTCDATE())) 
-      AND year = YEAR(DATEADD(MINUTE, 330, GETUTCDATE()))
+      WHERE month = MONTH(GETDATE()) 
+      AND year = YEAR(GETDATE())
       AND employee_id IN (
         SELECT id FROM users 
         WHERE joining_date IS NOT NULL 
-        AND DATEADD(day, 90, joining_date) <= DATEADD(MINUTE, 330, GETUTCDATE())
+        AND DATEADD(day, 90, joining_date) <= GETDATE()
       )
     `);
     console.log(`[SCHEDULED TASK] Successfully credited ${result.rowsAffected[0]} users with monthly leave (+1) in leave_stats.`);
@@ -12849,7 +12849,7 @@ cron.schedule('0 10 * * *', async () => {
     if (adminEmails.length > 0) {
       await sendAppEmail({
         to: adminEmails.join(','),
-        subject: `📋 Onboarding Alert: ${candidates.length} Promotions Pending`,
+        subject: `ðŸ“‹ Onboarding Alert: ${candidates.length} Promotions Pending`,
         html: getPromotionReminderHtml(candidates),
         text: `Daily Alert: There are ${candidates.length} team members eligible for promotion to full-time status.`
       });
@@ -12870,20 +12870,20 @@ async function executeAccrual(req, res) {
     await pool.request().query(`
       INSERT INTO leave_stats (employee_id, month, year, leaves_taken, leaves_available, LOP, updated_at)
       SELECT employee_id, 
-             MONTH(DATEADD(MINUTE, 330, GETUTCDATE())), 
-             YEAR(DATEADD(MINUTE, 330, GETUTCDATE())), 
+             MONTH(GETDATE()), 
+             YEAR(GETDATE()), 
              0, 
              leaves_available, 
              0, 
              GETDATE()
       FROM leave_stats prev
-      WHERE prev.month = MONTH(DATEADD(MONTH, -1, DATEADD(MINUTE, 330, GETUTCDATE())))
-      AND prev.year = YEAR(DATEADD(MONTH, -1, DATEADD(MINUTE, 330, GETUTCDATE())))
+      WHERE prev.month = MONTH(DATEADD(MONTH, -1, GETDATE()))
+      AND prev.year = YEAR(DATEADD(MONTH, -1, GETDATE()))
       AND NOT EXISTS (
         SELECT 1 FROM leave_stats curr 
         WHERE curr.employee_id = prev.employee_id 
-        AND curr.month = MONTH(DATEADD(MINUTE, 330, GETUTCDATE()))
-        AND curr.year = YEAR(DATEADD(MINUTE, 330, GETUTCDATE()))
+        AND curr.month = MONTH(GETDATE())
+        AND curr.year = YEAR(GETDATE())
       )
     `);
 
@@ -12891,12 +12891,12 @@ async function executeAccrual(req, res) {
     const statsResult = await pool.request().query(`
       UPDATE leave_stats 
       SET leaves_available = leaves_available + 1, updated_at = GETDATE()
-      WHERE month = MONTH(DATEADD(MINUTE, 330, GETUTCDATE())) 
-      AND year = YEAR(DATEADD(MINUTE, 330, GETUTCDATE()))
+      WHERE month = MONTH(GETDATE()) 
+      AND year = YEAR(GETDATE())
       AND employee_id IN (
         SELECT id FROM users 
         WHERE joining_date IS NOT NULL 
-        AND DATEADD(day, 90, joining_date) <= DATEADD(MINUTE, 330, GETUTCDATE())
+        AND DATEADD(day, 90, joining_date) <= GETDATE()
       )
     `);
 
@@ -13032,7 +13032,7 @@ app.post(['/api/admin/pay-slips', '/api/admin/payslips', '/api/pay_slip', '/api/
             pt_deduction = @pt_deduction, lwf = @lwf, income_tax = @income_tax, lop_deduction = @lop_deduction,
             total_deductions = @total_deductions, net_payable = @net_payable,
             updated_by = @updated_by,
-            updated_at = DATEADD(MINUTE, 330, GETUTCDATE())
+            updated_at = GETDATE()
           WHERE employee_id = @employee_id AND month = @month AND year = @year
         ELSE
           INSERT INTO pay_slips (
@@ -13329,9 +13329,9 @@ app.post('/api/admin/mandatory-suggestions/request', verifyToken, async (req, re
         text: `Hello ${emp.name}, please submit your mandatory suggestion at https://hub.navabharathtechnologies.com/suggestions/new`
       });
       results.sent.push({ email: emp.email });
-      console.log(`✅ Suggestion request sent to ${emp.email}`);
+      console.log(`âœ… Suggestion request sent to ${emp.email}`);
     } catch (err) {
-      console.error(`❌ Failed to send to ${emp.email}:`, err.message);
+      console.error(`âŒ Failed to send to ${emp.email}:`, err.message);
       results.failed.push({ email: emp.email, error: err.message });
     }
   }
@@ -13419,7 +13419,7 @@ const runSaturdayAudit = async (type = 'Reminder') => {
     Log.success('Audit', `Found ${missingEmployees.length} employees with missing suggestions.`);
 
     if (missingEmployees.length === 0) {
-      Log.success('Audit', 'All employees are compliant this week! 🎉');
+      Log.success('Audit', 'All employees are compliant this week! ðŸŽ‰');
       return { success: true, count: 0 };
     }
 
@@ -13432,7 +13432,7 @@ const runSaturdayAudit = async (type = 'Reminder') => {
 
       try {
         const isWarning = type.toLowerCase().includes('warning');
-        const subject = isWarning ? '🚨 Compliance Deadline Approaching' : '📝 Saturday Suggestion Reminder';
+        const subject = isWarning ? 'ðŸš¨ Compliance Deadline Approaching' : 'ðŸ“ Saturday Suggestion Reminder';
 
         const html = isWarning
           ? getSaturdayFinalWarningHtml(emp.name)
@@ -13796,7 +13796,7 @@ app.put(['/api/admin/pay-slips/:id', '/api/admin/payslips/:id', '/api/payslips/:
           pt_deduction = @pt_deduction, lwf = @lwf, income_tax = @income_tax, lop_deduction = @lop_deduction,
           total_deductions = @total_deductions, net_payable = @net_payable,
           updated_by = @updated_by,
-          updated_at = DATEADD(MINUTE, 330, GETUTCDATE())
+          updated_at = GETDATE()
         WHERE id = @id
       `);
 
@@ -13911,7 +13911,7 @@ app.post('/api/admin/rewards/bypass', async (req, res) => {
         .input('reason', sql.NVarChar, reason || 'Developer Adjustment')
         .query(`
           INSERT INTO employee_rewards (employee_id, reward_name, points, category, granted_by, note, created_at)
-          VALUES (@userId, @reason, @pts, 'Other', 20250, @reason, DATEADD(MINUTE, 330, GETUTCDATE()))
+          VALUES (@userId, @reason, @pts, 'Other', 20250, @reason, GETDATE())
         `);
 
       await transaction.commit();
@@ -14626,7 +14626,7 @@ app.get('/api/public/employees/leaderboard/all', async (req, res) => {
       const top3 = formatted.slice(0, 3);
       const podiumHtml = top3.map((emp, index) => {
         const medalColor = index === 0 ? 'var(--gold)' : index === 1 ? 'var(--silver)' : 'var(--bronze)';
-        const medalIcon = index === 0 ? '👑' : index === 1 ? '🥈' : '🥉';
+        const medalIcon = index === 0 ? 'ðŸ‘‘' : index === 1 ? 'ðŸ¥ˆ' : 'ðŸ¥‰';
         const rankLabel = index === 0 ? '1st' : index === 1 ? '2nd' : '3rd';
         const initials = emp.name ? emp.name.split(' ').map(n => n[0]).join('').substring(0, 2).toUpperCase() : 'EE';
 
@@ -14641,15 +14641,15 @@ app.get('/api/public/employees/leaderboard/all', async (req, res) => {
             <div class="podium-role">${emp.role || 'Team Member'}</div>
             <div class="podium-points">${emp.total_points_fmt} PTS</div>
             <div class="podium-breakdown">
-              <span class="breakdown-pill quiz">🎯 Quiz: ${emp.quiz_points_fmt}</span>
-              <span class="breakdown-pill reward">🏅 Reward: ${emp.reward_points_fmt}</span>
+              <span class="breakdown-pill quiz">ðŸŽ¯ Quiz: ${emp.quiz_points_fmt}</span>
+              <span class="breakdown-pill reward">ðŸ… Reward: ${emp.reward_points_fmt}</span>
             </div>
           </div>
         `;
       }).join('');
 
       const tableRowsHtml = formatted.map((emp, index) => {
-        const medalIcon = index === 0 ? '👑' : index === 1 ? '🥈' : index === 2 ? '🥉' : `#${emp.rank}`;
+        const medalIcon = index === 0 ? 'ðŸ‘‘' : index === 1 ? 'ðŸ¥ˆ' : index === 2 ? 'ðŸ¥‰' : `#${emp.rank}`;
         const medalStyle = index === 0 ? 'color: var(--gold); font-weight: bold;' : index === 1 ? 'color: var(--silver); font-weight: bold;' : index === 2 ? 'color: var(--bronze); font-weight: bold;' : '';
         const initials = emp.name ? emp.name.split(' ').map(n => n[0]).join('').substring(0, 2).toUpperCase() : 'EE';
 
@@ -14670,7 +14670,7 @@ app.get('/api/public/employees/leaderboard/all', async (req, res) => {
             </td>
             <td class="table-cell">${emp.role || '----'}</td>
             <td class="table-cell"><span class="team-badge">${emp.team || '----'}</span></td>
-            <td class="table-cell text-center">${emp.total_awards} 🏆</td>
+            <td class="table-cell text-center">${emp.total_awards} ðŸ†</td>
             <td class="table-cell points-col text-right quiz-pts">${emp.quiz_points_fmt}</td>
             <td class="table-cell points-col text-right reward-pts">${emp.reward_points_fmt}</td>
             <td class="table-cell points-col text-right total-pts">${emp.total_points_fmt}</td>
@@ -15073,9 +15073,9 @@ app.get('/api/public/employees/leaderboard/all', async (req, res) => {
             <th class="header-cell">Designation</th>
             <th class="header-cell">Team</th>
             <th class="header-cell text-center">Awards</th>
-            <th class="header-cell text-right" style="color:#6ee7b7">🎯 Quiz Pts</th>
-            <th class="header-cell text-right" style="color:#fcd34d">🏅 Reward Pts</th>
-            <th class="header-cell text-right" style="color:#818cf8">⭐ Total Pts</th>
+            <th class="header-cell text-right" style="color:#6ee7b7">ðŸŽ¯ Quiz Pts</th>
+            <th class="header-cell text-right" style="color:#fcd34d">ðŸ… Reward Pts</th>
+            <th class="header-cell text-right" style="color:#818cf8">â­ Total Pts</th>
           </tr>
         </thead>
         <tbody>
@@ -15212,7 +15212,7 @@ app.post(['/api/quizzes', '/api/fun-quizzes'], verifyToken, async (req, res) => 
         .input('creatorId', sql.Int, req.user.id)
         .query(`
           INSERT INTO notifications (target_user_id, message, type, is_read, created_at)
-          SELECT id, @msg, 'QUIZ', 0, DATEADD(MINUTE, 330, GETUTCDATE())
+          SELECT id, @msg, 'QUIZ', 0, GETDATE()
           FROM users WITH (NOLOCK)
           WHERE id <> @creatorId
         `);
@@ -15626,7 +15626,7 @@ app.get(['/api/fun-quizzes/leaderboard', '/api/quizzes/leaderboard/daily'], veri
         JOIN fun_quizzes fq ON qa.quiz_id = fq.id
         WHERE qa.is_correct = 1
         AND qa.employee_id NOT IN (SELECT id FROM users WHERE status = 'Resigned')
-        AND CAST(qa.created_at AS DATE) = CAST(DATEADD(MINUTE, 330, GETUTCDATE()) AS DATE)
+        AND CAST(qa.created_at AS DATE) = CAST(GETDATE() AS DATE)
         GROUP BY qa.employee_id
         ORDER BY points DESC
       `);
@@ -15785,7 +15785,7 @@ app.post('/api/my-documents', verifyToken, async (req, res) => {
             aadhaar_number = @aadhaar_number, passport_no = @passport_no, driving_license = @driving_license,
             pf_account_number = @pf_account_number, uan_number = @uan_number, esic_number = @esic_number,
             nominee_name = @nominee_name, nominee_relationship = @nominee_relationship, nominee_contact = @nominee_contact,
-            updated_at = DATEADD(MINUTE, 330, GETUTCDATE())
+            updated_at = GETDATE()
           WHERE employee_id = @userId
         END
         ELSE
@@ -15882,7 +15882,7 @@ app.post('/api/resignations', verifyToken, async (req, res) => {
     // Notify employee themselves
     await pool.request()
       .input('uid', sql.Int, userId)
-      .query("INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@uid, 'Your resignation is submitted successfully and is pending review', 'Resignation', 0, DATEADD(MINUTE, 330, GETUTCDATE()))");
+      .query("INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@uid, 'Your resignation is submitted successfully and is pending review', 'Resignation', 0, GETDATE())");
 
     // Query managers and HR to notify
     const managerId = employee.reporting_manager_id;
@@ -15924,7 +15924,7 @@ app.post('/api/resignations', verifyToken, async (req, res) => {
       await pool.request()
         .input('targetId', sql.Int, notifierId)
         .input('msg', sql.NVarChar, `New Resignation Request from ${employee.name}`)
-        .query("INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@targetId, @msg, 'Resignation', 0, DATEADD(MINUTE, 330, GETUTCDATE()))");
+        .query("INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@targetId, @msg, 'Resignation', 0, GETDATE())");
     }
 
     res.json({ success: true, message: 'Resignation submitted successfully. Pending review.' });
@@ -16064,7 +16064,7 @@ app.put('/api/admin/resignations/:id/review', verifyToken, async (req, res) => {
       // 2. Perform updates to resignations table
       const request = new sql.Request(transaction).input('id', sql.Int, id);
 
-      let updateQuery = "UPDATE resignations SET updated_at = DATEADD(MINUTE, 330, GETUTCDATE())";
+      let updateQuery = "UPDATE resignations SET updated_at = GETDATE()";
       let sets = [];
 
       if (finalHRStatus) {
@@ -16144,7 +16144,7 @@ app.put('/api/admin/resignations/:id/review', verifyToken, async (req, res) => {
         await new sql.Request(transaction)
           .input('uid', sql.Int, targetEmpId)
           .input('msg', sql.NVarChar, notificationMsg)
-          .query("INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@uid, @msg, 'Resignation', 0, DATEADD(MINUTE, 330, GETUTCDATE()))");
+          .query("INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@uid, @msg, 'Resignation', 0, GETDATE())");
 
         // Notify managers and HR/Admin/CEO
         const empResult = await new sql.Request(transaction)
@@ -16195,7 +16195,7 @@ app.put('/api/admin/resignations/:id/review', verifyToken, async (req, res) => {
             await new sql.Request(transaction)
               .input('mId', sql.Int, mId)
               .input('msg', sql.NVarChar, managerMsg)
-              .query("INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@mId, @msg, 'Resignation', 0, DATEADD(MINUTE, 330, GETUTCDATE()))");
+              .query("INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@mId, @msg, 'Resignation', 0, GETDATE())");
           }
         }
       }
@@ -16261,7 +16261,7 @@ app.post(['/api/service-certificates', '/api/service_certificate_requests'], ver
         INSERT INTO service_certificate_requests 
           (employee_id, purpose, designation_at_request, laptop_details, serial_number, mouse, keyboard, laptop_stand, ruf_pad, pendrive, company_mobile, external_camera, earphone_headphone, tablet, hr_status, pm_status, created_at, updated_at)
         VALUES 
-          (@employee_id, @purpose, @designation, @laptop, @serial, @mouse, @keyboard, @laptop_stand, @ruf_pad, @pendrive, @company_mobile, @external_camera, @earphone_headphone, @tablet, 'Pending', 'Pending', DATEADD(MINUTE, 330, GETUTCDATE()), DATEADD(MINUTE, 330, GETUTCDATE()))
+          (@employee_id, @purpose, @designation, @laptop, @serial, @mouse, @keyboard, @laptop_stand, @ruf_pad, @pendrive, @company_mobile, @external_camera, @earphone_headphone, @tablet, 'Pending', 'Pending', GETDATE(), GETDATE())
       `);
 
     res.status(201).json({ success: true, message: 'Service certificate application submitted successfully.' });
@@ -16502,7 +16502,7 @@ const addCertAssetsToStock = async (pool, cert, body) => {
         @laptop_details, @mouse, @keyboard, @laptop_stand, @ruf_pad, 
         @pendrive, @mobile, @camera, @earphone_headphone, @tablet,
         @returned_by_employee_id, @returned_by_name, @returned_by_designation,
-        DATEADD(MINUTE, 330, GETUTCDATE()), DATEADD(MINUTE, 330, GETUTCDATE()), DATEADD(MINUTE, 330, GETUTCDATE())
+        GETDATE(), GETDATE(), GETDATE()
       )
     `);
     console.log(`[CERT APPROVE] Assets added to stock (with employee audit) for cert request: ${cert.id}`);
@@ -16647,7 +16647,7 @@ app.put(['/api/admin/service-certificates/:id', '/api/service-certificates/:id',
       if (certificate) {
         // --- UPDATE PATH ---
         console.log(`[CERT UPDATE] Updating existing record ID: ${certificate.id}`);
-        let updateQuery = "UPDATE service_certificate_requests SET updated_at = DATEADD(MINUTE, 330, GETUTCDATE())";
+        let updateQuery = "UPDATE service_certificate_requests SET updated_at = GETDATE()";
         let sets = [];
 
         request.input('id', sql.Int, certificate.id);
@@ -16719,7 +16719,7 @@ app.put(['/api/admin/service-certificates/:id', '/api/service-certificates/:id',
         request.input('designation_at_request', sql.NVarChar, finalDesignation);
 
         let cols = ['employee_id', 'purpose', 'hr_status', 'pm_status', 'designation_at_request', 'created_at', 'updated_at'];
-        let vals = ['@emp_id', '@purpose', '@hr_status', '@pm_status', '@designation_at_request', 'DATEADD(MINUTE, 330, GETUTCDATE())', 'DATEADD(MINUTE, 330, GETUTCDATE())'];
+        let vals = ['@emp_id', '@purpose', '@hr_status', '@pm_status', '@designation_at_request', 'GETDATE()', 'GETDATE()'];
 
         if (finalAdminRemark !== undefined) {
           cols.push('admin_remark');
@@ -17349,7 +17349,7 @@ app.post('/api/exit-formalities', verifyToken, async (req, res) => {
           notice_period_served = @notice_period_served,
           recovery_details = @recovery_details,
           final_settlement_date = @final_settlement_date,
-          updated_at = DATEADD(MINUTE, 330, GETUTCDATE())
+          updated_at = GETDATE()
         WHERE id = @id
       `);
       
@@ -17383,7 +17383,7 @@ app.post('/api/exit-formalities', verifyToken, async (req, res) => {
         await pool.request()
           .input('uid', sql.Int, efRec.employee_id)
           .input('msg', sql.NVarChar, notificationMsg)
-          .query("INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@uid, @msg, 'Exit Formalities', 0, DATEADD(MINUTE, 330, GETUTCDATE()))");
+          .query("INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@uid, @msg, 'Exit Formalities', 0, GETDATE())");
       }
 
       res.json({ success: true, message: 'Exit formalities record updated successfully.', id: recordId });
@@ -17423,7 +17423,7 @@ app.post('/api/exit-formalities', verifyToken, async (req, res) => {
           @clearance_finance_status, @clearance_finance_remarks,
           @clearance_admin_status, @clearance_admin_remarks,
           @notice_period_served, @recovery_details, @final_settlement_date,
-          DATEADD(MINUTE, 330, GETUTCDATE()), DATEADD(MINUTE, 330, GETUTCDATE())
+          GETDATE(), GETDATE()
         )
       `);
       const newId = result.recordset[0].id;
@@ -17456,7 +17456,7 @@ app.post('/api/exit-formalities', verifyToken, async (req, res) => {
         await pool.request()
           .input('uid', sql.Int, efRec.employee_id)
           .input('msg', sql.NVarChar, notificationMsg)
-          .query("INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@uid, @msg, 'Exit Formalities', 0, DATEADD(MINUTE, 330, GETUTCDATE()))");
+          .query("INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@uid, @msg, 'Exit Formalities', 0, GETDATE())");
       }
 
       res.status(201).json({ success: true, message: 'Exit formalities record created successfully.', id: newId });
@@ -17526,7 +17526,7 @@ app.put('/api/exit-formalities/:id', verifyToken, async (req, res) => {
     request.input('id', sql.Int, recordId);
 
     // Dynamic field mapping
-    let sets = ["updated_at = DATEADD(MINUTE, 330, GETUTCDATE())"];
+    let sets = ["updated_at = GETDATE()"];
 
     if (resignation_id !== undefined) {
       sets.push("resignation_id = @resignation_id");
@@ -17715,7 +17715,7 @@ app.put('/api/exit-formalities/:id', verifyToken, async (req, res) => {
       await pool.request()
         .input('uid', sql.Int, efRec.employee_id)
         .input('msg', sql.NVarChar, notificationMsg)
-        .query("INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@uid, @msg, 'Exit Formalities', 0, DATEADD(MINUTE, 330, GETUTCDATE()))");
+        .query("INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@uid, @msg, 'Exit Formalities', 0, GETDATE())");
     }
 
     res.json({ success: true, message: 'Exit formalities record updated successfully.' });
@@ -17829,7 +17829,7 @@ app.post('/api/exit-feedback', verifyToken, async (req, res) => {
           hr_signature_date = @hr_signature_date,
           manager_signature = @manager_signature,
           manager_signature_date = @manager_signature_date,
-          updated_at = DATEADD(MINUTE, 330, GETUTCDATE())
+          updated_at = GETDATE()
         WHERE id = @id
       `);
 
@@ -17851,7 +17851,7 @@ app.post('/api/exit-feedback', verifyToken, async (req, res) => {
           @employee_signature, @employee_signature_date,
           @hr_signature, @hr_signature_date,
           @manager_signature, @manager_signature_date,
-          DATEADD(MINUTE, 330, GETUTCDATE()), DATEADD(MINUTE, 330, GETUTCDATE())
+          GETDATE(), GETDATE()
         )
       `);
       const newId = result.recordset[0].id;
@@ -18037,7 +18037,7 @@ app.put('/api/exit-feedback/:id', verifyToken, async (req, res) => {
     const request = pool.request();
     request.input('id', sql.Int, recordId);
 
-    let sets = ["updated_at = DATEADD(MINUTE, 330, GETUTCDATE())"];
+    let sets = ["updated_at = GETDATE()"];
 
     if (like_most !== undefined) {
       sets.push("like_most = @like_most");
@@ -18142,7 +18142,7 @@ app.put('/api/exit-feedback', verifyToken, async (req, res) => {
     const request = pool.request();
     request.input('id', sql.Int, recordId);
 
-    let sets = ["updated_at = DATEADD(MINUTE, 330, GETUTCDATE())"];
+    let sets = ["updated_at = GETDATE()"];
 
     if (like_most !== undefined) {
       sets.push("like_most = @like_most");
@@ -18999,19 +18999,19 @@ app.delete('/api/assets/:id', verifyToken, async (req, res) => {
   }
 });
 
-// GET: All assets in stock — filterable by UI tab name, returns data + tab counts together
+// GET: All assets in stock â€” filterable by UI tab name, returns data + tab counts together
 //
-// UI Filter Tab  →  ?filter=  value
-// ─────────────────────────────────────────
-// All            →  (omit param or all)
-// Laptops        →  laptops   | laptop
-// Keyboards      →  keyboards | keyboard
-// Mice           →  mice      | mouse
-// Mobiles        →  mobiles   | mobile
-// Accessories    →  accessories  (stand, ruf_pad, pendrive, camera, earphone, tablet)
-// Others         →  others    (rows with no items in any category)
+// UI Filter Tab  â†’  ?filter=  value
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// All            â†’  (omit param or all)
+// Laptops        â†’  laptops   | laptop
+// Keyboards      â†’  keyboards | keyboard
+// Mice           â†’  mice      | mouse
+// Mobiles        â†’  mobiles   | mobile
+// Accessories    â†’  accessories  (stand, ruf_pad, pendrive, camera, earphone, tablet)
+// Others         â†’  others    (rows with no items in any category)
 //
-// ?returnedBy=<emp_id>  → further filter by who returned the assets
+// ?returnedBy=<emp_id>  â†’ further filter by who returned the assets
 //
 // Response shape:
 //   {
@@ -19024,7 +19024,7 @@ app.get('/api/assets-stock', verifyToken, async (req, res) => {
 
   if (!isAdmin) return res.status(403).json({ error: 'Unauthorized: Admin access required.' });
 
-  // ── SQL condition fragments per UI tab ──────────────────────────────────────
+  // â”€â”€ SQL condition fragments per UI tab â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const TAB_CONDITIONS = {
     laptops: `(laptop_details IS NOT NULL AND laptop_details <> '')`,
     keyboards: `keyboard = 'Yes'`,
@@ -19047,7 +19047,7 @@ app.get('/api/assets-stock', verifyToken, async (req, res) => {
                   )`,
   };
 
-  // Normalise aliases  (laptops → laptops, laptop → laptops, mice → mice, mouse → mice, …)
+  // Normalise aliases  (laptops â†’ laptops, laptop â†’ laptops, mice â†’ mice, mouse â†’ mice, â€¦)
   const normaliseFilter = (raw) => {
     const f = (raw || '').trim().toLowerCase();
     if (!f || f === 'all') return 'all';
@@ -19064,7 +19064,7 @@ app.get('/api/assets-stock', verifyToken, async (req, res) => {
     const pool = await getPool();
     const request = pool.request();
 
-    // ── Build WHERE for the selected tab ────────────────────────────────────
+    // â”€â”€ Build WHERE for the selected tab â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     const activeFilter = normaliseFilter(req.query.filter || req.query.item || '');
     const filterCondition = TAB_CONDITIONS[activeFilter] || null;
 
@@ -19079,7 +19079,7 @@ app.get('/api/assets-stock', verifyToken, async (req, res) => {
 
     const whereSQL = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
 
-    // ── Run both queries in parallel ─────────────────────────────────────────
+    // â”€â”€ Run both queries in parallel â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     const [dataResult, countsResult] = await Promise.all([
       request.query(`SELECT * FROM assets_stock ${whereSQL} ORDER BY created_at DESC`),
       pool.request().query(`
@@ -19101,7 +19101,7 @@ app.get('/api/assets-stock', verifyToken, async (req, res) => {
       activeFilter,
       // Filtered list of stock rows
       data: dataResult.recordset.map(mapAssetStockRow),
-      // Counts for every tab — use these as badge numbers on the filter pills
+      // Counts for every tab â€” use these as badge numbers on the filter pills
       counts: {
         all: c.total,
         laptops: c.laptops,
@@ -19118,7 +19118,7 @@ app.get('/api/assets-stock', verifyToken, async (req, res) => {
   }
 });
 
-// GET: /api/assets-stock/summary  — lightweight alias (just the counts, no row data)
+// GET: /api/assets-stock/summary  â€” lightweight alias (just the counts, no row data)
 /**
  * Helper to dynamically count detailed assets from a table.
  */
@@ -19221,7 +19221,7 @@ const getCombinedBreakdown = (stock, assigned) => {
   };
 };
 
-// GET: /api/assets-stock/summary  — lightweight alias (returns complete detailed asset counts breakdown)
+// GET: /api/assets-stock/summary  â€” lightweight alias (returns complete detailed asset counts breakdown)
 app.get('/api/assets-stock/summary', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
   const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
@@ -19334,7 +19334,7 @@ app.post('/api/assets-stock', verifyToken, async (req, res) => {
       VALUES (
         ${columns.map(c => '@' + c).join(', ')},
         @returned_by_employee_id, @returned_by_name, @returned_by_designation,
-        DATEADD(MINUTE, 330, GETUTCDATE()), DATEADD(MINUTE, 330, GETUTCDATE()), DATEADD(MINUTE, 330, GETUTCDATE())
+        GETDATE(), GETDATE(), GETDATE()
       )
     `;
 
@@ -19391,7 +19391,7 @@ app.put('/api/assets-stock/:id', verifyToken, async (req, res) => {
 
     if (updateClauses.length === 0) return res.status(400).json({ error: 'No data provided to update' });
 
-    const query = `UPDATE assets_stock SET ${updateClauses.join(', ')}, updated_at = DATEADD(MINUTE, 330, GETUTCDATE()) WHERE id = @id`;
+    const query = `UPDATE assets_stock SET ${updateClauses.join(', ')}, updated_at = GETDATE() WHERE id = @id`;
     await request.query(query);
     res.json({ success: true, message: 'Stock asset record updated' });
   } catch (err) {
@@ -19550,7 +19550,7 @@ app.post('/api/assets/release', verifyToken, async (req, res) => {
     await transaction.begin();
 
     try {
-      // Insert into assets_stock — preserve the returning employee's details for audit trail
+      // Insert into assets_stock â€” preserve the returning employee's details for audit trail
       const insertReq = new sql.Request(transaction);
       const columns = [
         'laptop_details', 'mouse', 'keyboard', 'laptop_stand', 'ruf_pad',
@@ -19581,7 +19581,7 @@ app.post('/api/assets/release', verifyToken, async (req, res) => {
         VALUES (
           ${columns.map(c => '@' + c).join(', ')},
           @returned_by_employee_id, @returned_by_name, @returned_by_designation,
-          DATEADD(MINUTE, 330, GETUTCDATE()), DATEADD(MINUTE, 330, GETUTCDATE()), DATEADD(MINUTE, 330, GETUTCDATE())
+          GETDATE(), GETDATE(), GETDATE()
         )
       `;
 
@@ -19809,7 +19809,7 @@ app.put('/api/resignations/:id', verifyToken, async (req, res) => {
         await new sql.Request(transaction)
           .input('uid', sql.Int, targetEmpId)
           .input('msg', sql.NVarChar, notificationMsg)
-          .query("INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@uid, @msg, 'Resignation', 0, DATEADD(MINUTE, 330, GETUTCDATE()))");
+          .query("INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@uid, @msg, 'Resignation', 0, GETDATE())");
 
         // Notify managers and HR/Admin/CEO
         const empResult = await new sql.Request(transaction)
@@ -19860,7 +19860,7 @@ app.put('/api/resignations/:id', verifyToken, async (req, res) => {
             await new sql.Request(transaction)
               .input('mId', sql.Int, mId)
               .input('msg', sql.NVarChar, managerMsg)
-              .query("INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@mId, @msg, 'Resignation', 0, DATEADD(MINUTE, 330, GETUTCDATE()))");
+              .query("INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@mId, @msg, 'Resignation', 0, GETDATE())");
           }
         }
       }
@@ -20383,9 +20383,9 @@ const fixProfilePictureColumns = async (providedPool) => {
       IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('new_joinees') AND name = 'profile_picture')
         ALTER TABLE new_joinees ALTER COLUMN profile_picture NVARCHAR(MAX);
     `);
-    console.log('✅ Database: Profile Picture columns expanded to MAX capacity');
+    console.log('âœ… Database: Profile Picture columns expanded to MAX capacity');
   } catch (err) {
-    console.error('❌ Failed to expand profile picture columns:', err.message);
+    console.error('âŒ Failed to expand profile picture columns:', err.message);
   }
 };
 
@@ -20410,9 +20410,9 @@ const fixEmployeeProfileColumns = async (providedPool) => {
     }
 
     await pool.request().query(query);
-    console.log('✅ Database: Employee Profile document columns expanded to MAX capacity');
+    console.log('âœ… Database: Employee Profile document columns expanded to MAX capacity');
   } catch (err) {
-    console.error('❌ Failed to expand employee profile columns:', err.message);
+    console.error('âŒ Failed to expand employee profile columns:', err.message);
   }
 };
 
@@ -20480,8 +20480,8 @@ const initializeDocumentsTable = async (providedPool) => {
           pancard_photo NVARCHAR(MAX),
           adharcard_photo NVARCHAR(MAX),
           experience_letter_photo NVARCHAR(MAX),
-          created_at DATETIME DEFAULT DATEADD(MINUTE, 330, GETUTCDATE()),
-          updated_at DATETIME DEFAULT DATEADD(MINUTE, 330, GETUTCDATE())
+          created_at DATETIME DEFAULT GETDATE(),
+          updated_at DATETIME DEFAULT GETDATE()
         );
       END
       ELSE
@@ -20665,9 +20665,9 @@ const ensureWelcomeSentColumns = async (providedPool) => {
       IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('interns') AND name = 'welcome_sent')
         ALTER TABLE interns ADD welcome_sent BIT DEFAULT 0;
     `);
-    console.log('✅ Database: welcome_sent columns verified for new_joinees and interns');
+    console.log('âœ… Database: welcome_sent columns verified for new_joinees and interns');
   } catch (err) {
-    console.error('❌ Failed to ensure welcome_sent columns:', err.message);
+    console.error('âŒ Failed to ensure welcome_sent columns:', err.message);
   }
 };
 
@@ -20679,9 +20679,9 @@ const ensureJobApplicationsColumns = async (providedPool) => {
       IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('job_applications') AND name = 'is_deleted')
         ALTER TABLE job_applications ADD is_deleted BIT DEFAULT 0;
     `);
-    console.log('✅ Database: is_deleted column verified for job_applications');
+    console.log('âœ… Database: is_deleted column verified for job_applications');
   } catch (err) {
-    console.error('❌ Failed to ensure is_deleted column for job_applications:', err.message);
+    console.error('âŒ Failed to ensure is_deleted column for job_applications:', err.message);
   }
 };
 
@@ -20717,7 +20717,7 @@ getPool().then(async (pool) => {
   // --- STARTUP CATCH-UP ATTENDANCE SYNC ---
   // Runs once on primary instance startup. Detects missed days (e.g., server was down over a
   // weekend) by checking the last synced date in attendance_logs, then backfills all missed days.
-  // MINIMUM of 3 days is always synced to cover the Friday→Saturday→Sunday→Monday gap.
+  // MINIMUM of 3 days is always synced to cover the Fridayâ†’Saturdayâ†’Sundayâ†’Monday gap.
   if (isPrimaryNode) {
     setTimeout(async () => {
       try {
@@ -20754,9 +20754,9 @@ getPool().then(async (pool) => {
         const daysToFetch = Math.min(Math.max(daysMissed + 1, 3), 14);
 
         if (daysMissed <= 1) {
-          console.log(`[STARTUP SYNC] ✅ Up-to-date. Running ${daysToFetch}-day refresh to cover any weekend gaps...`);
+          console.log(`[STARTUP SYNC] âœ… Up-to-date. Running ${daysToFetch}-day refresh to cover any weekend gaps...`);
         } else {
-          console.log(`[STARTUP SYNC] ⚠️  Server was down! Last sync: ${lastDateIST.toISOString().split('T')[0]}. Backfilling ${daysToFetch} days...`);
+          console.log(`[STARTUP SYNC] âš ï¸  Server was down! Last sync: ${lastDateIST.toISOString().split('T')[0]}. Backfilling ${daysToFetch} days...`);
         }
         importAttendance(daysToFetch).catch(err => console.error('[STARTUP SYNC ERROR]:', err.message));
 
@@ -20769,7 +20769,7 @@ getPool().then(async (pool) => {
   }
 
 }).catch(err => {
-  console.error('\n❌ FATAL: Backend failed to start due to database connectivity issues.');
-  console.error('❌ Error Details:', err.message);
+  console.error('\nâŒ FATAL: Backend failed to start due to database connectivity issues.');
+  console.error('âŒ Error Details:', err.message);
   process.exit(1);
 });
