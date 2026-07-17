@@ -270,6 +270,11 @@ const getPool = async () => {
   if (_pool === pool) return _pool;
   _pool = pool;
 
+  // Only run schema migrations on the primary instance (0) or standalone process to prevent deadlocks in cluster mode
+  if (process.env.NODE_APP_INSTANCE !== '0' && process.env.NODE_APP_INSTANCE !== undefined) {
+    return _pool;
+  }
+
   // Initialize Suggestions Table if not exists (only run once per new pool instance)
   try {
     await _pool.request().query(`
@@ -12132,6 +12137,37 @@ app.get('/api/leaves/stats/my', verifyToken, async (req, res) => {
   } catch (err) {
     console.error('[MY LEAVE STATS ERROR]:', err);
     res.status(500).json({ error: 'Failed to fetch your leave statistics' });
+  }
+});
+
+app.get('/api/leaves/:id', verifyToken, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const pool = await getPool();
+    const result = await pool.request()
+      .input('id', sql.Int, id)
+      .query(`
+        SELECT l.id, l.user_id, l.leave_type, l.start_date, l.end_date, l.reason, l.created_at,
+               l.rm_status, l.pm_status, l.hr_status, l.rm_remarks, l.pm_remarks, l.hr_remarks,
+               l.is_half_day, l.half_day_slot,
+               u.name as employeeName, u.role as employeeRole, u.team as employeeTeam,
+               CASE 
+                 WHEN l.rm_status = 'Rejected' OR l.pm_status = 'Rejected' OR l.hr_status = 'Rejected' THEN 'Rejected'
+                 WHEN l.hr_status = 'Approved' THEN 'Approved'
+                 ELSE 'Pending'
+               END as status
+        FROM leaves l WITH (NOLOCK)
+        JOIN users u WITH (NOLOCK) ON l.user_id = u.id
+        WHERE l.id = @id
+      `);
+
+    if (result.recordset.length === 0) {
+      return res.status(404).json({ error: 'Leave record not found' });
+    }
+    res.json(result.recordset[0]);
+  } catch (err) {
+    console.error('[GET LEAVE DETAIL ERROR]:', err);
+    res.status(500).json({ error: 'Failed to fetch leave details.' });
   }
 });
 
