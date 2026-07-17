@@ -15862,6 +15862,12 @@ app.post('/api/resignations', verifyToken, async (req, res) => {
       return res.status(400).json({ error: 'You already have a pending resignation request.' });
     }
 
+    // Fetch employee details to notify managers and HR
+    const empResult = await pool.request()
+      .input('userId', sql.Int, userId)
+      .query('SELECT name, reporting_manager_id, hierarchy_pm_id, role FROM users WHERE id = @userId');
+    const employee = empResult.recordset[0] || { name: 'An Employee' };
+
     await pool.request()
       .input('employee_id', sql.Int, userId)
       .input('resignation_date', sql.Date, resignation_date)
@@ -15872,6 +15878,54 @@ app.post('/api/resignations', verifyToken, async (req, res) => {
         INSERT INTO resignations (employee_id, resignation_date, last_working_day, reason, letter_content)
         VALUES (@employee_id, @resignation_date, @last_working_day, @reason, @letter_content)
       `);
+
+    // Notify employee themselves
+    await pool.request()
+      .input('uid', sql.Int, userId)
+      .query("INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@uid, 'Your resignation is submitted successfully and is pending review', 'Resignation', 0, DATEADD(MINUTE, 330, GETUTCDATE()))");
+
+    // Query managers and HR to notify
+    const managerId = employee.reporting_manager_id;
+    const keyPersonnelResult = await pool.request().query(`
+      SELECT id, role 
+      FROM users WITH (NOLOCK)
+      WHERE role LIKE '%CEO%' 
+         OR role LIKE '%Founder%' 
+         OR role LIKE '%Project Manager%' 
+         OR role LIKE '%PM%'
+    `);
+
+    let ceoId = null;
+    let defaultPmId = null;
+    keyPersonnelResult.recordset.forEach(u => {
+      const r = (u.role || '').toLowerCase();
+      if (r.includes('ceo') || r.includes('founder')) ceoId = u.id;
+      if (r.includes('project manager') || r === 'pm') defaultPmId = u.id;
+    });
+
+    const normalizedRole = (employee.role || '').toLowerCase();
+    const isTL = normalizedRole.includes('lead') || normalizedRole.includes('tl');
+    const projectManagerId = isTL ? managerId : (employee.hierarchy_pm_id || defaultPmId);
+
+    const authResult = await pool.request().query(`
+      SELECT id FROM users 
+      WHERE role LIKE '%HR%' 
+         OR role LIKE '%Human Resource%' 
+         OR role LIKE '%CEO%' 
+         OR role LIKE '%Founder%' 
+         OR role LIKE '%Admin%'
+         OR role LIKE '%Super%'
+    `);
+    const ccIds = authResult.recordset.map(u => u.id);
+
+    const allNotifierIds = Array.from(new Set([managerId, projectManagerId, ...ccIds])).filter(id => id && id !== userId);
+
+    for (const notifierId of allNotifierIds) {
+      await pool.request()
+        .input('targetId', sql.Int, notifierId)
+        .input('msg', sql.NVarChar, `New Resignation Request from ${employee.name}`)
+        .query("INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@targetId, @msg, 'Resignation', 0, DATEADD(MINUTE, 330, GETUTCDATE()))");
+    }
 
     res.json({ success: true, message: 'Resignation submitted successfully. Pending review.' });
   } catch (err) {
@@ -16067,7 +16121,7 @@ app.put('/api/admin/resignations/:id/review', verifyToken, async (req, res) => {
       // 3. Trigger check and potential user deactivation
       await checkAndDeactivateUser(transaction, employeeId);
 
-      // 4. Send resignation status update notification to the employee
+      // 4. Send resignation status update notifications
       const statusRes = await new sql.Request(transaction)
         .input('id', sql.Int, id)
         .query("SELECT hr_status, pm_status, employee_id FROM resignations WHERE id = @id");
@@ -16086,10 +16140,64 @@ app.put('/api/admin/resignations/:id/review', verifyToken, async (req, res) => {
           notificationMsg = 'Your resignation is in waiting';
         }
 
+        // Notify employee
         await new sql.Request(transaction)
           .input('uid', sql.Int, targetEmpId)
           .input('msg', sql.NVarChar, notificationMsg)
           .query("INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@uid, @msg, 'Resignation', 0, DATEADD(MINUTE, 330, GETUTCDATE()))");
+
+        // Notify managers and HR/Admin/CEO
+        const empResult = await new sql.Request(transaction)
+          .input('userId', sql.Int, targetEmpId)
+          .query('SELECT name, reporting_manager_id, hierarchy_pm_id, role FROM users WHERE id = @userId');
+        
+        if (empResult.recordset.length > 0) {
+          const employee = empResult.recordset[0];
+          const managerId = employee.reporting_manager_id;
+          
+          const keyPersonnelResult = await new sql.Request(transaction).query(`
+            SELECT id, role 
+            FROM users WITH (NOLOCK)
+            WHERE role LIKE '%CEO%' 
+               OR role LIKE '%Founder%' 
+               OR role LIKE '%Project Manager%' 
+               OR role LIKE '%PM%'
+          `);
+
+          let ceoId = null;
+          let defaultPmId = null;
+          keyPersonnelResult.recordset.forEach(u => {
+            const r = (u.role || '').toLowerCase();
+            if (r.includes('ceo') || r.includes('founder')) ceoId = u.id;
+            if (r.includes('project manager') || r === 'pm') defaultPmId = u.id;
+          });
+
+          const normalizedRole = (employee.role || '').toLowerCase();
+          const isTL = normalizedRole.includes('lead') || normalizedRole.includes('tl');
+          const projectManagerId = isTL ? managerId : (employee.hierarchy_pm_id || defaultPmId);
+
+          const authResult = await new sql.Request(transaction).query(`
+            SELECT id FROM users 
+            WHERE role LIKE '%HR%' 
+               OR role LIKE '%Human Resource%' 
+               OR role LIKE '%CEO%' 
+               OR role LIKE '%Founder%' 
+               OR role LIKE '%Admin%'
+               OR role LIKE '%Super%'
+          `);
+          const ccIds = authResult.recordset.map(u => u.id);
+
+          const reviewerId = req.user.id;
+          const managersToNotify = Array.from(new Set([managerId, projectManagerId, ...ccIds])).filter(id => id && id !== reviewerId && id !== targetEmpId);
+
+          const managerMsg = `Resignation update for ${employee.name}: HR: ${newHR}, PM: ${newPM}`;
+          for (const mId of managersToNotify) {
+            await new sql.Request(transaction)
+              .input('mId', sql.Int, mId)
+              .input('msg', sql.NVarChar, managerMsg)
+              .query("INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@mId, @msg, 'Resignation', 0, DATEADD(MINUTE, 330, GETUTCDATE()))");
+          }
+        }
       }
 
       await transaction.commit();
@@ -19677,6 +19785,85 @@ app.put('/api/resignations/:id', verifyToken, async (req, res) => {
 
       // 3. Trigger check and potential user deactivation
       await checkAndDeactivateUser(transaction, employeeId);
+
+      // 4. Send resignation status update notifications
+      const statusRes = await new sql.Request(transaction)
+        .input('id', sql.Int, id)
+        .query("SELECT hr_status, pm_status, employee_id FROM resignations WHERE id = @id");
+      if (statusRes.recordset.length > 0) {
+        const updatedRow = statusRes.recordset[0];
+        const newHR = updatedRow.hr_status;
+        const newPM = updatedRow.pm_status;
+        const targetEmpId = updatedRow.employee_id;
+
+        let notificationMsg = '';
+        if (newHR === 'Approved' && newPM === 'Approved') {
+          notificationMsg = 'Your resignation is approved';
+        } else if (newHR === 'Rejected' || newPM === 'Rejected') {
+          notificationMsg = 'Your resignation is rejected';
+        } else {
+          notificationMsg = 'Your resignation is in waiting';
+        }
+
+        // Notify employee
+        await new sql.Request(transaction)
+          .input('uid', sql.Int, targetEmpId)
+          .input('msg', sql.NVarChar, notificationMsg)
+          .query("INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@uid, @msg, 'Resignation', 0, DATEADD(MINUTE, 330, GETUTCDATE()))");
+
+        // Notify managers and HR/Admin/CEO
+        const empResult = await new sql.Request(transaction)
+          .input('userId', sql.Int, targetEmpId)
+          .query('SELECT name, reporting_manager_id, hierarchy_pm_id, role FROM users WHERE id = @userId');
+        
+        if (empResult.recordset.length > 0) {
+          const employee = empResult.recordset[0];
+          const managerId = employee.reporting_manager_id;
+          
+          const keyPersonnelResult = await new sql.Request(transaction).query(`
+            SELECT id, role 
+            FROM users WITH (NOLOCK)
+            WHERE role LIKE '%CEO%' 
+               OR role LIKE '%Founder%' 
+               OR role LIKE '%Project Manager%' 
+               OR role LIKE '%PM%'
+          `);
+
+          let ceoId = null;
+          let defaultPmId = null;
+          keyPersonnelResult.recordset.forEach(u => {
+            const r = (u.role || '').toLowerCase();
+            if (r.includes('ceo') || r.includes('founder')) ceoId = u.id;
+            if (r.includes('project manager') || r === 'pm') defaultPmId = u.id;
+          });
+
+          const normalizedRole = (employee.role || '').toLowerCase();
+          const isTL = normalizedRole.includes('lead') || normalizedRole.includes('tl');
+          const projectManagerId = isTL ? managerId : (employee.hierarchy_pm_id || defaultPmId);
+
+          const authResult = await new sql.Request(transaction).query(`
+            SELECT id FROM users 
+            WHERE role LIKE '%HR%' 
+               OR role LIKE '%Human Resource%' 
+               OR role LIKE '%CEO%' 
+               OR role LIKE '%Founder%' 
+               OR role LIKE '%Admin%'
+               OR role LIKE '%Super%'
+          `);
+          const ccIds = authResult.recordset.map(u => u.id);
+
+          const reviewerId = req.user.id;
+          const managersToNotify = Array.from(new Set([managerId, projectManagerId, ...ccIds])).filter(id => id && id !== reviewerId && id !== targetEmpId);
+
+          const managerMsg = `Resignation update for ${employee.name}: HR: ${newHR}, PM: ${newPM}`;
+          for (const mId of managersToNotify) {
+            await new sql.Request(transaction)
+              .input('mId', sql.Int, mId)
+              .input('msg', sql.NVarChar, managerMsg)
+              .query("INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@mId, @msg, 'Resignation', 0, DATEADD(MINUTE, 330, GETUTCDATE()))");
+          }
+        }
+      }
 
       await transaction.commit();
 

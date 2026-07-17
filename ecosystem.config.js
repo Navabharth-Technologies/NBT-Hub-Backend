@@ -2,7 +2,7 @@ module.exports = {
   apps: [{
     name: "nbt-backend",
     script: "./server.js",
-    instances: "max", // Utilizes all available CPU cores
+    instances: 2, // Changed from max to 2 to prevent local SQL Server memory exhaustion
     exec_mode: "cluster",
     watch: false,
     env: {
