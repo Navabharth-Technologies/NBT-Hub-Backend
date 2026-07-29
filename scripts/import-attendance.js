@@ -93,7 +93,6 @@ async function importAttendance(daysToImport = 2) {
                     // --- Only sync users that exist in local DB ---
                     const user = usersMap.get(empId);
                     if (!user) {
-                        console.warn(`   ⚠️ No DB record for Empcode: ${log.Empcode} (ID: ${empId}) — skipping.`);
                         skippedCount++;
                         continue;
                     }
