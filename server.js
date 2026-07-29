@@ -10042,17 +10042,25 @@ app.put('/api/support-tickets/:id', async (req, res) => {
     const pool = await getPool();
 
     // 1. Fetch current ticket details for target identification and filtering
-    const ticketRes = await pool.request()
-      .input('ticketId', sql.Int, id)
-      .query('SELECT user_id, ticket_number, subject, status FROM support_tickets WHERE id = @ticketId');
+    let ticketRes;
+    if (/^\d+$/.test(id)) {
+      ticketRes = await pool.request()
+        .input('ticketId', sql.Int, parseInt(id))
+        .query('SELECT id, user_id, ticket_number, subject, status FROM support_tickets WHERE id = @ticketId');
+    } else {
+      ticketRes = await pool.request()
+        .input('ticketNum', sql.NVarChar, id)
+        .query('SELECT id, user_id, ticket_number, subject, status FROM support_tickets WHERE ticket_number = @ticketNum');
+    }
 
     if (ticketRes.recordset.length === 0) {
       return res.status(404).json({ error: 'Ticket not found' });
     }
     const ticketInfo = ticketRes.recordset[0];
+    const resolvedId = ticketInfo.id;
 
     let query = 'UPDATE support_tickets SET updated_at = GETDATE()';
-    const request = pool.request().input('id', sql.Int, id);
+    const request = pool.request().input('id', sql.Int, resolvedId);
 
     if (status) {
       if (!validStatuses.includes(status)) {
