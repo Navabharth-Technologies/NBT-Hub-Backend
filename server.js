@@ -12361,9 +12361,10 @@ app.put(['/api/leaves/:id/status', '/api/ceo/leaves/:id/status'], verifyToken, a
       await transaction.commit();
 
       // 4. Notifications
+      const approverRole = isRM ? 'RM' : isPM ? 'PM' : 'HR';
       const notifMsg = finalStatus === 'Pending'
-        ? `Leave status updated by ${isRM ? 'RM' : isPM ? 'PM' : 'HR'}. Currently: ${status}`
-        : `Your leave request from ${leave.start_date} to ${leave.end_date} has been ${finalStatus}.`;
+        ? `Leave status updated by ${approverRole}. Currently: ${status}`
+        : `Your leave request from ${leave.start_date} to ${leave.end_date} has been ${finalStatus.toLowerCase()} by ${approverRole}.`;
 
       await pool.request()
         .input('userId', sql.Int, leave.user_id)
