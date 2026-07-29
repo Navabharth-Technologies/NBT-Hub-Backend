@@ -9936,7 +9936,8 @@ app.get('/api/support-agents', async (req, res) => {
 // POST: Submit a new support ticket (Auto-routes based on department)
 app.post('/api/support-tickets', async (req, res) => {
   const userId = req.body.userId || req.body.user_id || req.body.employeeId || req.body.employee_id;
-  const { subject, description, priority, department } = req.body;
+  const { subject, description, priority } = req.body;
+  const department = req.body.department || req.body.category || 'HR';
 
   if (!subject) return res.status(400).json({ error: 'Issue subject is required' });
 
@@ -9952,20 +9953,21 @@ app.post('/api/support-tickets', async (req, res) => {
     const pool = await getPool();
     let agentId = null;
 
-    // 1. Technical Routing: Query the team_technical_support table directly
-    if (routingDept === 'Technical') {
-      const techResult = await pool.request()
-        .query('SELECT TOP 1 user_id FROM team_technical_support');
-      if (techResult.recordset.length > 0) {
-        agentId = techResult.recordset[0].user_id;
-      }
-    } else {
-      // 2. Normal Department Routing (HR, Infrastructure mapped to @routingDept)
-      const agentResult = await pool.request()
-        .input('dept', sql.NVarChar, routingDept)
-        .query('SELECT agent_user_id FROM support_agents WHERE department = @dept');
+        const agentResult = await pool.request()
+      .input('dept', sql.NVarChar, routingDept)
+      .query('SELECT agent_user_id, agent_email FROM support_agents WHERE LOWER(department) = LOWER(@dept)');
 
-      agentId = agentResult.recordset.length > 0 ? agentResult.recordset[0].agent_user_id : null;
+    if (agentResult.recordset.length > 0) {
+      agentId = agentResult.recordset[0].agent_user_id;
+      const agentEmail = agentResult.recordset[0].agent_email;
+      if (!agentId && agentEmail) {
+        const userLookup = await pool.request()
+          .input('email', sql.NVarChar, agentEmail)
+          .query('SELECT id FROM users WHERE email = @email');
+        if (userLookup.recordset.length > 0) {
+          agentId = userLookup.recordset[0].id;
+        }
+      }
     }
 
     // Lookup creator name if not provided but userId is present
@@ -12368,7 +12370,7 @@ app.put(['/api/leaves/:id/status', '/api/ceo/leaves/:id/status'], verifyToken, a
         .input('msg', sql.NVarChar, notifMsg)
         .query('INSERT INTO notifications (target_user_id, message, is_read, created_at) VALUES (@userId, @msg, 0, GETDATE())');
 
-      res.json({ success: true, message: `Leave ${status} successfully by ${isRM ? 'RM' : isPM ? 'PM' : 'HR'}`, finalStatus });
+      res.json({ success: true, message: `Leave ${status} successfully by ${approverRole}`, finalStatus });
     } catch (innerErr) {
       if (transaction) await transaction.rollback();
       throw innerErr;
@@ -15865,7 +15867,7 @@ app.post('/api/resignations', verifyToken, async (req, res) => {
     // Fetch employee details to notify managers and HR
     const empResult = await pool.request()
       .input('userId', sql.Int, userId)
-      .query('SELECT name, reporting_manager_id, hierarchy_pm_id, role FROM users WHERE id = @userId');
+      .query('SELECT u.name, u.reporting_manager_id, u.role, m.reporting_manager_id as hierarchy_pm_id FROM users u LEFT JOIN users m ON u.reporting_manager_id = m.id WHERE u.id = @userId');
     const employee = empResult.recordset[0] || { name: 'An Employee' };
 
     await pool.request()
@@ -16149,7 +16151,7 @@ app.put('/api/admin/resignations/:id/review', verifyToken, async (req, res) => {
         // Notify managers and HR/Admin/CEO
         const empResult = await new sql.Request(transaction)
           .input('userId', sql.Int, targetEmpId)
-          .query('SELECT name, reporting_manager_id, hierarchy_pm_id, role FROM users WHERE id = @userId');
+          .query('SELECT u.name, u.reporting_manager_id, u.role, m.reporting_manager_id as hierarchy_pm_id FROM users u LEFT JOIN users m ON u.reporting_manager_id = m.id WHERE u.id = @userId');
         
         if (empResult.recordset.length > 0) {
           const employee = empResult.recordset[0];
@@ -19814,7 +19816,7 @@ app.put('/api/resignations/:id', verifyToken, async (req, res) => {
         // Notify managers and HR/Admin/CEO
         const empResult = await new sql.Request(transaction)
           .input('userId', sql.Int, targetEmpId)
-          .query('SELECT name, reporting_manager_id, hierarchy_pm_id, role FROM users WHERE id = @userId');
+          .query('SELECT u.name, u.reporting_manager_id, u.role, m.reporting_manager_id as hierarchy_pm_id FROM users u LEFT JOIN users m ON u.reporting_manager_id = m.id WHERE u.id = @userId');
         
         if (empResult.recordset.length > 0) {
           const employee = empResult.recordset[0];
