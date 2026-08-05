@@ -1,4 +1,4 @@
-﻿require('dotenv').config();
+require('dotenv').config();
 const cron = require('node-cron');
 
 // PM2 Load Balancer / Cluster Mode Support
@@ -743,13 +743,13 @@ const mapAssetStockRow = (row) => {
  * Shared emoji reaction type map (extracted from 4+ inline copies)
  */
 const emojiMap = {
-  heart: 'â¤ï¸',
-  thumbsup: 'ðŸ‘',
-  shocked: 'ðŸ˜®',
-  laugh: 'ðŸ˜‚',
-  fire: 'ðŸ”¥',
-  clap: 'ðŸ‘',
-  cake: 'ðŸŽ‚'
+  heart: '❤️',
+  thumbsup: '👍',
+  shocked: '😮',
+  laugh: '😂',
+  fire: '🔥',
+  clap: '👏',
+  cake: '🎂'
 };
 
 /**
@@ -7785,13 +7785,13 @@ const handlePostReaction = async (req, res) => {
 
   // Map literal emojis OR common names to standardized database strings
   const reactionMap = {
-    'â¤ï¸': 'heart', 'heart': 'heart', 'love': 'heart',
-    'ðŸ‘': 'thumbsup', 'thumbsup': 'thumbsup', 'thumb': 'thumbsup',
-    'ðŸ˜®': 'shocked', 'shocked': 'shocked', 'wow': 'shocked',
-    'ðŸ˜‚': 'laugh', 'laugh': 'laugh', 'haha': 'laugh',
-    'ðŸ”¥': 'fire', 'fire': 'fire', 'lit': 'fire',
-    'ðŸ‘': 'clap', 'clap': 'clap', 'clapping': 'clap',
-    'ðŸŽ‚': 'cake', 'cake': 'cake', 'birthday': 'cake',
+    '❤️': 'heart', 'heart': 'heart', 'love': 'heart',
+    '👍': 'thumbsup', 'thumbsup': 'thumbsup', 'thumb': 'thumbsup',
+    '😮': 'shocked', 'shocked': 'shocked', 'wow': 'shocked',
+    '😂': 'laugh', 'laugh': 'laugh', 'haha': 'laugh',
+    '🔥': 'fire', 'fire': 'fire', 'lit': 'fire',
+    '👏': 'clap', 'clap': 'clap', 'clapping': 'clap',
+    '🎂': 'cake', 'cake': 'cake', 'birthday': 'cake',
     'like': 'like'
   };
 
@@ -13207,7 +13207,7 @@ app.get(['/api/admin/pay-slips/calculate-summary', '/api/admin/payslips/calculat
       empName = u.name || '';
       designation = u.role || '';
       department = u.department || u.team || '';
-      basicSalary = u.salary || 0;
+      basicSalary = 0;
       ptDeduction = u.pt || 0;
     }
 
@@ -14445,36 +14445,60 @@ app.get('/api/employees/leaderboard/all', verifyToken, async (req, res) => {
   try {
     const pool = await getPool();
     const result = await pool.request().query(`
-      WITH CombinedPoints AS (
-        SELECT employee_id, points, 1 as is_award FROM employee_rewards WITH (NOLOCK)
-        UNION ALL
-        SELECT employee_id, total_points as points, 0 as is_award FROM quiz_completions WITH (NOLOCK)
-      ),
-      AllParticipants AS (
+      WITH AllParticipants AS (
         SELECT id, name, role, team, profile_picture FROM users WITH (NOLOCK) WHERE ISNULL(status, 'Active') != 'Resigned'
         UNION ALL
         SELECT id, name, role, 'New Joinee' as team, profile_picture FROM new_joinees WITH (NOLOCK)
         UNION ALL
         SELECT id, name, role, 'Intern' as team, profile_picture FROM interns WITH (NOLOCK)
+      ),
+      QuizPoints AS (
+        SELECT employee_id, ISNULL(SUM(total_points), 0) as quiz_pts
+        FROM quiz_completions WITH (NOLOCK)
+        GROUP BY employee_id
+      ),
+      RewardPoints AS (
+        SELECT employee_id, ISNULL(SUM(points), 0) as reward_pts
+        FROM employee_rewards WITH (NOLOCK)
+        GROUP BY employee_id
+      ),
+      AwardCount AS (
+        SELECT employee_id, COUNT(*) as award_count
+        FROM employee_rewards WITH (NOLOCK)
+        GROUP BY employee_id
       )
       SELECT 
         ap.id, ap.name, ap.role, ap.team, ap.profile_picture,
-        ISNULL(SUM(cp.points), 0) as total_rep,
-        ISNULL(SUM(cp.is_award), 0) as total_awards,
-        DENSE_RANK() OVER (ORDER BY ISNULL(SUM(cp.points), 0) DESC) as rank
+        ISNULL(qp.quiz_pts, 0)   as quiz_points,
+        ISNULL(rp.reward_pts, 0) as reward_points,
+        ISNULL(qp.quiz_pts, 0) + ISNULL(rp.reward_pts, 0) as total_rep,
+        ISNULL(ac.award_count, 0) as total_awards,
+        DENSE_RANK() OVER (ORDER BY ISNULL(qp.quiz_pts, 0) + ISNULL(rp.reward_pts, 0) DESC) as rank
       FROM AllParticipants ap
-      LEFT JOIN CombinedPoints cp ON ap.id = cp.employee_id
-      GROUP BY ap.id, ap.name, ap.role, ap.team, ap.profile_picture
+      LEFT JOIN QuizPoints   qp ON ap.id = qp.employee_id
+      LEFT JOIN RewardPoints rp ON ap.id = rp.employee_id
+      LEFT JOIN AwardCount   ac ON ap.id = ac.employee_id
       ORDER BY total_rep DESC, ap.name ASC
     `);
 
     const formatted = result.recordset.map(row => ({
       ...row,
-      total_rep: formatINR(row.total_rep),
+      quiz_points: row.quiz_points,
+      reward_points: row.reward_points,
+      total_rep: row.total_rep,
       totalRepNum: row.total_rep,
-      totalPoints: formatINR(row.total_rep),
-      total_points: formatINR(row.total_rep),
-      totalPointsNum: row.total_rep
+      totalPoints: row.total_rep,
+      total_points: row.total_rep,
+      totalPointsNum: row.total_rep,
+      quiz_points_fmt: formatINR(row.quiz_points),
+      reward_points_fmt: formatINR(row.reward_points),
+      total_points_fmt: formatINR(row.total_rep),
+      rewardPoints: formatINR(row.reward_points),
+      reward_points: formatINR(row.reward_points),
+      rewardPointsNum: row.reward_points,
+      quizPoints: formatINR(row.quiz_points),
+      quiz_points: formatINR(row.quiz_points),
+      quizPointsNum: row.quiz_points
     }));
 
     res.json({ success: true, data: formatted });

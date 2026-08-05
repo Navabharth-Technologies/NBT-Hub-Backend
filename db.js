@@ -14,8 +14,8 @@ const dbConfig = {
         cancelTimeout: 30000,
     },
     pool: {
-        max: 5,  // Lowered to queue requests in Node.js rather than overwhelm SQL Server (5 * 12 = 60 max)
-        min: 0,  // Allow connections to completely close when idle to save DB memory
+        max: 20,  // Increased from 5 to prevent connection starvation and timeout errors under concurrent load
+        min: 2,   // Maintain a minimum of 2 idle connections for faster response times
         idleTimeoutMillis: 30000,
         acquireTimeoutMillis: 60000 // Queue wait time
     }
