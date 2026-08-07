@@ -277,6 +277,44 @@ const getPool = async () => {
 
   // Initialize Suggestions Table if not exists (only run once per new pool instance)
   try {
+    // Dynamically drop support_tickets user_id foreign key constraint to allow new joinees/interns to submit support tickets
+    try {
+      await _pool.request().query(`
+        DECLARE @ConstraintName NVARCHAR(255);
+        SELECT @ConstraintName = f.name
+        FROM sys.foreign_keys AS f
+        INNER JOIN sys.foreign_key_columns AS fc ON f.OBJECT_ID = fc.constraint_object_id
+        WHERE OBJECT_NAME(f.parent_object_id) = 'support_tickets'
+          AND OBJECT_NAME(f.referenced_object_id) = 'users'
+          AND COL_NAME(fc.parent_object_id, fc.parent_column_id) = 'user_id';
+        IF @ConstraintName IS NOT NULL
+        BEGIN
+          EXEC('ALTER TABLE support_tickets DROP CONSTRAINT ' + @ConstraintName);
+        END
+      `);
+    } catch (migConstraintErr) {
+      console.warn('Non-critical support_tickets constraint migration warning:', migConstraintErr.message);
+    }
+
+    // Dynamically drop resignations employee_id foreign key constraint to allow new joinees/interns to submit resignations
+    try {
+      await _pool.request().query(`
+        DECLARE @ConstraintName NVARCHAR(255);
+        SELECT @ConstraintName = f.name
+        FROM sys.foreign_keys AS f
+        INNER JOIN sys.foreign_key_columns AS fc ON f.OBJECT_ID = fc.constraint_object_id
+        WHERE OBJECT_NAME(f.parent_object_id) = 'resignations'
+          AND OBJECT_NAME(f.referenced_object_id) = 'users'
+          AND COL_NAME(fc.parent_object_id, fc.parent_column_id) = 'employee_id';
+        IF @ConstraintName IS NOT NULL
+        BEGIN
+          EXEC('ALTER TABLE resignations DROP CONSTRAINT ' + @ConstraintName);
+        END
+      `);
+    } catch (migConstraintErr) {
+      console.warn('Non-critical resignations constraint migration warning:', migConstraintErr.message);
+    }
+
     await _pool.request().query(`
       IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[employee_suggestions]') AND type in (N'U'))
       BEGIN
@@ -914,7 +952,10 @@ app.get([
     stream.pipe(res);
   } catch (err) {
     console.error('[DRIVE PROXY ERROR]', err.message);
-    res.status(404).send('Resource not found or access denied by Google Drive');
+    // FALLBACK: Redirect directly to Google Drive preview URL so the browser can play it natively
+    // using the user's logged-in Google session
+    console.log(`[DRIVE PROXY] Redirecting to Google Drive preview fallback for fileId: ${fileId}`);
+    return res.redirect(`https://drive.google.com/file/d/${fileId}/preview`);
   }
 });
 
@@ -1635,7 +1676,7 @@ app.post('/api/login', async (req, res) => {
       
       if (actualRole.includes(reqRole) || reqRole.includes(actualRole)) {
         isAuthorized = true;
-      } else if (reqRole === 'hr' && actualRole.includes('hr')) {
+      } else if (reqRole === 'hr' && (actualRole.includes('hr') || actualRole.includes('human') || actualRole.includes('resource'))) {
         isAuthorized = true;
       } else if (reqRole === 'pm' && (actualRole.includes('project') || actualRole.includes('manager'))) {
         isAuthorized = true;
@@ -8704,7 +8745,7 @@ app.post('/api/new-joinees', async (req, res) => {
       .input('courseCompletion', sql.Int, courseCompletion)
       .input('hiredBy', sql.NVarChar, finalHiredBy)
       .input('password', sql.NVarChar, finalPassword)
-      .input('duration', sql.NVarChar, duration || null)
+      .input('duration', sql.NVarChar, duration !== undefined && duration !== null ? String(duration) : null)
       .input('phoneNumber', sql.NVarChar, finalPhone)
       .query('INSERT INTO new_joinees (name, role, email_id, joining_date, course_completion, hired_by, password, duration, phone_number) VALUES (@name, @role, @emailId, @joiningDate, @courseCompletion, @hiredBy, @password, @duration, @phoneNumber)');
       
@@ -8719,7 +8760,8 @@ app.post('/api/new-joinees', async (req, res) => {
     
     res.json({ message: 'New joinee recorded successfully' });
   } catch (err) {
-    res.status(500).json({ error: 'Failed to add new joinee' });
+    console.error('Failed to add new joinee:', err);
+    res.status(500).json({ error: 'Failed to add new joinee', details: err.message });
   }
 });
 
@@ -8757,7 +8799,7 @@ app.put('/api/new-joinees/:id', verifyToken, async (req, res) => {
     if (hiredBy !== undefined) { updates.push('hired_by = @hiredBy'); request.input('hiredBy', sql.NVarChar, hiredBy); }
     if (is_blocked !== undefined) { updates.push('is_blocked = @isBlocked'); request.input('isBlocked', sql.Bit, is_blocked); }
     if (block_reason !== undefined) { updates.push('block_reason = @blockReason'); request.input('blockReason', sql.NVarChar, block_reason); }
-    if (duration !== undefined) { updates.push('duration = @duration'); request.input('duration', sql.NVarChar, duration); }
+    if (duration !== undefined) { updates.push('duration = @duration'); request.input('duration', sql.NVarChar, duration !== null ? String(duration) : null); }
     if (phoneNumber !== undefined) { updates.push('phone_number = @phoneNumber'); request.input('phoneNumber', sql.NVarChar, phoneNumber); }
 
     if (updates.length === 0) {
@@ -9865,8 +9907,6 @@ app.get('/api/support-tickets', async (req, res) => {
       let query = `
          SELECT t.*, 
                 u.name as creatorName, u.email as creatorEmail,
-                t.created_at as created_at, 
-                t.updated_at as updated_at,
                 sa.agent_name as assignedAgent
          FROM support_tickets t WITH (NOLOCK)
          LEFT JOIN support_agents sa WITH (NOLOCK) ON t.department = sa.department
@@ -9889,8 +9929,6 @@ app.get('/api/support-tickets', async (req, res) => {
     let query = `
        SELECT t.*, 
               u.name as creatorName, u.email as creatorEmail,
-              t.created_at as created_at, 
-              t.updated_at as updated_at,
               sa.agent_name as assignedAgent,
               COUNT(*) OVER() as totalCount
        FROM support_tickets t WITH (NOLOCK)
@@ -18354,27 +18392,45 @@ app.get('/api/admin/employee-profiles', verifyToken, async (req, res) => {
 app.get('/api/employee-profile/:id', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
   const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo') || role.includes('manager') || role.includes('lead');
-  const targetId = sanitizeNumericId(req.params.id);
-
-  // Security Check: Only admins or the user themselves can view this
-  // We'll verify this after we fetch the user_id from the DB if the input was an emp_id
+  const rawId = req.params.id;
+  const isEmail = String(rawId || '').includes('@');
+  const targetId = isEmail ? null : sanitizeNumericId(rawId);
 
   try {
     const pool = await getPool();
-    const result = await pool.request()
-      .input('id', sql.Int, targetId)
-      .query(`
-        SELECT u.id as user_id, u.name as base_name, u.email as base_email, u.role as base_role, u.joining_date,
-               u.phone_number, u.profile_picture, u.date_of_birth, u.about_me, u.team, u.reporting_manager_id,
-               CASE WHEN m.role LIKE '%CEO%' OR m.role LIKE '%Founder%' THEN 'Founder' ELSE m.name END AS reporting_manager_name,
-               e.emp_id, e.designation as base_designation, e.team_name as base_team,
-               p.* 
-        FROM users u
-        LEFT JOIN users m ON u.reporting_manager_id = m.id
-        LEFT JOIN employee e ON u.id = e.user_id
-        LEFT JOIN employee_profiles p ON u.id = p.employee_id
-        WHERE u.id = @id OR e.emp_id = @id
-      `);
+    let result;
+
+    if (isEmail) {
+      result = await pool.request()
+        .input('email', sql.NVarChar, rawId)
+        .query(`
+          SELECT u.id as user_id, u.name as base_name, u.email as base_email, u.role as base_role, u.joining_date,
+                 u.phone_number, u.profile_picture, u.date_of_birth, u.about_me, u.team, u.reporting_manager_id,
+                 CASE WHEN m.role LIKE '%CEO%' OR m.role LIKE '%Founder%' THEN 'Founder' ELSE m.name END AS reporting_manager_name,
+                 e.emp_id, e.designation as base_designation, e.team_name as base_team,
+                 p.* 
+          FROM users u
+          LEFT JOIN users m ON u.reporting_manager_id = m.id
+          LEFT JOIN employee e ON u.id = e.user_id
+          LEFT JOIN employee_profiles p ON u.id = p.employee_id
+          WHERE u.email = @email
+        `);
+    } else {
+      result = await pool.request()
+        .input('id', sql.Int, targetId)
+        .query(`
+          SELECT u.id as user_id, u.name as base_name, u.email as base_email, u.role as base_role, u.joining_date,
+                 u.phone_number, u.profile_picture, u.date_of_birth, u.about_me, u.team, u.reporting_manager_id,
+                 CASE WHEN m.role LIKE '%CEO%' OR m.role LIKE '%Founder%' THEN 'Founder' ELSE m.name END AS reporting_manager_name,
+                 e.emp_id, e.designation as base_designation, e.team_name as base_team,
+                 p.* 
+          FROM users u
+          LEFT JOIN users m ON u.reporting_manager_id = m.id
+          LEFT JOIN employee e ON u.id = e.user_id
+          LEFT JOIN employee_profiles p ON u.id = p.employee_id
+          WHERE u.id = @id OR e.emp_id = @id
+        `);
+    }
 
     let profile = null;
 
@@ -18382,29 +18438,56 @@ app.get('/api/employee-profile/:id', verifyToken, async (req, res) => {
       profile = result.recordset[0];
     } else {
       // Fallback: Check new_joinees
-      let fallbackRes = await pool.request()
-        .input('id', sql.Int, targetId)
-        .query(`
-          SELECT id as user_id, name as base_name, email_id as base_email, role as base_role, joining_date,
-                 phone_number, profile_picture, NULL as date_of_birth, 'New Joinee - Profile Pending' as about_me, 
-                 'Onboarding' as team, NULL as reporting_manager_id, NULL as reporting_manager_name,
-                 id as emp_id, role as base_designation, 'Onboarding' as base_team
-          FROM new_joinees
-          WHERE id = @id
-        `);
-      
-      if (fallbackRes.recordset.length === 0) {
-        // Fallback: Check interns
+      let fallbackRes;
+      if (isEmail) {
+        fallbackRes = await pool.request()
+          .input('email', sql.NVarChar, rawId)
+          .query(`
+            SELECT id as user_id, name as base_name, email_id as base_email, role as base_role, joining_date,
+                   phone_number, profile_picture, NULL as date_of_birth, 'New Joinee - Profile Pending' as about_me, 
+                   'Onboarding' as team, NULL as reporting_manager_id, NULL as reporting_manager_name,
+                   id as emp_id, role as base_designation, 'Onboarding' as base_team
+            FROM new_joinees
+            WHERE email_id = @email
+          `);
+      } else {
         fallbackRes = await pool.request()
           .input('id', sql.Int, targetId)
           .query(`
-            SELECT id as user_id, name as base_name, email as base_email, role as base_role, NULL as joining_date,
-                   NULL as phone_number, profile_picture, NULL as date_of_birth, 'Intern' as about_me, 
+            SELECT id as user_id, name as base_name, email_id as base_email, role as base_role, joining_date,
+                   phone_number, profile_picture, NULL as date_of_birth, 'New Joinee - Profile Pending' as about_me, 
                    'Onboarding' as team, NULL as reporting_manager_id, NULL as reporting_manager_name,
                    id as emp_id, role as base_designation, 'Onboarding' as base_team
-            FROM interns
+            FROM new_joinees
             WHERE id = @id
           `);
+      }
+      
+      if (fallbackRes.recordset.length === 0) {
+        // Fallback: Check interns
+        if (isEmail) {
+          fallbackRes = await pool.request()
+            .input('email', sql.NVarChar, rawId)
+            .query(`
+              SELECT id as user_id, name as base_name, email as base_email, role as base_role, NULL as joining_date,
+                     NULL as phone_number, profile_picture, NULL as date_of_birth, 'Intern' as about_me, 
+                     'Onboarding' as team, NULL as reporting_manager_id, NULL as reporting_manager_name,
+                     id as emp_id, role as base_designation, 'Onboarding' as base_team
+              FROM interns
+              WHERE email = @email
+            `);
+        } else {
+          fallbackRes = await pool.request()
+            .input('id', sql.Int, targetId)
+            .query(`
+              SELECT id as user_id, name as base_name, email as base_email, role as base_role, NULL as joining_date,
+                     NULL as phone_number, profile_picture, NULL as date_of_birth, 'Intern' as about_me, 
+                     'Onboarding' as team, NULL as reporting_manager_id, NULL as reporting_manager_name,
+                     id as emp_id, role as base_designation, 'Onboarding' as base_team
+              FROM interns
+              WHERE id = @id
+            `);
+        }
       }
 
       if (fallbackRes.recordset.length > 0) {
