@@ -9973,7 +9973,7 @@ app.get('/api/support-agents', async (req, res) => {
 
 // POST: Submit a new support ticket (Auto-routes based on department)
 app.post('/api/support-tickets', async (req, res) => {
-  const userId = req.body.userId || req.body.user_id || req.body.employeeId || req.body.employee_id;
+  const rawUserId = req.body.userId || req.body.user_id || req.body.employeeId || req.body.employee_id;
   const { subject, description, priority } = req.body;
   const department = req.body.department || req.body.category || 'HR';
 
@@ -9989,6 +9989,24 @@ app.post('/api/support-tickets', async (req, res) => {
 
   try {
     const pool = await getPool();
+    let userId = null;
+    if (rawUserId) {
+      const rawUserStr = String(rawUserId).trim();
+      if (rawUserStr.includes('@')) {
+        const userLookup = await pool.request()
+          .input('email', sql.NVarChar, rawUserStr)
+          .query('SELECT id FROM users WHERE email = @email');
+        if (userLookup.recordset.length > 0) {
+          userId = userLookup.recordset[0].id;
+        }
+      } else {
+        const parsed = parseInt(rawUserStr.replace(/\D/g, ''), 10);
+        if (!isNaN(parsed)) {
+          userId = parsed;
+        }
+      }
+    }
+
     let agentId = null;
 
         const agentResult = await pool.request()

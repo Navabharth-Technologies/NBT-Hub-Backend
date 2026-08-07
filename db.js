@@ -15,7 +15,7 @@ const dbConfig = {
     },
     pool: {
         max: 20,  // Increased from 5 to prevent connection starvation and timeout errors under concurrent load
-        min: 2,   // Maintain a minimum of 2 idle connections for faster response times
+        min: 0,   // Set to 0 to prevent stale/dead connections from staying in the pool during idle periods
         idleTimeoutMillis: 30000,
         acquireTimeoutMillis: 60000 // Queue wait time
     }
