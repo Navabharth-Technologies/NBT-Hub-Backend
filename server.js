@@ -575,10 +575,31 @@ const normalizeProfile = (profile) => {
     profile.rmId = profile.reporting_manager_id;
   }
   if (profile.reporting_manager_name) {
+    profile.reporting_manager = profile.reporting_manager_name;
     profile.reportingManagerName = profile.reporting_manager_name;
     profile.reportingManager = profile.reporting_manager_name; // Legacy support
     profile.managerName = profile.reporting_manager_name;
     profile.rmName = profile.reporting_manager_name;
+  }
+
+  if (profile.base_designation) {
+    profile.designation = profile.base_designation;
+  }
+
+  const userRole = (profile.base_role || '').toLowerCase();
+  if (userRole.includes('human resource') || userRole === 'hr') {
+    if (!profile.reporting_manager_id || profile.reporting_manager_id === 'N/A' || !profile.reporting_manager_name || profile.reporting_manager_name === 'Not Assigned' || profile.reporting_manager === 'Not Assigned') {
+      profile.reporting_manager_id = 20251;
+      profile.reporting_manager_name = 'Anish V N';
+      profile.reportingManagerId = 20251;
+      profile.reportingManagerName = 'Anish V N';
+      profile.reportingManager = 'Anish V N';
+      profile.managerId = 20251;
+      profile.managerName = 'Anish V N';
+      profile.rmId = 20251;
+      profile.rmName = 'Anish V N';
+      profile.reporting_manager = 'Anish V N';
+    }
   }
 
   return profile;
@@ -7754,6 +7775,10 @@ app.get('/api/threads', async (req, res) => {
       };
 
       // Create emoji-mapped objects for standard frontend compatibility
+      const emojiMap = {
+        like: '👍', heart: '❤️', thumbsup: '👍', shocked: '😮', 
+        laugh: '😂', fire: '🔥', clap: '👏', cake: '🎂'
+      };
       const emojiReactions = {};
       const emojiUserReactions = {};
       Object.keys(emojiMap).forEach(key => {
@@ -7814,7 +7839,7 @@ app.get('/api/threads', async (req, res) => {
     res.json(feed);
   } catch (err) {
     console.error('Feed fetch failed:', err);
-    res.status(500).json({ error: 'Failed to extract social feed' });
+    res.status(500).json({ error: 'Failed to extract social feed', details: err.message, stack: err.stack });
   }
 });
 
@@ -11732,7 +11757,8 @@ app.get('/api/leaves/my', verifyToken, async (req, res) => {
       `);
     res.json(result.recordset);
   } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch leave history' });
+    console.error('[LEAVE FETCH ERROR]', err);
+    res.status(500).json({ error: 'Failed to fetch leave history', details: err.message, stack: err.stack });
   }
 });
 
