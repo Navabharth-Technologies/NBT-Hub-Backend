@@ -1,4 +1,4 @@
-require('dotenv').config();
+﻿require('dotenv').config();
 const cron = require('node-cron');
 
 // PM2 Load Balancer / Cluster Mode Support
@@ -13525,7 +13525,7 @@ const runSaturdayAudit = async (type = 'Reminder') => {
 
       try {
         const isWarning = type.toLowerCase().includes('warning');
-        const subject = isWarning ? 'ðŸš¨ Compliance Deadline Approaching' : 'ðŸ“ Saturday Suggestion Reminder';
+        const subject = isWarning ? 'Compliance Deadline Approaching' : 'Saturday Suggestion Reminder';
 
         const html = isWarning
           ? getSaturdayFinalWarningHtml(emp.name)
