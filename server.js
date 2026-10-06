@@ -13066,10 +13066,12 @@ app.post(['/api/admin/pay-slips', '/api/admin/payslips', '/api/pay_slip', '/api/
       }
     }
 
-    const getDaysInMonth = (year, month) => new Date(year, month, 0).getDate();
-    const totalDays = getDaysInMonth(year, month);
-    const perDaySalary = totalDays > 0 ? (parseFloat(basic_salary || 0) / totalDays) : 0;
-    const calculatedLop = Math.round(perDaySalary * absentDays);
+    let calculatedLop = parseFloat(lop_deduction);
+      if (isNaN(calculatedLop)) {
+        const totalDays = 30;
+        const perDaySalary = totalDays > 0 ? (parseFloat(basic_salary || 0) / totalDays) : 0;
+        calculatedLop = Math.round(perDaySalary * absentDays);
+      }
     console.log(`[PAYSLIP SAVE] Policy-enforced LOP deduction: ${calculatedLop} based on ${absentDays} LOP days.`);
 
     // Calculate totals automatically to ensure data integrity based on user input
