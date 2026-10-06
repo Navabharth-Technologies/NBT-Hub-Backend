@@ -13692,9 +13692,8 @@ app.get(['/api/admin/pay-slips', '/api/admin/payslips', '/api/payslips'], verify
       }
 
       // Dynamic high-precision LOP calculation
-      const getDaysInMonth = (year, month) => new Date(year, month, 0).getDate();
-      const totalDays = getDaysInMonth(targetYear, targetMonth);
-      const perDaySalary = totalDays > 0 ? (basicSalary / totalDays) : 0;
+      const totalDays = 30; // Standard 30-day payroll divisor
+      const perDaySalary = (basicSalary / totalDays);
       const lopDeduction = Math.round(perDaySalary * absentDays);
       const netPayable = Math.max(0, Math.round(basicSalary - lopDeduction));
 
