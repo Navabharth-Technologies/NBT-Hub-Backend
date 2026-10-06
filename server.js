@@ -1,4 +1,4 @@
-﻿require('dotenv').config();
+require('dotenv').config();
 const cron = require('node-cron');
 
 // PM2 Load Balancer / Cluster Mode Support
@@ -802,13 +802,13 @@ const mapAssetStockRow = (row) => {
  * Shared emoji reaction type map (extracted from 4+ inline copies)
  */
 const emojiMap = {
-  heart: '❤️',
-  thumbsup: '👍',
-  shocked: '😮',
-  laugh: '😂',
-  fire: '🔥',
-  clap: '👏',
-  cake: '🎂'
+  heart: '??',
+  thumbsup: '??',
+  shocked: '??',
+  laugh: '??',
+  fire: '??',
+  clap: '??',
+  cake: '??'
 };
 
 /**
@@ -7776,8 +7776,8 @@ app.get('/api/threads', async (req, res) => {
 
       // Create emoji-mapped objects for standard frontend compatibility
       const emojiMap = {
-        like: '👍', heart: '❤️', thumbsup: '👍', shocked: '😮', 
-        laugh: '😂', fire: '🔥', clap: '👏', cake: '🎂'
+        like: '??', heart: '??', thumbsup: '??', shocked: '??', 
+        laugh: '??', fire: '??', clap: '??', cake: '??'
       };
       const emojiReactions = {};
       const emojiUserReactions = {};
@@ -7851,13 +7851,13 @@ const handlePostReaction = async (req, res) => {
 
   // Map literal emojis OR common names to standardized database strings
   const reactionMap = {
-    '❤️': 'heart', 'heart': 'heart', 'love': 'heart',
-    '👍': 'thumbsup', 'thumbsup': 'thumbsup', 'thumb': 'thumbsup',
-    '😮': 'shocked', 'shocked': 'shocked', 'wow': 'shocked',
-    '😂': 'laugh', 'laugh': 'laugh', 'haha': 'laugh',
-    '🔥': 'fire', 'fire': 'fire', 'lit': 'fire',
-    '👏': 'clap', 'clap': 'clap', 'clapping': 'clap',
-    '🎂': 'cake', 'cake': 'cake', 'birthday': 'cake',
+    '??': 'heart', 'heart': 'heart', 'love': 'heart',
+    '??': 'thumbsup', 'thumbsup': 'thumbsup', 'thumb': 'thumbsup',
+    '??': 'shocked', 'shocked': 'shocked', 'wow': 'shocked',
+    '??': 'laugh', 'laugh': 'laugh', 'haha': 'laugh',
+    '??': 'fire', 'fire': 'fire', 'lit': 'fire',
+    '??': 'clap', 'clap': 'clap', 'clapping': 'clap',
+    '??': 'cake', 'cake': 'cake', 'birthday': 'cake',
     'like': 'like'
   };
 
@@ -13075,10 +13075,13 @@ app.post(['/api/admin/pay-slips', '/api/admin/payslips', '/api/pay_slip', '/api/
     // Calculate totals automatically to ensure data integrity based on user input
     const totalIncentive = parseFloat(performance_incentive || 0) + parseFloat(yearly_incentive || 0);
     const earnings = parseFloat(basic_salary || 0) + parseFloat(hra || 0) + parseFloat(conveyance || 0) + parseFloat(special_allowance || 0);
-    const deductions = parseFloat(pf_deduction || 0) + parseFloat(esi_deduction || 0) + parseFloat(pt_deduction || 0) + parseFloat(lwf || 0) + parseFloat(income_tax || 0) + calculatedLop;
+    
+    const providedTotalDeductions = parseFloat(req.body.total_deductions);
+    const deductions = !isNaN(providedTotalDeductions) ? providedTotalDeductions : (parseFloat(pf_deduction || 0) + parseFloat(esi_deduction || 0) + parseFloat(pt_deduction || 0) + parseFloat(lwf || 0) + parseFloat(income_tax || 0) + calculatedLop);
 
     // Enforce comprehensive dynamic netPayable calculation: Net Payable = Total Earnings + Total Incentives - Total Deductions
-    const netPayable = Math.max(0, Math.round(earnings + totalIncentive - deductions));
+    const providedNetPayable = parseFloat(req.body.net_payable);
+    const netPayable = !isNaN(providedNetPayable) ? providedNetPayable : Math.max(0, Math.round(earnings + totalIncentive - deductions));
 
     await pool.request()
       .input('employee_id', sql.Int, employee_id)
@@ -13844,8 +13847,12 @@ app.put(['/api/admin/pay-slips/:id', '/api/admin/payslips/:id', '/api/payslips/:
 
     const earnings = Math.round(basic + hraAmt + conv + spec + bonus);
     const totalIncentive = Math.round(perf + yearly);
-    const deductions = Math.round(pf + esi + pt + lwfAmt + tax + lop);
-    const netPayable = Math.max(0, Math.round(earnings + totalIncentive - deductions));
+    
+    const providedTotalDeductions = parseFloat(req.body.total_deductions);
+    const deductions = !isNaN(providedTotalDeductions) ? providedTotalDeductions : Math.round(pf + esi + pt + lwfAmt + tax + lop);
+    
+    const providedNetPayable = parseFloat(req.body.net_payable);
+    const netPayable = !isNaN(providedNetPayable) ? providedNetPayable : Math.max(0, Math.round(earnings + totalIncentive - deductions));
 
     await pool.request()
       .input('id', sql.Int, id)
@@ -17077,7 +17084,7 @@ app.get('/api/exit-formalities/resignation/:id', verifyToken, async (req, res) =
       // Access check: Admin/HR/CEO or direct manager or the employee themself
       const role = (req.user.role || '').toLowerCase();
       const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo');
-      if (!isAdmin && record.employee_id !== req.user.id) {
+      if (!isAdmin && String(record.employee_id) !== String(req.user.id)) {
         // Check if direct manager
         const userRes = await pool.request()
           .input('empId', sql.Int, record.employee_id)
@@ -17122,7 +17129,7 @@ app.get('/api/exit-formalities/employee/:id', verifyToken, async (req, res) => {
   // Access check
   const role = (req.user.role || '').toLowerCase();
   const isAdmin = role.includes('hr') || role.includes('human resource') || role.includes('admin') || role.includes('ceo');
-  if (!isAdmin && targetEmployeeId !== req.user.id) {
+  if (!isAdmin && String(targetEmployeeId) !== String(req.user.id)) {
     try {
       const pool = await getPool();
       const userRes = await pool.request()
@@ -17243,7 +17250,7 @@ app.post('/api/exit-formalities', verifyToken, async (req, res) => {
     return res.status(400).json({ error: 'Invalid employee ID' });
   }
 
-  if (!isAdmin && targetEmployeeId !== req.user.id) {
+  if (!isAdmin && String(targetEmployeeId) !== String(req.user.id)) {
     return res.status(403).json({ error: 'Unauthorized: You can only submit your own exit formalities.' });
   }
 
@@ -17390,7 +17397,7 @@ app.post('/api/exit-formalities', verifyToken, async (req, res) => {
           id: { type: sql.Int, val: recordId }
         });
         if (existingData) {
-          request.input('employee_name', sql.NVarChar, existingData.employee_name);
+          // request.input('employee_name', sql.NVarChar, existingData.employee_name);
           request.input('department', sql.NVarChar, existingData.department);
           request.input('last_working_day', sql.Date, existingData.last_working_day);
           request.input('company_employee_id', sql.NVarChar, existingData.company_employee_id);
@@ -17611,7 +17618,7 @@ app.put('/api/exit-formalities/:id', verifyToken, async (req, res) => {
     const employeeId = verifyResult.recordset[0].employee_id;
 
     // Access check: Admin/HR/CEO or direct manager or the employee themself
-    if (!isAdmin && employeeId !== req.user.id) {
+    if (!isAdmin && String(employeeId) !== String(req.user.id)) {
       const userRes = await pool.request()
         .input('empId', sql.Int, employeeId)
         .query('SELECT reporting_manager_id FROM users WHERE id = @empId');
@@ -17858,7 +17865,7 @@ app.post('/api/exit-feedback', verifyToken, async (req, res) => {
     return res.status(400).json({ error: 'Invalid employee ID' });
   }
 
-  if (!isAdmin && targetEmployeeId !== req.user.id) {
+  if (!isAdmin && String(targetEmployeeId) !== String(req.user.id)) {
     return res.status(403).json({ error: 'Unauthorized: You can only submit your own exit feedback.' });
   }
 
@@ -18131,7 +18138,7 @@ app.put('/api/exit-feedback/:id', verifyToken, async (req, res) => {
 
     // Check if requester is reporting manager
     let isManager = false;
-    if (!isAdmin && employeeId !== req.user.id) {
+    if (!isAdmin && String(employeeId) !== String(req.user.id)) {
       const managerRes = await pool.request()
         .input('empId', sql.Int, employeeId)
         .query('SELECT reporting_manager_id FROM users WHERE id = @empId');
@@ -18140,7 +18147,7 @@ app.put('/api/exit-feedback/:id', verifyToken, async (req, res) => {
       }
     }
 
-    if (!isAdmin && employeeId !== req.user.id && !isManager) {
+    if (!isAdmin && String(employeeId) !== String(req.user.id) && !isManager) {
       return res.status(403).json({ error: 'Unauthorized to modify this record' });
     }
 
@@ -18236,7 +18243,7 @@ app.put('/api/exit-feedback', verifyToken, async (req, res) => {
 
     // Check if requester is reporting manager
     let isManager = false;
-    if (!isAdmin && employeeId !== req.user.id) {
+    if (!isAdmin && String(employeeId) !== String(req.user.id)) {
       const managerRes = await pool.request()
         .input('empId', sql.Int, employeeId)
         .query('SELECT reporting_manager_id FROM users WHERE id = @empId');
@@ -18245,7 +18252,7 @@ app.put('/api/exit-feedback', verifyToken, async (req, res) => {
       }
     }
 
-    if (!isAdmin && employeeId !== req.user.id && !isManager) {
+    if (!isAdmin && String(employeeId) !== String(req.user.id) && !isManager) {
       return res.status(403).json({ error: 'Unauthorized to modify this record' });
     }
 
@@ -18733,7 +18740,7 @@ const handleProfileUpdate = async (req, res) => {
   targetEmployeeId = parseInt(targetEmployeeId, 10);
 
   // Security Check 1: Non-admins cannot edit someone else's profile
-  if (!isAdmin && targetEmployeeId !== req.user.id) {
+  if (!isAdmin && String(targetEmployeeId) !== String(req.user.id)) {
     return res.status(403).json({ error: 'Unauthorized: You can only edit your own profile.' });
   }
 
