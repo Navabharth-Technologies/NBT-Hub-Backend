@@ -6604,52 +6604,48 @@ const deleteTeamHandler = async (req, res) => {
     const uniqueTables = [...new Set(variations)];
     const droppedTables = [];
 
-    const transaction = new sql.Transaction(pool);
-    await transaction.begin();
-
+    // 5. Cleanup team assignment from users first
     try {
-      for (const tableName of uniqueTables) {
-        // Ensure table name contains only safe alphanumeric/underscore characters to prevent SQL injection
-        if (!/^[a-zA-Z0-9_]+$/.test(tableName)) {
-          console.warn(`[TEAM DELETE] Skipping invalid table name variation: ${tableName}`);
-          continue;
-        }
+      const cleanupUsersReq = pool.request();
+      cleanupUsersReq.input('teamName', sql.NVarChar, teamName);
+      cleanupUsersReq.input('sanitizedInput', sql.NVarChar, sanitizedInput);
+      await cleanupUsersReq.query("UPDATE users SET team = NULL WHERE team = @teamName OR LOWER(REPLACE(team, ' ', '_')) = @sanitizedInput");
+    } catch (cleanErr) {
+      console.warn(`[TEAM DELETE] Warning cleaning users team assignment:`, cleanErr.message);
+    }
 
-        const checkTableReq = new sql.Request(transaction);
+    // 5.1 Drop specialized team tables individually outside transaction to avoid SQL Server DDL transaction aborts
+    for (const tableName of uniqueTables) {
+      if (!/^[a-zA-Z0-9_]+$/.test(tableName)) {
+        console.warn(`[TEAM DELETE] Skipping invalid table name variation: ${tableName}`);
+        continue;
+      }
+
+      try {
+        const checkTableReq = pool.request();
         checkTableReq.input('tableName', sql.NVarChar, tableName);
         const checkResult = await checkTableReq.query(`SELECT OBJECT_ID(@tableName, N'U') AS id`);
 
         if (checkResult.recordset[0].id) {
-          const dropReq = new sql.Request(transaction);
-          await dropReq.query(`DROP TABLE [${tableName}]`);
+          await pool.request().query(`DROP TABLE [${tableName}]`);
           droppedTables.push(tableName);
         }
+      } catch (dropErr) {
+        console.warn(`[TEAM DELETE] Non-fatal table drop warning for [${tableName}]:`, dropErr.message);
       }
-
-      // 5. Cleanup team assignment for any legacy/dangling records just in case
-      const cleanupUsersReq = new sql.Request(transaction);
-      cleanupUsersReq.input('teamName', sql.NVarChar, teamName);
-      cleanupUsersReq.input('sanitizedInput', sql.NVarChar, sanitizedInput);
-      await cleanupUsersReq.query("UPDATE users SET team = NULL WHERE team = @teamName OR LOWER(REPLACE(team, ' ', '_')) = @sanitizedInput");
-
-      await transaction.commit();
-
-      // 6. Invalidate User cache to sync changes
-      allUsersCache = null;
-      lastAllUsersCacheUpdate = 0;
-
-      Log.success('Team Management', `Team "${teamName}" successfully deleted by ${req.user.name}. Dropped tables: ${droppedTables.join(', ')}`);
-
-      res.json({
-        success: true,
-        message: `Team "${teamName}" successfully deleted.`,
-        droppedTables
-      });
-
-    } catch (err) {
-      if (transaction) await transaction.rollback();
-      throw err;
     }
+
+    // 6. Invalidate User cache to sync changes
+    allUsersCache = null;
+    lastAllUsersCacheUpdate = 0;
+
+    Log.success('Team Management', `Team "${teamName}" successfully deleted by ${req.user.name}. Dropped tables: ${droppedTables.join(', ')}`);
+
+    res.json({
+      success: true,
+      message: `Team "${teamName}" successfully deleted.`,
+      droppedTables
+    });
 
   } catch (err) {
     console.error('[TEAM DELETE ERROR]:', err);
