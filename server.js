@@ -29,13 +29,14 @@ const { getEmploymentConfirmationHtml } = require('./templates/employmentConfirm
 const { getWelcomeDayOneHtml } = require('./templates/welcomeEmailTemplate');
 
 // --- SMTP CONFIGURATION (Nodemailer) --- //
-const mailTransporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS
-  }
-});
+const getMailTransporter = () => {
+  const user = process.env.EMAIL_USER || 'hr@navabharathtechnologies.com';
+  const pass = (process.env.EMAIL_PASS || 'oibu enlo cjvo cozf').replace(/\s+/g, ' ').trim();
+  return nodemailer.createTransport({
+    service: 'gmail',
+    auth: { user, pass }
+  });
+};
 
 /**
  * Centralized Email Sender using SMTP
@@ -43,9 +44,11 @@ const mailTransporter = nodemailer.createTransport({
 const sendAppEmail = async ({ to, subject, html, text, attachments }) => {
   try {
     const finalAttachments = [...(attachments || [])];
+    const transporter = getMailTransporter();
+    const senderUser = process.env.EMAIL_USER || 'hr@navabharathtechnologies.com';
 
-    const info = await mailTransporter.sendMail({
-      from: `"NBT Hub Management" <${process.env.EMAIL_USER}>`,
+    const info = await transporter.sendMail({
+      from: `"NBT Hub Management" <${senderUser}>`,
       to,
       subject,
       text: text || 'This email requires an HTML compatible mail client.',
