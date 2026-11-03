@@ -6279,7 +6279,7 @@ app.get('/api/users', async (req, res) => {
 
       try {
         let pool = await getPool();
-        const result = await pool.request().query("SELECT u.id, u.name, u.email, u.role, ep.designation, u.team, u.joining_date FROM users u WITH (NOLOCK) LEFT JOIN employee_profiles ep WITH (NOLOCK) ON u.id = ep.employee_id WHERE u.status = 'Active' ORDER BY u.name ASC");
+        const result = await pool.request().query("SELECT u.id, u.name, u.email, u.role, ep.designation, u.team, u.joining_date, u.status FROM users u WITH (NOLOCK) LEFT JOIN employee_profiles ep WITH (NOLOCK) ON u.id = ep.employee_id WHERE u.status = 'Active' ORDER BY u.name ASC");
         allUsersCache = result.recordset;
         lastAllUsersCacheUpdate = now;
         return res.json(allUsersCache);
@@ -6290,7 +6290,7 @@ app.get('/api/users', async (req, res) => {
     } else {
       try {
         let pool = await getPool();
-        const result = await pool.request().query("SELECT u.id, u.name, u.email, u.role, ep.designation, u.team, u.joining_date FROM users u WITH (NOLOCK) LEFT JOIN employee_profiles ep WITH (NOLOCK) ON u.id = ep.employee_id ORDER BY u.name ASC");
+        const result = await pool.request().query("SELECT u.id, u.name, u.email, u.role, ep.designation, u.team, u.joining_date, u.status FROM users u WITH (NOLOCK) LEFT JOIN employee_profiles ep WITH (NOLOCK) ON u.id = ep.employee_id ORDER BY u.name ASC");
         return res.json(result.recordset);
       } catch (err) {
         return res.status(500).json({ error: 'Failed to fetch users' });
