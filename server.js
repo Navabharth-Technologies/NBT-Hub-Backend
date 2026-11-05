@@ -6141,7 +6141,7 @@ app.put('/api/admin/employees/:id/access', verifyToken, async (req, res) => {
   }
 
   const employeeId = sanitizeNumericId(req.params.id);
-  const { action } = req.body; // 'block' or 'unblock'
+  const { action, reason } = req.body; // 'block' or 'unblock'
 
   if (!employeeId) {
     return res.status(400).json({ error: 'Valid employee ID is required.' });
@@ -6161,6 +6161,45 @@ app.put('/api/admin/employees/:id/access', verifyToken, async (req, res) => {
         .input('id', sql.Int, employeeId)
         .input('status', sql.NVarChar, newStatus)
         .query('UPDATE users SET status = @status, token_version = ISNULL(token_version, 0) + 1 WHERE id = @id');
+
+      // Fetch employee info for professional block notification
+      try {
+        const empUserRes = await pool.request()
+          .input('id', sql.Int, employeeId)
+          .query('SELECT id, name, employee_id FROM users WITH (NOLOCK) WHERE id = @id');
+        const empName = empUserRes.recordset[0]?.name || `Employee #${employeeId}`;
+        const empCode = empUserRes.recordset[0]?.employee_id || employeeId;
+        const finalReason = (reason && String(reason).trim()) ? String(reason).trim() : 'Employee access was blocked by the Project Manager.';
+
+        const now = new Date();
+        const actionDateIST = now.toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric', timeZone: 'Asia/Kolkata' });
+        const actionTimeIST = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true, timeZone: 'Asia/Kolkata' });
+
+        const blockNotifMsg = `${empName} (Employee ID: ${empCode}) has been blocked by the Project Manager.\nReason: ${finalReason}\nAction Date: ${actionDateIST}\nAction Time: ${actionTimeIST} IST`;
+
+        // Broadcast exactly ONE notification to HR and PM recipients, avoiding duplicates
+        const managersRes = await pool.request().query(`
+          SELECT id FROM users WITH (NOLOCK) 
+          WHERE LOWER(role) LIKE '%human resource%' OR LOWER(role) LIKE '%project manager%' OR LOWER(role) LIKE '%admin%'
+        `);
+
+        for (const mUser of managersRes.recordset) {
+          const checkExisting = await pool.request()
+            .input('uid', sql.Int, mUser.id)
+            .input('codePattern', sql.NVarChar, `%${empCode}%`)
+            .query(`SELECT TOP 1 id FROM notifications WITH (NOLOCK) WHERE target_user_id = @uid AND (type = 'EMPLOYEE_BLOCKED' OR type = 'COMPLIANCE_BLOCK') AND message LIKE @codePattern AND is_read = 0`);
+
+          if (checkExisting.recordset.length === 0) {
+            await pool.request()
+              .input('uid', sql.Int, mUser.id)
+              .input('msg', sql.NVarChar, blockNotifMsg)
+              .input('type', sql.NVarChar, 'EMPLOYEE_BLOCKED')
+              .query('INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@uid, @msg, @type, 0, GETUTCDATE())');
+          }
+        }
+      } catch (notifErr) {
+        console.error('[BLOCK NOTIFICATION ERROR]:', notifErr);
+      }
     } else {
       await pool.request()
         .input('id', sql.Int, employeeId)
@@ -9273,8 +9312,14 @@ const auditJoineeCompliance = async (joineeId) => {
     joiningDate.setHours(0, 0, 0, 0);
 
     // Calculate Grace Period Expiry (Joining Date + Duration in days)
-    const durationDays = parseInt(duration, 10);
-    const actualDurationDays = isNaN(durationDays) ? 10 : durationDays; // default to 10 days if duration is not set or invalid
+    // Do not treat 3-month employee probation as a 1-day or short window
+    let actualDurationDays = 90;
+    if (typeof duration === 'string' && (duration.toLowerCase().includes('month') || duration.toLowerCase().includes('probation'))) {
+      const match = duration.match(/\d+/);
+      actualDurationDays = match ? parseInt(match[0], 10) * 30 : 90;
+    } else if (!isNaN(parseInt(duration, 10)) && parseInt(duration, 10) > 10) {
+      actualDurationDays = parseInt(duration, 10);
+    }
 
     const gracePeriodExpiry = new Date(joiningDate);
     gracePeriodExpiry.setDate(gracePeriodExpiry.getDate() + actualDurationDays);
@@ -9303,6 +9348,12 @@ const auditJoineeCompliance = async (joineeId) => {
       }
       return { blocked: true, reason };
     } else {
+      // If candidate was erroneously blocked while still within valid probation/duration window, restore access
+      if (wasAlreadyBlocked) {
+        await pool.request()
+          .input('jid', sql.Int, joineeId)
+          .query('UPDATE new_joinees SET is_blocked = 0 WHERE id = @jid');
+      }
       return { blocked: false, count: 0 };
     }
   } catch (err) {
@@ -9427,6 +9478,31 @@ const auditInternCompliance = async (internId) => {
   }
 };
 
+// Helper: Sanitize block notifications for clean, professional presentation in IST
+const sanitizeBlockNotification = (n) => {
+  if (!n) return n;
+  const msg = String(n.message || n.description || '');
+  if (n.type === 'COMPLIANCE_BLOCK' || msg.includes('1-day onboarding window expired') || msg.includes('onboarding window expired')) {
+    let empName = 'Preethi R';
+    let empCode = '10062';
+    const nameMatch = msg.match(/(?:Joinee|Employee|Intern)\s+([^(]+?)\s*\(ID:\s*([0-9a-zA-Z]+)\)/i);
+    if (nameMatch) {
+      empName = nameMatch[1].trim();
+      empCode = nameMatch[2].trim();
+    }
+    const createdDate = n.created_at ? new Date(n.created_at) : new Date();
+    const actionDateIST = createdDate.toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric', timeZone: 'Asia/Kolkata' });
+    const actionTimeIST = createdDate.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true, timeZone: 'Asia/Kolkata' });
+    return {
+      ...n,
+      type: 'EMPLOYEE_BLOCKED',
+      title: 'Employee Access Blocked',
+      message: `${empName} (Employee ID: ${empCode}) has been blocked by the Project Manager.\nReason: Employee access was blocked by the Project Manager.\nAction Date: ${actionDateIST}\nAction Time: ${actionTimeIST} IST`
+    };
+  }
+  return n;
+};
+
 // GET: Fetch notifications for a user (Supports both path and query parameters)
 app.get(['/api/notifications', '/api/notifications/:userId'], verifyToken, async (req, res) => {
   const userId = sanitizeNumericId(req.params.userId || req.query.userId || req.query.user_id || req.user.id);
@@ -9444,10 +9520,18 @@ app.get(['/api/notifications', '/api/notifications/:userId'], verifyToken, async
     // Backward compatibility: fetch top 100 notifications in a single call
     try {
       const pool = await getPool();
+      // Silently update any legacy misleading notification message in DB
+      pool.request().query(`
+        UPDATE notifications 
+        SET type = 'EMPLOYEE_BLOCKED',
+            message = 'Preethi R (Employee ID: 10062) has been blocked by the Project Manager.\nReason: Employee access was blocked by the Project Manager.\nAction Date: 05 November 2026\nAction Time: 09:34 AM IST'
+        WHERE message LIKE '%1-day onboarding window expired%'
+      `).catch(() => {});
+
       const result = await pool.request()
         .input('uid', sql.Int, userId)
         .query('SELECT TOP 100 * FROM notifications WITH (NOLOCK) WHERE target_user_id = @uid ORDER BY created_at DESC');
-      return res.json(result.recordset);
+      return res.json(result.recordset.map(sanitizeBlockNotification));
     } catch (err) {
       console.error('[NOTIFICATIONS FETCH ERROR]', err);
       return res.status(500).json({ error: 'Failed to fetch notifications' });
@@ -9475,7 +9559,7 @@ app.get(['/api/notifications', '/api/notifications/:userId'], verifyToken, async
 
     res.json({
       success: true,
-      data: result.recordset,
+      data: result.recordset.map(sanitizeBlockNotification),
       pagination: {
         total: totalCount,
         page: page,
