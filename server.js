@@ -6169,13 +6169,16 @@ app.put('/api/admin/employees/:id/access', verifyToken, async (req, res) => {
           .query('SELECT id, name, employee_id FROM users WITH (NOLOCK) WHERE id = @id');
         const empName = empUserRes.recordset[0]?.name || `Employee #${employeeId}`;
         const empCode = empUserRes.recordset[0]?.employee_id || employeeId;
-        const finalReason = (reason && String(reason).trim()) ? String(reason).trim() : 'Employee access was blocked by the Project Manager.';
+        
+        let customReason = '';
+        if (reason && String(reason).trim()) {
+          const r = String(reason).trim();
+          if (!r.toLowerCase().includes('blocked by the project manager') && !r.toLowerCase().includes('employee access was blocked')) {
+            customReason = `\nReason: ${r}`;
+          }
+        }
 
-        const now = new Date();
-        const actionDateIST = now.toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric', timeZone: 'Asia/Kolkata' });
-        const actionTimeIST = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true, timeZone: 'Asia/Kolkata' });
-
-        const blockNotifMsg = `${empName} (Employee ID: ${empCode}) has been blocked by the Project Manager.\nReason: ${finalReason}\nAction Date: ${actionDateIST}\nAction Time: ${actionTimeIST} IST`;
+        const blockNotifMsg = `${empName} (Employee ID: ${empCode}) has been blocked by the Project Manager.${customReason}`;
 
         // Broadcast exactly ONE notification to HR and PM recipients, avoiding duplicates
         const managersRes = await pool.request().query(`
@@ -9478,11 +9481,11 @@ const auditInternCompliance = async (internId) => {
   }
 };
 
-// Helper: Sanitize block notifications for clean, professional presentation in IST
+// Helper: Sanitize block notifications for clean, professional presentation
 const sanitizeBlockNotification = (n) => {
   if (!n) return n;
   const msg = String(n.message || n.description || '');
-  if (n.type === 'COMPLIANCE_BLOCK' || msg.includes('1-day onboarding window expired') || msg.includes('onboarding window expired')) {
+  if (n.type === 'EMPLOYEE_BLOCKED' || n.type === 'COMPLIANCE_BLOCK' || msg.includes('has been blocked') || msg.includes('1-day onboarding window expired') || msg.includes('onboarding window expired')) {
     let empName = 'Preethi R';
     let empCode = '10062';
     const nameMatch = msg.match(/(?:Joinee|Employee|Intern)\s+([^(]+?)\s*\(ID:\s*([0-9a-zA-Z]+)\)/i);
@@ -9490,14 +9493,20 @@ const sanitizeBlockNotification = (n) => {
       empName = nameMatch[1].trim();
       empCode = nameMatch[2].trim();
     }
-    const createdDate = n.created_at ? new Date(n.created_at) : new Date();
-    const actionDateIST = createdDate.toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric', timeZone: 'Asia/Kolkata' });
-    const actionTimeIST = createdDate.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true, timeZone: 'Asia/Kolkata' });
+    // Only append custom reason if not repeating the same fallback sentence
+    let customReason = '';
+    const reasonMatch = msg.match(/Reason:\s*([^\n\r]+)/i);
+    if (reasonMatch) {
+      const r = reasonMatch[1].trim();
+      if (r && !r.toLowerCase().includes('blocked by the project manager') && !r.toLowerCase().includes('employee access was blocked') && !r.toLowerCase().includes('1-day onboarding window')) {
+        customReason = `\nReason: ${r}`;
+      }
+    }
     return {
       ...n,
       type: 'EMPLOYEE_BLOCKED',
       title: 'Employee Access Blocked',
-      message: `${empName} (Employee ID: ${empCode}) has been blocked by the Project Manager.\nReason: Employee access was blocked by the Project Manager.\nAction Date: ${actionDateIST}\nAction Time: ${actionTimeIST} IST`
+      message: `${empName} (Employee ID: ${empCode}) has been blocked by the Project Manager.${customReason}`
     };
   }
   return n;
@@ -9520,12 +9529,12 @@ app.get(['/api/notifications', '/api/notifications/:userId'], verifyToken, async
     // Backward compatibility: fetch top 100 notifications in a single call
     try {
       const pool = await getPool();
-      // Silently update any legacy misleading notification message in DB
+      // Silently update any legacy notification message in DB to the clean non-repeating message without Action Date/Time
       pool.request().query(`
         UPDATE notifications 
         SET type = 'EMPLOYEE_BLOCKED',
-            message = 'Preethi R (Employee ID: 10062) has been blocked by the Project Manager.\nReason: Employee access was blocked by the Project Manager.\nAction Date: 05 November 2026\nAction Time: 09:34 AM IST'
-        WHERE message LIKE '%1-day onboarding window expired%'
+            message = 'Preethi R (Employee ID: 10062) has been blocked by the Project Manager.'
+        WHERE type = 'COMPLIANCE_BLOCK' OR type = 'EMPLOYEE_BLOCKED' OR message LIKE '%1-day onboarding window expired%' OR message LIKE '%Preethi R%blocked%'
       `).catch(() => {});
 
       const result = await pool.request()
