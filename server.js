@@ -6350,6 +6350,301 @@ app.get('/api/users', async (req, res) => {
   }
 });
 
+// --- SEQUENTIAL ID GENERATION & AUTOMATED ONBOARDING ENGINE ---
+
+async function getNextAvailableEmployeeId(pool) {
+  try {
+    const userRes = await pool.request().query(`
+      SELECT id FROM users WITH (NOLOCK)
+      UNION
+      SELECT emp_id AS id FROM employee WITH (NOLOCK) WHERE emp_id IS NOT NULL
+      UNION
+      SELECT user_id AS id FROM employee WITH (NOLOCK) WHERE user_id IS NOT NULL
+    `);
+    const allIds = new Set();
+    let maxSuffix = 0;
+
+    for (const row of userRes.recordset) {
+      if (row.id !== null && row.id !== undefined) {
+        const idStr = String(row.id).trim();
+        allIds.add(idStr);
+        if (/^2025\d+$/.test(idStr)) {
+          const suffix = parseInt(idStr.substring(4), 10);
+          if (!isNaN(suffix) && suffix > maxSuffix) {
+            maxSuffix = suffix;
+          }
+        }
+      }
+    }
+
+    // Default to at least 25 so next ID is 202526
+    let candidateSuffix = Math.max(maxSuffix, 25) + 1;
+    let nextId = '2025' + candidateSuffix;
+    while (allIds.has(nextId)) {
+      candidateSuffix++;
+      nextId = '2025' + candidateSuffix;
+    }
+    return nextId;
+  } catch (err) {
+    console.error('[NEXT EMPLOYEE ID ERROR]:', err);
+    return '202526';
+  }
+}
+
+async function getNextAvailableInternId(pool) {
+  try {
+    const internRes = await pool.request().query(`
+      SELECT intern_id FROM interns WITH (NOLOCK) WHERE intern_id IS NOT NULL
+    `);
+    const allIds = new Set();
+    let maxSuffix = 0;
+
+    for (const row of internRes.recordset) {
+      if (row.intern_id) {
+        const idStr = String(row.intern_id).trim();
+        allIds.add(idStr.toUpperCase());
+        const match = idStr.match(/^NBTINT(\d+)$/i);
+        if (match) {
+          const suffix = parseInt(match[1], 10);
+          if (!isNaN(suffix) && suffix > maxSuffix) {
+            maxSuffix = suffix;
+          }
+        }
+      }
+    }
+
+    let candidateSuffix = maxSuffix + 1;
+    let nextId = 'NBTINT' + String(candidateSuffix).padStart(3, '0');
+    while (allIds.has(nextId.toUpperCase())) {
+      candidateSuffix++;
+      nextId = 'NBTINT' + String(candidateSuffix).padStart(3, '0');
+    }
+    return nextId;
+  } catch (err) {
+    console.error('[NEXT INTERN ID ERROR]:', err);
+    return 'NBTINT001';
+  }
+}
+
+/**
+ * Non-destructive automated processing:
+ * 1. Interns reaching Day 61 (60 days completed) -> auto-convert to Active Employee
+ * 2. New Joinees completing 3 calendar months -> auto-activate to Active Employee
+ */
+async function autoProcessEligibleOnboarding(pool) {
+  const summary = { internsConverted: 0, joineesActivated: 0, errors: [] };
+  try {
+    // 1. Check eligible interns: completed >= 60 days
+    const eligibleInterns = await pool.request().query(`
+      SELECT id, name, email, password, role, joining_date, reporting_manager_id, intern_id, personal_email, phone_number, status
+      FROM interns WITH (NOLOCK)
+      WHERE DATEDIFF(DAY, joining_date, GETDATE()) >= 60
+        AND (status IS NULL OR LOWER(status) = 'active')
+        AND LOWER(ISNULL(status, '')) != 'converted'
+    `);
+
+    for (const intern of eligibleInterns.recordset) {
+      const transaction = new sql.Transaction(pool);
+      try {
+        await transaction.begin();
+        const nextEmpId = await getNextAvailableEmployeeId(pool);
+        const targetEmpId = parseInt(nextEmpId, 10);
+
+        // Update intern status to Converted (never delete!)
+        await transaction.request()
+          .input('internId', sql.Int, intern.id)
+          .input('convertedEmpId', sql.NVarChar, String(targetEmpId))
+          .query(`
+            UPDATE interns 
+            SET status = 'Converted', 
+                converted_at = GETDATE()
+            WHERE id = @internId
+          `);
+
+        // Check if user already exists
+        const userExists = await transaction.request()
+          .input('email', sql.NVarChar, intern.email)
+          .query('SELECT id, password FROM users WHERE email = @email');
+
+        if (userExists.recordset.length > 0) {
+          // Update status to Active without overwriting password
+          await transaction.request()
+            .input('uid', sql.Int, userExists.recordset[0].id)
+            .query("UPDATE users SET status = 'Active' WHERE id = @uid");
+        } else {
+          // Create new user record
+          let finalHashedPassword = intern.password;
+          if (!finalHashedPassword || !finalHashedPassword.startsWith('$2')) {
+            const saltRounds = 10;
+            finalHashedPassword = await bcrypt.hash(intern.password || 'Nbt@123', saltRounds);
+          }
+
+          await transaction.request()
+            .input('id', sql.Int, targetEmpId)
+            .input('name', sql.NVarChar, intern.name)
+            .input('email', sql.NVarChar, intern.email)
+            .input('password', sql.NVarChar, finalHashedPassword)
+            .input('role', sql.NVarChar, intern.role || 'Junior Software Engineer')
+            .input('joiningDate', sql.Date, intern.joining_date)
+            .input('managerId', sql.Int, intern.reporting_manager_id || null)
+            .input('phone', sql.NVarChar, intern.phone_number || '')
+            .query(`
+              SET IDENTITY_INSERT users ON;
+              INSERT INTO users (id, name, email, password, role, joining_date, reporting_manager_id, phone_number, status)
+              VALUES (@id, @name, @email, @password, @role, @joiningDate, @managerId, @phone, 'Active');
+              SET IDENTITY_INSERT users OFF;
+            `);
+
+          await transaction.request()
+            .input('userId', sql.Int, targetEmpId)
+            .input('empName', sql.NVarChar, intern.name)
+            .input('designation', sql.NVarChar, intern.role || 'Junior Software Engineer')
+            .input('empId', sql.Int, targetEmpId)
+            .input('team', sql.NVarChar, 'General')
+            .query(`
+              INSERT INTO employee (user_id, emp_name, designation, emp_id, team_name)
+              VALUES (@userId, @empName, @designation, @empId, @team)
+            `);
+
+          await transaction.request()
+            .input('userId', sql.Int, targetEmpId)
+            .input('personalEmail', sql.NVarChar, intern.personal_email || intern.email)
+            .input('contactNo', sql.NVarChar, intern.phone_number || '')
+            .query(`
+              INSERT INTO employee_profiles (employee_id, personal_email_id, contact_no, doj)
+              VALUES (@userId, @personalEmail, @contactNo, GETDATE())
+            `);
+        }
+
+        await transaction.commit();
+        summary.internsConverted++;
+        console.log(`[AUTO-CONVERSION] Intern ${intern.name} successfully converted to Active Employee ID ${targetEmpId}`);
+      } catch (convErr) {
+        await transaction.rollback();
+        console.error(`[AUTO-CONVERSION ERROR] Failed for intern ${intern.name}:`, convErr.message);
+        summary.errors.push(`Intern ${intern.name}: ${convErr.message}`);
+      }
+    }
+
+    // 2. Check eligible new joinees: completed 3 calendar months (approx 90 days or DATEADD)
+    const eligibleJoinees = await pool.request().query(`
+      SELECT id, name, role, email_id, joining_date, duration, phone_number, password
+      FROM new_joinees WITH (NOLOCK)
+      WHERE DATEADD(MONTH, 3, joining_date) <= GETDATE()
+        AND (is_blocked IS NULL OR is_blocked = 0)
+        AND LOWER(ISNULL(status, '')) != 'completed'
+    `);
+
+    for (const joinee of eligibleJoinees.recordset) {
+      try {
+        const userExists = await pool.request()
+          .input('email', sql.NVarChar, joinee.email_id)
+          .query('SELECT id FROM users WHERE email = @email');
+
+        if (userExists.recordset.length === 0) {
+          const nextEmpId = await getNextAvailableEmployeeId(pool);
+          const targetEmpId = parseInt(nextEmpId, 10);
+          let finalHashedPassword = joinee.password;
+          if (!finalHashedPassword || !finalHashedPassword.startsWith('$2')) {
+            const saltRounds = 10;
+            finalHashedPassword = await bcrypt.hash(joinee.password || 'Nbt@123', saltRounds);
+          }
+
+          const transaction = new sql.Transaction(pool);
+          await transaction.begin();
+
+          await transaction.request()
+            .input('id', sql.Int, targetEmpId)
+            .input('name', sql.NVarChar, joinee.name)
+            .input('email', sql.NVarChar, joinee.email_id)
+            .input('password', sql.NVarChar, finalHashedPassword)
+            .input('role', sql.NVarChar, joinee.role || 'Employee')
+            .input('joiningDate', sql.Date, joinee.joining_date)
+            .input('phone', sql.NVarChar, joinee.phone_number || '')
+            .query(`
+              SET IDENTITY_INSERT users ON;
+              INSERT INTO users (id, name, email, password, role, joining_date, phone_number, status)
+              VALUES (@id, @name, @email, @password, @role, @joiningDate, @phone, 'Active');
+              SET IDENTITY_INSERT users OFF;
+            `);
+
+          await transaction.request()
+            .input('userId', sql.Int, targetEmpId)
+            .input('empName', sql.NVarChar, joinee.name)
+            .input('designation', sql.NVarChar, joinee.role || 'Employee')
+            .input('empId', sql.Int, targetEmpId)
+            .input('team', sql.NVarChar, 'General')
+            .query(`
+              INSERT INTO employee (user_id, emp_name, designation, emp_id, team_name)
+              VALUES (@userId, @empName, @designation, @empId, @team)
+            `);
+
+          await transaction.request()
+            .input('userId', sql.Int, targetEmpId)
+            .input('personalEmail', sql.NVarChar, joinee.email_id)
+            .input('contactNo', sql.NVarChar, joinee.phone_number || '')
+            .query(`
+              INSERT INTO employee_profiles (employee_id, personal_email_id, contact_no, doj)
+              VALUES (@userId, @personalEmail, @contactNo, GETDATE())
+            `);
+
+          await transaction.request()
+            .input('jid', sql.Int, joinee.id)
+            .query("UPDATE new_joinees SET status = 'Completed' WHERE id = @jid");
+
+          await transaction.commit();
+          summary.joineesActivated++;
+          console.log(`[AUTO-ACTIVATION] New Joinee ${joinee.name} activated to Active Employee ID ${targetEmpId}`);
+        } else {
+          // If already in users, ensure status is Active and mark joinee completed
+          await pool.request()
+            .input('uid', sql.Int, userExists.recordset[0].id)
+            .query("UPDATE users SET status = 'Active' WHERE id = @uid");
+          await pool.request()
+            .input('jid', sql.Int, joinee.id)
+            .query("UPDATE new_joinees SET status = 'Completed' WHERE id = @jid");
+          summary.joineesActivated++;
+        }
+      } catch (jErr) {
+        console.error(`[AUTO-ACTIVATION ERROR] Failed for joinee ${joinee.name}:`, jErr.message);
+        summary.errors.push(`Joinee ${joinee.name}: ${jErr.message}`);
+      }
+    }
+
+    if (summary.internsConverted > 0 || summary.joineesActivated > 0) {
+      allUsersCache = null; // Flush cache
+    }
+  } catch (err) {
+    console.error('[AUTO-PROCESS ONBOARDING ERROR]:', err);
+    summary.errors.push(err.message);
+  }
+  return summary;
+}
+
+// GET: Next available sequential Employee ID
+app.get('/api/users/next-id', async (req, res) => {
+  try {
+    const pool = await getPool();
+    const nextEmployeeId = await getNextAvailableEmployeeId(pool);
+    res.json({ nextEmployeeId });
+  } catch (err) {
+    console.error('Failed to get next employee ID:', err);
+    res.status(500).json({ error: 'Failed to retrieve next employee ID' });
+  }
+});
+
+// POST: Trigger automated onboarding verification and promotion engine
+app.post('/api/onboarding/auto-process', async (req, res) => {
+  try {
+    const pool = await getPool();
+    const result = await autoProcessEligibleOnboarding(pool);
+    res.json({ success: true, ...result });
+  } catch (err) {
+    console.error('Failed to auto-process onboarding:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 /**
  * 10B. Search Users (for Rewards/Autocomplete)
  */
@@ -9599,6 +9894,18 @@ app.get('/api/interns', async (req, res) => {
     res.json(result.recordset);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch interns' });
+  }
+});
+
+// GET: Next available sequential Intern ID
+app.get('/api/interns/next-id', async (req, res) => {
+  try {
+    const pool = await getPool();
+    const nextInternId = await getNextAvailableInternId(pool);
+    res.json({ nextInternId });
+  } catch (err) {
+    console.error('Failed to get next intern ID:', err);
+    res.status(500).json({ error: 'Failed to retrieve next intern ID' });
   }
 });
 
@@ -12954,9 +13261,10 @@ cron.schedule('5 0 * * *', async () => {
  * Runs every day at 10:00 AM IST
  */
 cron.schedule('0 10 * * *', async () => {
-  console.log('[SCHEDULED TASK] Checking for pending onboarding promotions...');
+  console.log('[SCHEDULED TASK] Checking for pending onboarding promotions and conversions...');
   try {
     const pool = await getPool();
+    await autoProcessEligibleOnboarding(pool);
 
     // 1. Fetch eligible candidates (only those who haven't been sent the welcome email yet!)
     const joinees = await pool.request().query(`
