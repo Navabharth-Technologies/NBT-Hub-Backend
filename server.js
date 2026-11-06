@@ -6154,10 +6154,18 @@ app.put('/api/admin/employees/:id/access', verifyToken, async (req, res) => {
   try {
     const pool = await getPool();
 
+    // Ensure is_blocked column exists on users table
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('users') AND name = 'is_blocked')
+      BEGIN
+        ALTER TABLE users ADD is_blocked BIT CONSTRAINT DF_users_is_blocked DEFAULT 0 WITH VALUES;
+      END
+    `);
+
     // Fetch employee details
     const empUserRes = await pool.request()
       .input('id', sql.Int, employeeId)
-      .query('SELECT id, name, employee_id, status, is_blocked FROM users WITH (NOLOCK) WHERE id = @id');
+      .query('SELECT id, name, status, is_blocked FROM users WITH (NOLOCK) WHERE id = @id');
 
     if (empUserRes.recordset.length === 0) {
       return res.status(404).json({ error: 'Employee not found.' });
@@ -6165,7 +6173,7 @@ app.put('/api/admin/employees/:id/access', verifyToken, async (req, res) => {
 
     const empRecord = empUserRes.recordset[0];
     const empName = empRecord.name || `Employee #${employeeId}`;
-    const empCode = empRecord.employee_id || employeeId;
+    const empCode = empRecord.id || employeeId;
     const currentStatus = empRecord.status; // Preserve employment/resignation status!
     const isBlockAction = action === 'block';
 
@@ -6248,7 +6256,7 @@ app.put('/api/admin/employees/:id/access', verifyToken, async (req, res) => {
     });
   } catch (err) {
     console.error('[EMPLOYEE ACCESS UPDATE ERROR]:', err);
-    res.status(500).json({ error: 'Failed to update employee access status.' });
+    res.status(500).json({ error: 'Failed to update employee access status.', details: err.message });
   }
 });
 
