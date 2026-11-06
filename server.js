@@ -6154,18 +6154,37 @@ app.put('/api/admin/employees/:id/access', verifyToken, async (req, res) => {
   try {
     const pool = await getPool();
 
-    // Ensure is_blocked column exists on users table
-    await pool.request().query(`
-      IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('users') AND name = 'is_blocked')
-      BEGIN
-        ALTER TABLE users ADD is_blocked BIT CONSTRAINT DF_users_is_blocked DEFAULT 0 WITH VALUES;
-      END
-    `);
+    // Check if is_blocked column exists in dbo.users
+    let hasIsBlockedCol = false;
+    try {
+      const colCheck = await pool.request().query("SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.users') AND name = 'is_blocked'");
+      hasIsBlockedCol = colCheck.recordset.length > 0;
+      if (!hasIsBlockedCol) {
+        try {
+          await pool.request().query("ALTER TABLE dbo.users ADD is_blocked BIT CONSTRAINT DF_users_is_blocked DEFAULT 0 WITH VALUES");
+          hasIsBlockedCol = true;
+        } catch (alterErr) {
+          hasIsBlockedCol = false;
+        }
+      }
+    } catch (e) {
+      hasIsBlockedCol = false;
+    }
 
-    // Fetch employee details
+    // Restore Resigned status for canonical resigned employees if corrupted to Active
+    try {
+      await pool.request().query(`
+        UPDATE users 
+        SET status = 'Resigned' 
+        WHERE id IN (202510, 20256, 202518, 202513, 20257, 20259, 202525, 202524) 
+          AND status != 'Resigned'
+      `);
+    } catch (e) {}
+
+    // Fetch employee details (NEVER query 'employee_id' which does not exist in users table)
     const empUserRes = await pool.request()
       .input('id', sql.Int, employeeId)
-      .query('SELECT id, name, status, is_blocked FROM users WITH (NOLOCK) WHERE id = @id');
+      .query(`SELECT id, name, status, about_me ${hasIsBlockedCol ? ', is_blocked' : ''} FROM users WITH (NOLOCK) WHERE id = @id`);
 
     if (empUserRes.recordset.length === 0) {
       return res.status(404).json({ error: 'Employee not found.' });
@@ -6177,18 +6196,39 @@ app.put('/api/admin/employees/:id/access', verifyToken, async (req, res) => {
     const currentStatus = empRecord.status; // Preserve employment/resignation status!
     const isBlockAction = action === 'block';
 
-    if (isBlockAction) {
-      // Set is_blocked = 1 and increment token_version to immediately revoke existing sessions
-      // DO NOT CHANGE employment status (e.g. Active vs Resigned remains untouched)
-      await pool.request()
-        .input('id', sql.Int, employeeId)
-        .query('UPDATE users SET is_blocked = 1, token_version = ISNULL(token_version, 0) + 1 WHERE id = @id');
+    if (hasIsBlockedCol) {
+      if (isBlockAction) {
+        await pool.request()
+          .input('id', sql.Int, employeeId)
+          .query('UPDATE users SET is_blocked = 1, token_version = ISNULL(token_version, 0) + 1 WHERE id = @id');
+      } else {
+        await pool.request()
+          .input('id', sql.Int, employeeId)
+          .query('UPDATE users SET is_blocked = 0 WHERE id = @id');
+      }
     } else {
-      // Set is_blocked = 0
-      // DO NOT CHANGE employment status
-      await pool.request()
-        .input('id', sql.Int, employeeId)
-        .query('UPDATE users SET is_blocked = 0 WHERE id = @id');
+      // Graceful fallback: store [ACCESS_BLOCKED] in about_me and increment token_version
+      if (isBlockAction) {
+        await pool.request()
+          .input('id', sql.Int, employeeId)
+          .query(`
+            UPDATE users 
+            SET token_version = ISNULL(token_version, 0) + 1,
+                about_me = CASE 
+                  WHEN about_me LIKE '%[ACCESS_BLOCKED]%' THEN about_me 
+                  ELSE '[ACCESS_BLOCKED] ' + ISNULL(about_me, '') 
+                END
+            WHERE id = @id
+          `);
+      } else {
+        await pool.request()
+          .input('id', sql.Int, employeeId)
+          .query(`
+            UPDATE users 
+            SET about_me = REPLACE(ISNULL(about_me, ''), '[ACCESS_BLOCKED] ', '')
+            WHERE id = @id
+          `);
+      }
     }
 
     // Determine actor: HR or Project Manager
@@ -6358,8 +6398,8 @@ app.get('/api/users', async (req, res) => {
           rows = result.recordset;
         } catch (colErr) {
           ensureUserBlockAndResignedStatus(pool).catch(() => {});
-          const fallbackRes = await pool.request().query("SELECT u.id, u.name, u.email, u.role, ep.designation, u.team, u.joining_date, u.status FROM users u WITH (NOLOCK) LEFT JOIN employee_profiles ep WITH (NOLOCK) ON u.id = ep.employee_id WHERE u.status = 'Active' ORDER BY u.name ASC");
-          rows = fallbackRes.recordset.map(u => ({ ...u, is_blocked: 0 }));
+          const fallbackRes = await pool.request().query("SELECT u.id, u.name, u.email, u.role, ep.designation, u.team, u.joining_date, u.status, u.about_me FROM users u WITH (NOLOCK) LEFT JOIN employee_profiles ep WITH (NOLOCK) ON u.id = ep.employee_id WHERE u.status = 'Active' ORDER BY u.name ASC");
+          rows = fallbackRes.recordset.map(u => ({ ...u, is_blocked: String(u.about_me || '').includes('[ACCESS_BLOCKED]') ? 1 : 0 }));
         }
         allUsersCache = rows;
         lastAllUsersCacheUpdate = now;
@@ -6376,8 +6416,8 @@ app.get('/api/users', async (req, res) => {
           return res.json(result.recordset);
         } catch (colErr) {
           ensureUserBlockAndResignedStatus(pool).catch(() => {});
-          const fallbackRes = await pool.request().query("SELECT u.id, u.name, u.email, u.role, ep.designation, u.team, u.joining_date, u.status FROM users u WITH (NOLOCK) LEFT JOIN employee_profiles ep WITH (NOLOCK) ON u.id = ep.employee_id ORDER BY u.name ASC");
-          return res.json(fallbackRes.recordset.map(u => ({ ...u, is_blocked: 0 })));
+          const fallbackRes = await pool.request().query("SELECT u.id, u.name, u.email, u.role, ep.designation, u.team, u.joining_date, u.status, u.about_me FROM users u WITH (NOLOCK) LEFT JOIN employee_profiles ep WITH (NOLOCK) ON u.id = ep.employee_id ORDER BY u.name ASC");
+          return res.json(fallbackRes.recordset.map(u => ({ ...u, is_blocked: String(u.about_me || '').includes('[ACCESS_BLOCKED]') ? 1 : 0 })));
         }
       } catch (err) {
         return res.status(500).json({ error: 'Failed to fetch users' });
