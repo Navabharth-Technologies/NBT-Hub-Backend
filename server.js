@@ -6344,8 +6344,16 @@ app.get('/api/users', async (req, res) => {
 
       try {
         let pool = await getPool();
-        const result = await pool.request().query("SELECT u.id, u.name, u.email, u.role, ep.designation, u.team, u.joining_date, u.status, ISNULL(u.is_blocked, 0) as is_blocked FROM users u WITH (NOLOCK) LEFT JOIN employee_profiles ep WITH (NOLOCK) ON u.id = ep.employee_id WHERE u.status = 'Active' ORDER BY u.name ASC");
-        allUsersCache = result.recordset;
+        let rows = [];
+        try {
+          const result = await pool.request().query("SELECT u.id, u.name, u.email, u.role, ep.designation, u.team, u.joining_date, u.status, ISNULL(u.is_blocked, 0) as is_blocked FROM users u WITH (NOLOCK) LEFT JOIN employee_profiles ep WITH (NOLOCK) ON u.id = ep.employee_id WHERE u.status = 'Active' ORDER BY u.name ASC");
+          rows = result.recordset;
+        } catch (colErr) {
+          ensureUserBlockAndResignedStatus(pool).catch(() => {});
+          const fallbackRes = await pool.request().query("SELECT u.id, u.name, u.email, u.role, ep.designation, u.team, u.joining_date, u.status FROM users u WITH (NOLOCK) LEFT JOIN employee_profiles ep WITH (NOLOCK) ON u.id = ep.employee_id WHERE u.status = 'Active' ORDER BY u.name ASC");
+          rows = fallbackRes.recordset.map(u => ({ ...u, is_blocked: 0 }));
+        }
+        allUsersCache = rows;
         lastAllUsersCacheUpdate = now;
         return res.json(allUsersCache);
       } catch (err) {
@@ -6355,8 +6363,14 @@ app.get('/api/users', async (req, res) => {
     } else {
       try {
         let pool = await getPool();
-        const result = await pool.request().query("SELECT u.id, u.name, u.email, u.role, ep.designation, u.team, u.joining_date, u.status, ISNULL(u.is_blocked, 0) as is_blocked FROM users u WITH (NOLOCK) LEFT JOIN employee_profiles ep WITH (NOLOCK) ON u.id = ep.employee_id ORDER BY u.name ASC");
-        return res.json(result.recordset);
+        try {
+          const result = await pool.request().query("SELECT u.id, u.name, u.email, u.role, ep.designation, u.team, u.joining_date, u.status, ISNULL(u.is_blocked, 0) as is_blocked FROM users u WITH (NOLOCK) LEFT JOIN employee_profiles ep WITH (NOLOCK) ON u.id = ep.employee_id ORDER BY u.name ASC");
+          return res.json(result.recordset);
+        } catch (colErr) {
+          ensureUserBlockAndResignedStatus(pool).catch(() => {});
+          const fallbackRes = await pool.request().query("SELECT u.id, u.name, u.email, u.role, ep.designation, u.team, u.joining_date, u.status FROM users u WITH (NOLOCK) LEFT JOIN employee_profiles ep WITH (NOLOCK) ON u.id = ep.employee_id ORDER BY u.name ASC");
+          return res.json(fallbackRes.recordset.map(u => ({ ...u, is_blocked: 0 })));
+        }
       } catch (err) {
         return res.status(500).json({ error: 'Failed to fetch users' });
       }
