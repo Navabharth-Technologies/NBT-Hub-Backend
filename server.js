@@ -6171,16 +6171,6 @@ app.put('/api/admin/employees/:id/access', verifyToken, async (req, res) => {
       hasIsBlockedCol = false;
     }
 
-    // Restore Resigned status for canonical resigned employees if corrupted to Active
-    try {
-      await pool.request().query(`
-        UPDATE users 
-        SET status = 'Resigned' 
-        WHERE id IN (202510, 20256, 202518, 202513, 20257, 20259, 202525, 202524) 
-          AND status != 'Resigned'
-      `);
-    } catch (e) {}
-
     // Fetch employee details (NEVER query 'employee_id' which does not exist in users table)
     const empUserRes = await pool.request()
       .input('id', sql.Int, employeeId)
@@ -6204,7 +6194,7 @@ app.put('/api/admin/employees/:id/access', verifyToken, async (req, res) => {
       } else {
         await pool.request()
           .input('id', sql.Int, employeeId)
-          .query('UPDATE users SET is_blocked = 0 WHERE id = @id');
+          .query("UPDATE users SET is_blocked = 0, status = 'Active' WHERE id = @id");
       }
     } else {
       // Graceful fallback: store [ACCESS_BLOCKED] in about_me and increment token_version
@@ -6225,7 +6215,7 @@ app.put('/api/admin/employees/:id/access', verifyToken, async (req, res) => {
           .input('id', sql.Int, employeeId)
           .query(`
             UPDATE users 
-            SET about_me = REPLACE(ISNULL(about_me, ''), '[ACCESS_BLOCKED] ', '')
+            SET status = 'Active', about_me = REPLACE(ISNULL(about_me, ''), '[ACCESS_BLOCKED] ', '')
             WHERE id = @id
           `);
       }
@@ -6286,10 +6276,11 @@ app.put('/api/admin/employees/:id/access', verifyToken, async (req, res) => {
     lastAllUsersCacheUpdate = 0;
 
     Log.success('Access Management', `Employee ID ${employeeId} access updated to ${action.toUpperCase()}ED by ${req.user.name}`);
+    const finalStatus = isBlockAction ? currentStatus : 'Active';
     res.json({
       success: true,
       employeeId,
-      status: currentStatus,
+      status: finalStatus,
       is_blocked: isBlockAction ? 1 : 0,
       isBlocked: isBlockAction,
       message: `Employee access ${isBlockAction ? 'blocked' : 'unblocked'} successfully.`
@@ -21484,13 +21475,6 @@ const ensureUserBlockAndResignedStatus = async (providedPool) => {
         ALTER TABLE users ADD is_blocked BIT CONSTRAINT DF_users_is_blocked DEFAULT 0 WITH VALUES;
       END
 
-      -- Restore Resigned status for employees that completed resignation
-      UPDATE users 
-      SET status = 'Resigned' 
-      WHERE (
-        id IN (202510, 20256, 202518, 202513, 20257, 20259, 202525, 202524)
-        OR id IN (SELECT DISTINCT user_id FROM resignations WHERE hr_status = 'Approved' OR pm_status = 'Approved' OR status = 'Approved')
-      ) AND status != 'Resigned';
     `);
     console.log('✅ Database: is_blocked column and resigned employee statuses verified in users table');
   } catch (err) {
