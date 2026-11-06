@@ -6135,9 +6135,9 @@ app.get('/api/employees/birthdays', fetchBirthdaysAsJSON);
  */
 app.put('/api/admin/employees/:id/access', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  const isAuthorized = isPMRole(role) || role.includes('admin') || role.includes('ceo');
+  const isAuthorized = isPMRole(role) || isHRRole(role) || role.includes('admin') || role.includes('ceo') || role.includes('hr') || role.includes('human') || role.includes('project') || role.includes('pm');
   if (!isAuthorized) {
-    return res.status(403).json({ error: 'Unauthorized: Only Project Manager or Admin can manage employee access.' });
+    return res.status(403).json({ error: 'Unauthorized: Only Project Manager or HR can manage employee access.' });
   }
 
   const employeeId = sanitizeNumericId(req.params.id);
@@ -6153,61 +6153,83 @@ app.put('/api/admin/employees/:id/access', verifyToken, async (req, res) => {
 
   try {
     const pool = await getPool();
-    const newStatus = action === 'block' ? 'Resigned' : 'Active';
 
-    // Update status and increment token_version when blocking to force instant token invalidation
-    if (action === 'block') {
+    // Fetch employee details
+    const empUserRes = await pool.request()
+      .input('id', sql.Int, employeeId)
+      .query('SELECT id, name, employee_id, status, is_blocked FROM users WITH (NOLOCK) WHERE id = @id');
+
+    if (empUserRes.recordset.length === 0) {
+      return res.status(404).json({ error: 'Employee not found.' });
+    }
+
+    const empRecord = empUserRes.recordset[0];
+    const empName = empRecord.name || `Employee #${employeeId}`;
+    const empCode = empRecord.employee_id || employeeId;
+    const currentStatus = empRecord.status; // Preserve employment/resignation status!
+    const isBlockAction = action === 'block';
+
+    if (isBlockAction) {
+      // Set is_blocked = 1 and increment token_version to immediately revoke existing sessions
+      // DO NOT CHANGE employment status (e.g. Active vs Resigned remains untouched)
       await pool.request()
         .input('id', sql.Int, employeeId)
-        .input('status', sql.NVarChar, newStatus)
-        .query('UPDATE users SET status = @status, token_version = ISNULL(token_version, 0) + 1 WHERE id = @id');
-
-      // Fetch employee info for professional block notification
-      try {
-        const empUserRes = await pool.request()
-          .input('id', sql.Int, employeeId)
-          .query('SELECT id, name, employee_id FROM users WITH (NOLOCK) WHERE id = @id');
-        const empName = empUserRes.recordset[0]?.name || `Employee #${employeeId}`;
-        const empCode = empUserRes.recordset[0]?.employee_id || employeeId;
-        
-        let customReason = '';
-        if (reason && String(reason).trim()) {
-          const r = String(reason).trim();
-          if (!r.toLowerCase().includes('blocked by the project manager') && !r.toLowerCase().includes('employee access was blocked')) {
-            customReason = `\nReason: ${r}`;
-          }
-        }
-
-        const blockNotifMsg = `${empName} (Employee ID: ${empCode}) has been blocked by the Project Manager.${customReason}`;
-
-        // Broadcast exactly ONE notification to HR and PM recipients, avoiding duplicates
-        const managersRes = await pool.request().query(`
-          SELECT id FROM users WITH (NOLOCK) 
-          WHERE LOWER(role) LIKE '%human resource%' OR LOWER(role) LIKE '%project manager%' OR LOWER(role) LIKE '%admin%'
-        `);
-
-        for (const mUser of managersRes.recordset) {
-          const checkExisting = await pool.request()
-            .input('uid', sql.Int, mUser.id)
-            .input('codePattern', sql.NVarChar, `%${empCode}%`)
-            .query(`SELECT TOP 1 id FROM notifications WITH (NOLOCK) WHERE target_user_id = @uid AND (type = 'EMPLOYEE_BLOCKED' OR type = 'COMPLIANCE_BLOCK') AND message LIKE @codePattern AND is_read = 0`);
-
-          if (checkExisting.recordset.length === 0) {
-            await pool.request()
-              .input('uid', sql.Int, mUser.id)
-              .input('msg', sql.NVarChar, blockNotifMsg)
-              .input('type', sql.NVarChar, 'EMPLOYEE_BLOCKED')
-              .query('INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@uid, @msg, @type, 0, GETUTCDATE())');
-          }
-        }
-      } catch (notifErr) {
-        console.error('[BLOCK NOTIFICATION ERROR]:', notifErr);
-      }
+        .query('UPDATE users SET is_blocked = 1, token_version = ISNULL(token_version, 0) + 1 WHERE id = @id');
     } else {
+      // Set is_blocked = 0
+      // DO NOT CHANGE employment status
       await pool.request()
         .input('id', sql.Int, employeeId)
-        .input('status', sql.NVarChar, newStatus)
-        .query('UPDATE users SET status = @status WHERE id = @id');
+        .query('UPDATE users SET is_blocked = 0 WHERE id = @id');
+    }
+
+    // Determine actor: HR or Project Manager
+    let actorRole = 'the Project Manager';
+    if (role.includes('hr') || role.includes('human')) {
+      actorRole = 'HR';
+    } else if (role.includes('pm') || role.includes('project')) {
+      actorRole = 'the Project Manager';
+    } else {
+      actorRole = req.user.name || 'HR';
+    }
+
+    // Generate notifications
+    try {
+      const notifType = isBlockAction ? 'EMPLOYEE_BLOCKED' : 'EMPLOYEE_UNBLOCKED';
+      const notifMsg = isBlockAction
+        ? `${empName} (Employee ID: ${empCode}) has been blocked by ${actorRole}.`
+        : `${empName} (Employee ID: ${empCode}) access has been restored by ${actorRole}.`;
+
+      // Broadcast exactly ONE notification to HR, PM, and Admin recipients
+      const managersRes = await pool.request().query(`
+        SELECT id FROM users WITH (NOLOCK) 
+        WHERE LOWER(role) LIKE '%human resource%' OR LOWER(role) LIKE '%project manager%' OR LOWER(role) LIKE '%admin%'
+      `);
+
+      for (const mUser of managersRes.recordset) {
+        const checkExisting = await pool.request()
+          .input('uid', sql.Int, mUser.id)
+          .input('type', sql.NVarChar, notifType)
+          .input('codePattern', sql.NVarChar, `%${empCode}%`)
+          .query(`
+            SELECT TOP 1 id FROM notifications WITH (NOLOCK) 
+            WHERE target_user_id = @uid 
+              AND type = @type 
+              AND message LIKE @codePattern 
+              AND is_read = 0 
+              AND DATEDIFF(minute, created_at, GETUTCDATE()) < 2
+          `);
+
+        if (checkExisting.recordset.length === 0) {
+          await pool.request()
+            .input('uid', sql.Int, mUser.id)
+            .input('msg', sql.NVarChar, notifMsg)
+            .input('type', sql.NVarChar, notifType)
+            .query('INSERT INTO notifications (target_user_id, message, type, is_read, created_at) VALUES (@uid, @msg, @type, 0, GETUTCDATE())');
+        }
+      }
+    } catch (notifErr) {
+      console.error('[BLOCK/UNBLOCK NOTIFICATION ERROR]:', notifErr);
     }
 
     // Invalidate token cache and all users cache
@@ -6219,9 +6241,10 @@ app.put('/api/admin/employees/:id/access', verifyToken, async (req, res) => {
     res.json({
       success: true,
       employeeId,
-      status: newStatus,
-      isBlocked: action === 'block',
-      message: `Employee ${action === 'block' ? 'blocked' : 'unblocked'} successfully.`
+      status: currentStatus,
+      is_blocked: isBlockAction ? 1 : 0,
+      isBlocked: isBlockAction,
+      message: `Employee access ${isBlockAction ? 'blocked' : 'unblocked'} successfully.`
     });
   } catch (err) {
     console.error('[EMPLOYEE ACCESS UPDATE ERROR]:', err);
@@ -6321,7 +6344,7 @@ app.get('/api/users', async (req, res) => {
 
       try {
         let pool = await getPool();
-        const result = await pool.request().query("SELECT u.id, u.name, u.email, u.role, ep.designation, u.team, u.joining_date, u.status FROM users u WITH (NOLOCK) LEFT JOIN employee_profiles ep WITH (NOLOCK) ON u.id = ep.employee_id WHERE u.status = 'Active' ORDER BY u.name ASC");
+        const result = await pool.request().query("SELECT u.id, u.name, u.email, u.role, ep.designation, u.team, u.joining_date, u.status, ISNULL(u.is_blocked, 0) as is_blocked FROM users u WITH (NOLOCK) LEFT JOIN employee_profiles ep WITH (NOLOCK) ON u.id = ep.employee_id WHERE u.status = 'Active' ORDER BY u.name ASC");
         allUsersCache = result.recordset;
         lastAllUsersCacheUpdate = now;
         return res.json(allUsersCache);
@@ -6332,7 +6355,7 @@ app.get('/api/users', async (req, res) => {
     } else {
       try {
         let pool = await getPool();
-        const result = await pool.request().query("SELECT u.id, u.name, u.email, u.role, ep.designation, u.team, u.joining_date, u.status FROM users u WITH (NOLOCK) LEFT JOIN employee_profiles ep WITH (NOLOCK) ON u.id = ep.employee_id ORDER BY u.name ASC");
+        const result = await pool.request().query("SELECT u.id, u.name, u.email, u.role, ep.designation, u.team, u.joining_date, u.status, ISNULL(u.is_blocked, 0) as is_blocked FROM users u WITH (NOLOCK) LEFT JOIN employee_profiles ep WITH (NOLOCK) ON u.id = ep.employee_id ORDER BY u.name ASC");
         return res.json(result.recordset);
       } catch (err) {
         return res.status(500).json({ error: 'Failed to fetch users' });
@@ -6350,7 +6373,7 @@ app.get('/api/users', async (req, res) => {
 
     let countQuery = 'SELECT COUNT(*) as total FROM users WITH (NOLOCK)';
     let selectQuery = `
-      SELECT u.id, u.name, u.email, u.role, ep.designation, u.team, u.joining_date 
+      SELECT u.id, u.name, u.email, u.role, ep.designation, u.team, u.joining_date, u.status, ISNULL(u.is_blocked, 0) as is_blocked 
       FROM users u WITH (NOLOCK) 
       LEFT JOIN employee_profiles ep WITH (NOLOCK) ON u.id = ep.employee_id 
       ORDER BY u.name ASC 
@@ -6361,7 +6384,7 @@ app.get('/api/users', async (req, res) => {
     if (!includeInactive) {
       countQuery = "SELECT COUNT(*) as total FROM users WITH (NOLOCK) WHERE status = 'Active'";
       selectQuery = `
-        SELECT u.id, u.name, u.email, u.role, ep.designation, u.team, u.joining_date 
+        SELECT u.id, u.name, u.email, u.role, ep.designation, u.team, u.joining_date, u.status, ISNULL(u.is_blocked, 0) as is_blocked 
         FROM users u WITH (NOLOCK) 
         LEFT JOIN employee_profiles ep WITH (NOLOCK) ON u.id = ep.employee_id 
         WHERE u.status = 'Active'
@@ -9485,28 +9508,32 @@ const auditInternCompliance = async (internId) => {
 const sanitizeBlockNotification = (n) => {
   if (!n) return n;
   const msg = String(n.message || n.description || '');
-  if (n.type === 'EMPLOYEE_BLOCKED' || n.type === 'COMPLIANCE_BLOCK' || msg.includes('has been blocked') || msg.includes('1-day onboarding window expired') || msg.includes('onboarding window expired')) {
-    let empName = 'Preethi R';
-    let empCode = '10062';
-    const nameMatch = msg.match(/(?:Joinee|Employee|Intern)\s+([^(]+?)\s*\(ID:\s*([0-9a-zA-Z]+)\)/i);
-    if (nameMatch) {
-      empName = nameMatch[1].trim();
-      empCode = nameMatch[2].trim();
+  const type = String(n.type || '').toUpperCase();
+
+  if (type === 'EMPLOYEE_UNBLOCKED' || msg.includes('access has been restored')) {
+    return {
+      ...n,
+      type: 'EMPLOYEE_UNBLOCKED',
+      title: 'Employee Access Restored',
+      message: msg
+    };
+  }
+
+  if (type === 'EMPLOYEE_BLOCKED' || type === 'COMPLIANCE_BLOCK' || msg.includes('has been blocked')) {
+    let cleanedMsg = msg;
+    const match = msg.match(/(?:Joinee|Employee|Intern)?\s*([A-Za-z\s.]+?)\s*\((?:Employee\s+)?ID:\s*([0-9a-zA-Z]+)\)\s+has\s+been\s+blocked/i);
+    if (match) {
+      const empName = match[1].trim();
+      const empCode = match[2].trim();
+      const actor = msg.toLowerCase().includes('hr') ? 'HR' : 'the Project Manager';
+      cleanedMsg = `${empName} (Employee ID: ${empCode}) has been blocked by ${actor}.`;
     }
-    // Only append custom reason if not repeating the same fallback sentence
-    let customReason = '';
-    const reasonMatch = msg.match(/Reason:\s*([^\n\r]+)/i);
-    if (reasonMatch) {
-      const r = reasonMatch[1].trim();
-      if (r && !r.toLowerCase().includes('blocked by the project manager') && !r.toLowerCase().includes('employee access was blocked') && !r.toLowerCase().includes('1-day onboarding window')) {
-        customReason = `\nReason: ${r}`;
-      }
-    }
+
     return {
       ...n,
       type: 'EMPLOYEE_BLOCKED',
       title: 'Employee Access Blocked',
-      message: `${empName} (Employee ID: ${empCode}) has been blocked by the Project Manager.${customReason}`
+      message: cleanedMsg
     };
   }
   return n;
@@ -9529,14 +9556,6 @@ app.get(['/api/notifications', '/api/notifications/:userId'], verifyToken, async
     // Backward compatibility: fetch top 100 notifications in a single call
     try {
       const pool = await getPool();
-      // Silently update any legacy notification message in DB to the clean non-repeating message without Action Date/Time
-      pool.request().query(`
-        UPDATE notifications 
-        SET type = 'EMPLOYEE_BLOCKED',
-            message = 'Preethi R (Employee ID: 10062) has been blocked by the Project Manager.'
-        WHERE type = 'COMPLIANCE_BLOCK' OR type = 'EMPLOYEE_BLOCKED' OR message LIKE '%1-day onboarding window expired%' OR message LIKE '%Preethi R%blocked%'
-      `).catch(() => {});
-
       const result = await pool.request()
         .input('uid', sql.Int, userId)
         .query('SELECT TOP 100 * FROM notifications WITH (NOLOCK) WHERE target_user_id = @uid ORDER BY created_at DESC');
@@ -21392,6 +21411,31 @@ const ensureWelcomeSentColumns = async (providedPool) => {
 };
 
 // Migration: Ensure job_applications has the is_deleted column
+
+// Migration: Ensure users table has is_blocked column and restore resigned employee statuses
+const ensureUserBlockAndResignedStatus = async (providedPool) => {
+  try {
+    const pool = providedPool || await getPool();
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('users') AND name = 'is_blocked')
+      BEGIN
+        ALTER TABLE users ADD is_blocked BIT CONSTRAINT DF_users_is_blocked DEFAULT 0 WITH VALUES;
+      END
+
+      -- Restore Resigned status for employees that completed resignation
+      UPDATE users 
+      SET status = 'Resigned' 
+      WHERE (
+        id IN (202510, 20256, 202518, 202513, 20257, 20259, 202525, 202524)
+        OR id IN (SELECT DISTINCT user_id FROM resignations WHERE hr_status = 'Approved' OR pm_status = 'Approved' OR status = 'Approved')
+      ) AND status != 'Resigned';
+    `);
+    console.log('✅ Database: is_blocked column and resigned employee statuses verified in users table');
+  } catch (err) {
+    console.error('❌ Failed to ensure is_blocked column / status in users:', err.message);
+  }
+};
+
 const ensureJobApplicationsColumns = async (providedPool) => {
   try {
     const pool = providedPool || await getPool();
@@ -21428,6 +21472,7 @@ getPool().then(async (pool) => {
     await runMigration('PostReactions', initializePostReactionsTable);
     await runMigration('WelcomeColumns', ensureWelcomeSentColumns);
     await runMigration('JobApplicationsColumns', ensureJobApplicationsColumns);
+    await runMigration('UserBlockStatus', ensureUserBlockAndResignedStatus);
     await runMigration('Indexes', initializeDatabaseIndexes);
   }
   app.listen(PORT, '0.0.0.0', () => {
