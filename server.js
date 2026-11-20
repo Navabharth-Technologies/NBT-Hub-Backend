@@ -30,8 +30,15 @@ const { getWelcomeDayOneHtml } = require('./templates/welcomeEmailTemplate');
 
 // --- SMTP CONFIGURATION (Nodemailer) --- //
 const getMailTransporter = () => {
-  const user = process.env.EMAIL_USER || 'hr@navabharathtechnologies.com';
-  const pass = (process.env.EMAIL_PASS || 'oibu enlo cjvo cozf').replace(/\s+/g, ' ').trim();
+  const user = (process.env.EMAIL_USER || 'hr@navabharathtechnologies.com').trim();
+  const rawPass = process.env.EMAIL_PASS;
+
+  if (!rawPass || !rawPass.trim()) {
+    throw new Error('SMTP configuration error: EMAIL_PASS environment variable is not configured.');
+  }
+
+  const pass = rawPass.replace(/\s+/g, '').trim();
+
   return nodemailer.createTransport({
     service: 'gmail',
     auth: { user, pass }
