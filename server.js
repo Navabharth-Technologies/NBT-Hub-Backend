@@ -5979,69 +5979,202 @@ app.get('/api/roster/:type', async (req, res) => {
  */
 app.post('/api/admin/teams/create', verifyToken, async (req, res) => {
   const role = (req.user.role || '').toLowerCase();
-  if (!role.includes('admin') && !role.includes('hr') && !role.includes('manager') && !role.includes('ceo')) {
+  if (!role.includes('admin') && !role.includes('hr') && !role.includes('manager') && !role.includes('ceo') && !isPMRole(role)) {
     return res.status(403).json({ error: 'Unauthorized: Only Admin/Manager can create teams.' });
   }
 
   const teamName = req.body.teamName || req.body.team_name;
   console.log(`[TEAM CREATE] Attempt for Name: "${teamName}" | Body:`, req.body);
 
-  if (!teamName) return res.status(400).json({ error: 'teamName is required' });
+  if (!teamName || typeof teamName !== 'string' || !teamName.trim()) {
+    return res.status(400).json({ error: 'teamName is required' });
+  }
 
   // Sanitize table name: "Web Dev & Design" -> "team_web_dev_design"
   const sanitizedName = teamName.toLowerCase().trim()
     .replace(/\s+/g, '_')           // Replace spaces with underscores
     .replace(/[^a-z0-9_]/g, '');    // Remove any non-alphanumeric characters except underscores
 
-  if (!sanitizedName) return res.status(400).json({ error: 'Invalid team name: Name must contain alphanumeric characters' });
+  if (!sanitizedName) {
+    return res.status(400).json({ error: 'Invalid team name: Name must contain alphanumeric characters' });
+  }
 
   const tableName = sanitizedName.startsWith('team_') ? sanitizedName : `team_${sanitizedName}`;
 
+  // Ensure table name does not exceed SQL Server identifier limit (128 characters)
+  if (tableName.length > 128) {
+    return res.status(400).json({ error: 'Team name is too long. Generated table identifier exceeds SQL Server limit of 128 characters.' });
+  }
+
+  // Helper for strict positive integer validation when an ID is explicitly provided
+  const parseStrictPositiveId = (raw, fieldName = 'ID') => {
+    if (raw === null || raw === undefined) return { valid: true, value: null };
+    const str = String(raw).trim();
+    if (str === '') return { valid: true, value: null };
+    if (typeof raw === 'boolean' || Array.isArray(raw) || typeof raw === 'object') {
+      return { valid: false, error: `${fieldName} must be a valid numeric ID.` };
+    }
+    if (!/^[1-9]\d*$/.test(str)) {
+      return { valid: false, error: `${fieldName} '${raw}' is invalid: must be a positive integer.` };
+    }
+    const num = Number(str);
+    if (!Number.isSafeInteger(num) || num <= 0) {
+      return { valid: false, error: `${fieldName} '${raw}' exceeds safe integer range.` };
+    }
+    return { valid: true, value: num };
+  };
+
+  // 1. Validate lead_id (optional, but if provided must be a valid positive integer)
+  const rawLead = req.body.lead_id !== undefined ? req.body.lead_id : req.body.leadId;
+  const leadCheck = parseStrictPositiveId(rawLead, 'Lead ID');
+  if (!leadCheck.valid) {
+    return res.status(400).json({ error: leadCheck.error });
+  }
+  const lead_id = leadCheck.value;
+
+  // 2. Validate member_ids (optional array, but if provided elements must be valid positive integers)
+  const rawMemberIds = req.body.member_ids !== undefined ? req.body.member_ids : req.body.memberIds;
+  const cleanMemberIds = [];
+  const memberSet = new Set();
+
+  if (rawMemberIds !== undefined && rawMemberIds !== null) {
+    if (!Array.isArray(rawMemberIds)) {
+      return res.status(400).json({ error: 'member_ids must be an array of employee IDs.' });
+    }
+    for (let i = 0; i < rawMemberIds.length; i++) {
+      const item = rawMemberIds[i];
+      // Skip empty string slots from frontend initial state ['', '', '', '']
+      if (item === '' || item === null || item === undefined) continue;
+      const memCheck = parseStrictPositiveId(item, `Member ID at index ${i}`);
+      if (!memCheck.valid) {
+        return res.status(400).json({ error: memCheck.error });
+      }
+      if (memCheck.value !== null) {
+        if (memberSet.has(memCheck.value)) {
+          return res.status(400).json({ error: `Duplicate employee ID ${memCheck.value} in member list.` });
+        }
+        memberSet.add(memCheck.value);
+        cleanMemberIds.push(memCheck.value);
+      }
+    }
+  }
+
+  // If lead_id is also present in cleanMemberIds, track in memberSet
+  if (lead_id !== null) {
+    memberSet.add(lead_id);
+  }
+
+  const allMemberIds = Array.from(memberSet);
+
+  let pool;
+  let transaction;
+
   try {
-    const pool = await getPool();
+    pool = await getPool();
+    transaction = new sql.Transaction(pool);
+    await transaction.begin();
 
-    // 1. Check if table already exists
-    const check = await pool.request()
-      .input('t', sql.NVarChar, tableName)
-      .query("SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = @t");
+    try {
+      // Step A: Existence check across schemas (case-insensitive) inside transaction
+      const checkReq = new sql.Request(transaction);
+      checkReq.input('tableName', sql.NVarChar, tableName);
+      const checkRes = await checkReq.query(`
+        SELECT s.name AS schema_name, t.name AS table_name
+        FROM sys.tables t
+        JOIN sys.schemas s ON t.schema_id = s.schema_id
+        WHERE LOWER(t.name) = LOWER(@tableName)
+      `);
 
-    if (check.recordset.length > 0) {
-      return res.status(400).json({ error: `Team '${teamName}' already exists (Table: ${tableName})` });
+      if (checkRes.recordset.length > 0) {
+        await transaction.rollback();
+        return res.status(409).json({ error: `Team '${teamName}' already exists (Table: ${tableName})` });
+      }
+
+      // Step B: Concurrency row-locking on users table if members are being assigned
+      if (allMemberIds.length > 0) {
+        const lockReq = new sql.Request(transaction);
+        const lockRes = await lockReq.query(`
+          SELECT id, team FROM users WITH (UPDLOCK, HOLDLOCK)
+          WHERE id IN (${allMemberIds.join(',')})
+        `);
+
+        if (lockRes.recordset.length !== allMemberIds.length) {
+          const foundIds = new Set(lockRes.recordset.map(r => r.id));
+          const missing = allMemberIds.filter(id => !foundIds.has(id));
+          await transaction.rollback();
+          return res.status(404).json({ error: `The following employee ID(s) do not exist: ${missing.join(', ')}` });
+        }
+      }
+
+      // Step C: Schema-qualified table creation in dbo with standard 8 columns
+      const createReq = new sql.Request(transaction);
+      createReq.input('tbl', sql.NVarChar, tableName);
+      await createReq.query(`
+        DECLARE @fullTableName NVARCHAR(512) = N'[dbo].' + QUOTENAME(@tbl);
+        DECLARE @createSql NVARCHAR(MAX) = N'CREATE TABLE ' + @fullTableName + N' (
+          id INT IDENTITY(1,1) PRIMARY KEY,
+          user_id INT NOT NULL,
+          emp_name NVARCHAR(255) NOT NULL,
+          designation NVARCHAR(255),
+          emp_id INT,
+          team_name NVARCHAR(255),
+          reporting_manager NVARCHAR(255),
+          created_at DATETIME DEFAULT GETDATE()
+        )';
+        EXEC sp_executesql @createSql;
+      `);
+
+      // Step D: Assign members atomically if provided
+      if (allMemberIds.length > 0) {
+        const updateReq = new sql.Request(transaction);
+        updateReq.input('team', sql.NVarChar, teamName);
+        const updateRes = await updateReq.query(`UPDATE users SET team = @team WHERE id IN (${allMemberIds.join(',')})`);
+
+        if (updateRes.rowsAffected[0] !== allMemberIds.length) {
+          throw new Error(`Assignment count mismatch: expected ${allMemberIds.length} users updated, but database updated ${updateRes.rowsAffected[0]}`);
+        }
+
+        // Step E: Initial populate of new team table strictly for assigned members, populating both user_id and emp_id
+        const insertReq = new sql.Request(transaction);
+        insertReq.input('tbl', sql.NVarChar, tableName);
+        await insertReq.query(`
+          DECLARE @fullTarget NVARCHAR(512) = N'[dbo].' + QUOTENAME(@tbl);
+          DECLARE @insertSql NVARCHAR(MAX) = N'
+            INSERT INTO ' + @fullTarget + N' (user_id, emp_id, emp_name, designation, team_name, reporting_manager)
+            SELECT u.id, u.id, u.name, u.role, u.team,
+              CASE WHEN m.role LIKE ''%CEO%'' OR m.role LIKE ''%Founder%'' THEN ''Founder'' ELSE m.name END
+            FROM users u
+            LEFT JOIN users m ON u.reporting_manager_id = m.id
+            WHERE u.id IN (${allMemberIds.join(',')});
+          ';
+          EXEC sp_executesql @insertSql;
+        `);
+      }
+
+      await transaction.commit();
+
+      // Invalidate memory cache for real-time frontend reflection if cache exists
+      if (typeof allUsersCache !== 'undefined') allUsersCache = null;
+      if (typeof lastAllUsersCacheUpdate !== 'undefined') lastAllUsersCacheUpdate = 0;
+
+      return res.json({
+        success: true,
+        message: `Team '${teamName}' created and members assigned successfully.`,
+        tableName
+      });
+    } catch (txErr) {
+      if (transaction) {
+        try { await transaction.rollback(); } catch (rbErr) {}
+      }
+      // SQL Server Error 2714: Object already exists
+      if (txErr.number === 2714) {
+        return res.status(409).json({ error: `Team '${teamName}' already exists.` });
+      }
+      throw txErr;
     }
-
-    // 2. Create the table with standard schema
-    await pool.request().query(`
-      CREATE TABLE [${tableName}] (
-        id INT IDENTITY(1,1) PRIMARY KEY,
-        user_id INT NOT NULL,
-        emp_name NVARCHAR(255) NOT NULL,
-        designation NVARCHAR(255),
-        emp_id INT,
-        team_name NVARCHAR(255),
-        reporting_manager NVARCHAR(255),
-        created_at DATETIME DEFAULT GETDATE()
-      )
-    `);
-
-    // 3. Assign members to the new team in the Users directory
-    const lead_id = sanitizeNumericId(req.body.lead_id || req.body.leadId);
-    const member_ids = Array.isArray(req.body.member_ids || req.body.memberIds) ? (req.body.member_ids || req.body.memberIds) : [];
-    const allIds = [lead_id, ...member_ids].filter(id => id !== null && id !== undefined);
-
-    if (allIds.length > 0) {
-      console.log(`[TEAM CREATE] Assigning ${allIds.length} members to new team: ${teamName}`);
-      const updateReq = pool.request();
-      updateReq.input('team', sql.NVarChar, teamName);
-      await updateReq.query(`UPDATE users SET team = @team WHERE id IN (${allIds.join(',')})`);
-
-      // Sync the specialized table immediately
-      await syncSpecificTeamTable(pool, null, teamName);
-    }
-
-    res.json({ success: true, message: `Team '${teamName}' created and members assigned successfully.`, tableName });
   } catch (err) {
     console.error('[CREATE TEAM ERROR]:', err);
-    res.status(500).json({ error: 'Failed to create team table', details: err.message });
+    res.status(500).json({ error: 'Failed to create team table' });
   }
 });
 
